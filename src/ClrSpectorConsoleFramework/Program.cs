@@ -1,17 +1,15 @@
 ﻿using System;
 using System.Diagnostics;
-using System.Runtime.CompilerServices;
+using ClrSpectorConsole;
 using Microsoft.Diagnostics.Runtime;
 using ClrObject = ClrSpector.ClrObject;
 
-namespace ClrSpectorConsole
+namespace ClrSpectorConsoleFramework
 {
     class Program
     {
         static void Main(string[] args)
         {
-            ClrObject clrObject;
-            //clrObject = ClrObject.From<SampleClass>();
             using (var dataTarget = DataTarget.CreateSnapshotAndAttach(Process.GetCurrentProcess().Id))
             {
                 var runtime = dataTarget.ClrVersions[0].CreateRuntime();
@@ -19,12 +17,10 @@ namespace ClrSpectorConsole
                 var type = module.GetTypeByName("ClrSpectorConsole.SampleClass");
 
                 var methodTableLoc = new UIntPtr(type.MethodTable);
-                var method = type.Methods[0];
-                var methodDescLoc = new UIntPtr(method.MethodDesc);
+                var methodDescLoc = new UIntPtr(type.Methods[0].MethodDesc);
 
-                clrObject = ClrObject.From<SampleClass>();
+                var clrObject = ClrObject.From<SampleClass>();
             }
-
         }
     }
 }

@@ -1,12 +1,13 @@
 ﻿using System;
 using System.Runtime.CompilerServices;
+using System.Text;
 
 namespace ClrSpector
 {
     public unsafe class MemoryReader
     {
         public void* BasePointer { get; set; }
-        public int Position { get; set; }
+        public uint Position { get; set; }
 
         public MemoryReader(IntPtr basePtr)
         {
@@ -64,10 +65,39 @@ namespace ClrSpector
             return value;
         }
 
+        public MemoryReader Dereference()
+        {
+            var dereferenced = new MemoryReader(*(IntPtr*)this.GetCurrentPointer());
+            this.Position += (uint)IntPtr.Size;
+
+            return dereferenced;
+        }
+
+        public string ReadString()
+        {
+            var charBase = (byte*)this.GetCurrentPointer();
+
+            var builder = new StringBuilder();
+
+            int count = 0;
+            while (true)
+            {
+                var value = *(charBase + count++);
+                if (value == '\0')
+                    break;
+
+                builder.Append((char)value);
+            }
+
+            this.Position += (uint)count;
+
+            return builder.ToString();
+        }
+
         public IntPtr ReadIntPtr()
         {
             var value = *(IntPtr*)this.GetCurrentPointer();
-            this.Position += IntPtr.Size;
+            this.Position += (uint)IntPtr.Size;
 
             return value;
         }

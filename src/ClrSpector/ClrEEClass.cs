@@ -8,7 +8,7 @@ namespace ClrSpector
         public const int kBitsPerint = 32; // Number of bits in a int
 
         public void* BasePointer { get; set; }
-        public int Size { get; set; }
+        public uint Size { get; set; }
 
         public IntPtr GuidInfo { get; set; }
         public IntPtr OptionalFields { get; set; }

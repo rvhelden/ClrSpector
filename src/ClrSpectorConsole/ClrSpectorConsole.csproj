@@ -6,6 +6,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="transport.runtime.win-x64.Microsoft.NETCore.Runtime.CoreCLR" Version="2.0.8-servicing-26520-0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\clrmd\src\Microsoft.Diagnostics.Runtime\Microsoft.Diagnostics.Runtime.csproj" />
     <ProjectReference Include="..\ClrSpector\ClrSpector.csproj" />
   </ItemGroup>
 
