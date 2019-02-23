@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Diagnostics;
-using System.Runtime.CompilerServices;
 using Microsoft.Diagnostics.Runtime;
 using ClrObject = ClrSpector.ClrObject;
 
@@ -11,7 +10,8 @@ namespace ClrSpectorConsole
         static void Main(string[] args)
         {
             ClrObject clrObject;
-            //clrObject = ClrObject.From<SampleClass>();
+            clrObject = ClrObject.From<SampleClass>();
+            
             using (var dataTarget = DataTarget.CreateSnapshotAndAttach(Process.GetCurrentProcess().Id))
             {
                 var runtime = dataTarget.ClrVersions[0].CreateRuntime();

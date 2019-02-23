@@ -53,10 +53,6 @@
     <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\..\clrmd\src\Microsoft.Diagnostics.Runtime\Microsoft.Diagnostics.Runtime.csproj">
-      <Project>{a82126ca-23aa-41f1-8586-a5938d44d0a7}</Project>
-      <Name>Microsoft.Diagnostics.Runtime</Name>
-    </ProjectReference>
     <ProjectReference Include="..\ClrSpector\ClrSpector.csproj">
       <Project>{c27bccdc-a31d-45cd-b162-b77b3bce3895}</Project>
       <Name>ClrSpector</Name>

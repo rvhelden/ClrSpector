@@ -17,21 +17,9 @@ namespace ClrSpector
         HasStableEntryPoint = 0x01, // The method entrypoint is stable (either precode or actual code)
         HasPrecode = 0x02,          // Precode has been allocated for this method
         IsUnboxingStub = 0x04,
-        HasNativeCodeSlot = 0x08, // Has slot for native code
-        Transparency_Mask = 0x30,
-        Transparency_Unknown = 0x00,     // The transparency has not been computed yet
-        Transparency_Transparent = 0x10, // Method is transparent
-        Transparency_Critical = 0x20,    // Method is critical
-        Transparency_TreatAsSafe = 0x30, // Method is treat as safe. Also implied critical.
-
-        // CAS Demands: Demands for Permissions that are CAS Permissions. CAS Perms are those 
-        // that derive from CodeAccessPermission and need a stackwalk to evaluate demands
-        // Non-CAS perms are those that don't need a stackwalk and don't derive from CodeAccessPermission. The implementor 
-        // specifies the behavior on a demand. Examples: CAS: FileIOPermission. Non-CAS: PrincipalPermission.
-        // This bit gets set if the demands are BCL CAS demands only. Even if there are non-BCL CAS demands, we don't set this
-        // bit.
-        CASDemandsOnly = 0x40,
-        HostProtectionLinkCheckOnly = 0x80, // Method has LinkTime check due to HP only.
+        HasNativeCodeSlot = 0x08,   // Has slot for native code
+        IsJitIntrinsic = 0x10,      // Jit may expand method as an intrinsic
+        IsEligibleForTieredCompilation = 0x20
     }
 
     [Flags]
@@ -48,17 +36,17 @@ namespace ClrSpector
         DoesNotHaveEquivalentValuetypeParameters = 0x8000, // Indicates that we have verified that there are no equivalent valuetype parameters for this method
     }
 
+
+    // Method.hpp:
     public unsafe class ClrMethodDescription : ClrInternalObject
     {
-        public string DebugMethodName { get; set; }
-        public string DebugClassName { get; set; }
-        public string DebugMethodSignature { get; set; }
-        public IntPtr DebugMethodTablePointer { get; set; }
-        public IntPtr GcCover { get; set; }
-        public ClrMethodTable DebugMethodTable => ClrMethodTable.Create(new MemoryReader(this.DebugMethodTablePointer));
         public ushort Flags3AndTokenRemainder { get; set; }
         public byte ChunkIndex { get; set; }
         public MethodDescFlag2 Flags2 { get; set; }
+        
+        // The slot number of this MethodDesc in the vtable array.
+        // Note that we may store other information in the high bits if available -- 
+        // see enum_packedSlotLayout and mdcRequiresFullSlotNumber for details.
         public ushort SlotNumber { get; set; }
         public PackedSlotLayout Flags { get; set; }
         public MethodDescFlag3 Flags3 => (MethodDescFlag3)(this.Flags3AndTokenRemainder & ~(ushort)MethodDescFlag3.TokenRemainderMask);
@@ -67,15 +55,6 @@ namespace ClrSpector
         public static ClrMethodDescription Create(MemoryReader reader)
         {
             var md = new ClrMethodDescription();
-
-            if (ClrEnvironment.IsDebug())
-            {
-                md.DebugMethodName = reader.Dereference().ReadString();
-                md.DebugClassName = reader.Dereference().ReadString();
-                md.DebugMethodSignature = reader.Dereference().ReadString();
-                md.DebugMethodTablePointer = reader.ReadIntPtr();
-                md.GcCover = reader.ReadIntPtr();
-            }
 
             md.Flags3AndTokenRemainder = reader.ReadUShort();
             md.ChunkIndex = reader.ReadByte();

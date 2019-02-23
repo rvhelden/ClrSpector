@@ -43,8 +43,7 @@ namespace ClrSpector.Methods
             
             if (IntPtr.Size == 8)
                 return new IntPtr(@base.ToInt64() + this.MethodDescChunkIndex * methodDescAlignment);
-            else
-                return new IntPtr(@base.ToInt32() + this.MethodDescChunkIndex * methodDescAlignment);
+            return new IntPtr(@base.ToInt32() + this.MethodDescChunkIndex * methodDescAlignment);
         }
 
         // Fixup precode chunk is associated with MethodDescChunk. The layout of the fixup precode chunk is:
@@ -57,8 +56,7 @@ namespace ClrSpector.Methods
         {
             if (IntPtr.Size == 8)
                 return new IntPtr(base.ClrPointer.ToInt64() + (this.PrecodeChunkIndex + 1) * this.Size);
-            else
-                return new IntPtr(base.ClrPointer.ToInt32() + (this.PrecodeChunkIndex + 1) * this.Size);
+            return new IntPtr(base.ClrPointer.ToInt32() + (this.PrecodeChunkIndex + 1) * this.Size);
         }
     }
 }

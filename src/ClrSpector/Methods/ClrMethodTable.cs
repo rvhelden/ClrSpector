@@ -48,7 +48,102 @@
 // GetNumVtableSlots) are laid out in a single chunk pointed to by an optional member.
 // See GetSlotPtrRaw for more details.
 
+/*
+    * This stuff must be first in the struct and should fit on a cache line - don't move it. Used by the GC.
 
+// struct
+// {
+
+// Low WORD is component size for array and string types (HasComponentSize() returns true).
+// Used for flags otherwise.
+DWORD m_dwFlags;
+
+// Base size of instance of this class when allocated on the heap
+DWORD m_BaseSize;
+// }
+
+WORD m_wFlags2;
+
+// Class token if it fits into 16-bits. If this is (WORD)-1, the class token is stored in the TokenOverflow optional member.
+WORD m_wToken;
+
+// <NICE> In the normal cases we shouldn't need a full word for each of these </NICE>
+WORD m_wNumVirtuals;
+WORD m_wNumInterfaces;
+
+# ifdef _DEBUG
+LPCUTF8 debug_m_szClassName;
+#endif //_DEBUG
+
+// On Linux ARM is a RelativeFixupPointer. Otherwise,
+// Parent PTR_MethodTable if enum_flag_HasIndirectParent is not set. Pointer to indirection cell
+// if enum_flag_enum_flag_HasIndirectParent is set. The indirection is offset by offsetof(MethodTable, m_pParentMethodTable).
+// It allows casting helpers to go through parent chain natually. Casting helper do not need need the explicit check
+// for enum_flag_HasIndirectParentMethodTable.
+ParentMT_t m_pParentMethodTable;
+
+RelativePointer<PTR_Module> m_pLoaderModule;    // LoaderModule. It is equal to the ZapModule in ngened images
+
+#if defined(FEATURE_NGEN_RELOCS_OPTIMIZATIONS)
+    RelativePointer<PTR_MethodTableWriteableData> m_pWriteableData;
+#else
+PlainPointer<PTR_MethodTableWriteableData> m_pWriteableData;
+#endif
+
+// The value of lowest two bits describe what the union contains
+enum LowBits
+{
+    UNION_EECLASS = 0,    //  0 - pointer to EEClass. This MethodTable is the canonical method table.
+    UNION_INVALID = 1,    //  1 - not used
+    UNION_METHODTABLE = 2,    //  2 - pointer to canonical MethodTable.
+    UNION_INDIRECTION = 3     //  3 - pointer to indirection cell that points to canonical MethodTable.
+};                             //      (used only if FEATURE_PREJIT is defined)
+static const TADDR UNION_MASK = 3;
+
+union {
+#if defined(FEATURE_NGEN_RELOCS_OPTIMIZATIONS)
+        RelativePointer<DPTR(EEClass)> m_pEEClass;
+        RelativePointer<TADDR> m_pCanonMT;
+#else
+        PlainPointer<DPTR(EEClass)> m_pEEClass;
+        PlainPointer<TADDR> m_pCanonMT;
+#endif
+    };
+
+    __forceinline static LowBits union_getLowBits(TADDR pCanonMT)
+{
+    LIMITED_METHOD_DAC_CONTRACT;
+    return LowBits(pCanonMT & UNION_MASK);
+}
+__forceinline static TADDR union_getPointer(TADDR pCanonMT)
+{
+    LIMITED_METHOD_DAC_CONTRACT;
+    return (pCanonMT & ~UNION_MASK);
+}
+
+// m_pPerInstInfo and m_pInterfaceMap have to be at fixed offsets because of performance sensitive 
+// JITed code and JIT helpers. However, they are frequently not present. The space is used by other
+// multipurpose slots on first come first served basis if the fixed ones are not present. The other 
+// multipurpose are DispatchMapSlot, NonVirtualSlots, ModuleOverride (see enum_flag_MultipurposeSlotsMask).
+// The multipurpose slots that do not fit are stored after vtable slots.
+
+union
+    {
+        PerInstInfo_t m_pPerInstInfo;
+TADDR m_ElementTypeHnd;
+TADDR m_pMultipurposeSlot1;
+    };
+    public:
+    union
+    {
+#if defined(FEATURE_NGEN_RELOCS_OPTIMIZATIONS)
+        RelativePointer<PTR_InterfaceInfo>   m_pInterfaceMap;
+#else
+        PlainPointer<PTR_InterfaceInfo> m_pInterfaceMap;
+#endif
+TADDR m_pMultipurposeSlot2;
+    };
+    */
 
 using System;
 using System.Collections.Generic;
@@ -91,7 +186,6 @@ namespace ClrSpector
         public IntPtr ElementTypeHnd { get; set; }
         public IntPtr PerInstInfo { get; set; }
         public IntPtr InterfaceMap { get; set; }
-        public IntPtr DebugClassName { get; set; }
         public bool HasNonVirtualSlots => this.Flags2.HasFlag(MethodTableFlags2.HasNonVirtualSlots);
         public bool HasSingleNonVirtualSlot => this.Flags2.HasFlag(MethodTableFlags2.HasSingleNonVirtualSlot);
         public bool HasNonVirtualSlotsArray => this.HasNonVirtualSlots && !this.HasSingleNonVirtualSlot;
@@ -125,12 +219,16 @@ namespace ClrSpector
             mt.NumberOfVirtuals = reader.ReadUShort();
             mt.NumberOfInterfaces = reader.ReadUShort();
 
-            if (ClrEnvironment.IsDebug())
-                mt.DebugClassName = reader.ReadIntPtr();
-
             var parentMtPointer = reader.ReadIntPtr();
             /*if (parentMtPointer != IntPtr.Zero)
-                mt.ParentMethodTable = ClrMethodTable.Create(new MemoryReader(parentMtPointer));*/
+            {
+                if (mt.FlagsHigh.HasFlag(MethodTableFlagsHigh.HasIndirectParent))
+                {
+                    parentMtPointer = *(IntPtr*)parentMtPointer;
+                }
+
+                mt.ParentMethodTable = ClrMethodTable.Create(new MemoryReader(parentMtPointer));
+            }*/
 
             mt.Module = reader.ReadIntPtr();
             mt.WriteableData = reader.ReadIntPtr();
@@ -272,6 +370,10 @@ namespace ClrSpector
             return (IntPtr*)((byte*)this.BasePointer + this.Size);
         }
 
+
+        // methodtable.h -> PCODE MethodTable::GetRestoredSlot(DWORD slotNumber):9597
+        // methodtable.h -> PCODE GetSlot(UINT32 slotNumber):1393
+        // methodtable.h -> TADDR GetSlotPtrRaw(UINT32 slotNum):1426
         private IntPtr GetSlotPtrRaw(uint slotNumber)
         {
             if (slotNumber < this.NumberOfVirtuals)
@@ -283,24 +385,27 @@ namespace ClrSpector
                 var vtableEntry = methodTableChunk + this.GetIndexAfterVtableIndirection(slotNumber);
                 return *vtableEntry;
             }
-            else if (this.HasSingleNonVirtualSlot)
+
+            if (this.HasSingleNonVirtualSlot)
             {
                 // Non-virtual slots < GetNumVtableSlots live in a single chunk pointed to by an optional member,
                 // except when there is only one in which case it lives in the optional member itself
 
                 if (IntPtr.Size == 4)
+                {
                     return new IntPtr(*(int*) this.GetNonVirtualSlotsPtr());
-                else
-                    return new IntPtr(*(long*) this.GetNonVirtualSlotsPtr());
+                }
+
+                return new IntPtr(*(long*) this.GetNonVirtualSlotsPtr());
             }
-            else
+
+            // Non-virtual slots < GetNumVtableSlots live in a single chunk pointed to by an optional member
+            if (IntPtr.Size == 4)
             {
-                // Non-virtual slots < GetNumVtableSlots live in a single chunk pointed to by an optional member
-                if (IntPtr.Size == 4)
-                    return new IntPtr(*(int *) this.GetNonVirtualSlotsPtr() + (slotNumber - this.NumberOfVirtuals));
-                else
-                    return new IntPtr(*(long *) this.GetNonVirtualSlotsPtr() + (slotNumber - this.NumberOfVirtuals));
+                return new IntPtr(*(int *) this.GetNonVirtualSlotsPtr() + (slotNumber - this.NumberOfVirtuals));
             }
+
+            return new IntPtr(*(long *) this.GetNonVirtualSlotsPtr() + (slotNumber - this.NumberOfVirtuals));
         }
     }
 }
