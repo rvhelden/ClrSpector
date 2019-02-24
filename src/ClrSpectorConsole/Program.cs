@@ -9,18 +9,22 @@ namespace ClrSpectorConsole
     {
         static void Main(string[] args)
         {
+            var coreAssemblyInfo = System.Diagnostics.FileVersionInfo.GetVersionInfo(typeof(object).Assembly.Location);
+            Console.WriteLine($"Hello World from Core {coreAssemblyInfo.ProductVersion}");
+            Console.WriteLine($"The location is {typeof(object).Assembly.Location}");
+
+            var sampleClass = new SampleClass(2);
+
             if (!Debugger.IsAttached)
             {
                 Debugger.Launch();
             }
 
-            var coreAssemblyInfo = System.Diagnostics.FileVersionInfo.GetVersionInfo(typeof(object).Assembly.Location);
-            Console.WriteLine($"Hello World from Core {coreAssemblyInfo.ProductVersion}");
-            Console.WriteLine($"The location is {typeof(object).Assembly.Location}");
+            Debugger.Break();
 
             ClrObject clrObject;
             clrObject = ClrObject.From<SampleClass>();
-            
+
             /*using (var dataTarget = DataTarget.CreateSnapshotAndAttach(Process.GetCurrentProcess().Id))
             {
                 var runtime = dataTarget.ClrVersions[0].CreateRuntime();

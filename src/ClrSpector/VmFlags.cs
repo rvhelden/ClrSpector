@@ -9,7 +9,7 @@ namespace ClrSpector
         Delegate = 0x00000002,
         Unused = 0x0000001c,
         FixedAddressVtStatics = 0x00000020, // Value type Statics in this class will be pinned
-        Haslayout = 0x00000040,
+        HasLayout = 0x00000040,
         Isnested = 0x00000080,
         IsEquivalentType = 0x00000200,
         Hasoverlayedfields = 0x00000400,

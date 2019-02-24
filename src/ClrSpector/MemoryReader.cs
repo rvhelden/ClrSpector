@@ -101,5 +101,23 @@ namespace ClrSpector
 
             return value;
         }
+
+        public IntPtr ReadRelativeIntPtr()
+        {
+            var value = *(IntPtr*)this.GetCurrentPointer();
+            if (value == IntPtr.Zero)
+            {
+                this.Position += (uint)IntPtr.Size;
+                return IntPtr.Zero;
+            }
+
+            value = IntPtr.Size == 8 ? 
+                new IntPtr(value.ToInt64() + (byte*)this.BasePointer + this.Position) : 
+                new IntPtr(value.ToInt32() + (byte*)this.BasePointer + this.Position);
+
+            this.Position += (uint)IntPtr.Size;
+
+            return value;
+        }
     }
 }

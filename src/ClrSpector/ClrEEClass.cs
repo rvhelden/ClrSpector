@@ -67,6 +67,7 @@
 //-------------------------------------------------------------
 
 using System;
+using System.Diagnostics;
 
 namespace ClrSpector
 {
@@ -90,7 +91,7 @@ namespace ClrSpector
         public IntPtr FieldDescList { get; set; }
         public IntPtr MethodDescChunks { get; set; }
 
-        public IntPtr NativeSize { get; set; } // valid only if EEClass::IsBlittable() or EEClass::HasLayout() is true
+        public uint NativeSize { get; set; } // valid only if EEClass::IsBlittable() or EEClass::HasLayout() is true
         public IntPtr ComCallableWrapper { get; set; } // points to interop data structures used when this type is exposed to COM
 
         public uint AttrClass { get; set; }
@@ -118,6 +119,10 @@ namespace ClrSpector
         public uint NumberOfNonVirtualSlots { get; set; }
         public uint Count { get; set; }
 
+
+        public bool IsBlittable => this.HasLayout && this.GetLayoutInfo().IsBlittable;
+        public bool HasLayout => this.VmFlags.HasFlag(VmFlags.HasLayout);
+
         public static ClrEEClass Create(MemoryReader reader)
         {
             var eeclass = new ClrEEClass();
@@ -128,23 +133,26 @@ namespace ClrSpector
             if (ClrEnvironment.IsDebug())
             {
                 eeclass.DebugClassName = reader.ReadIntPtr();
-                eeclass.DebuggingClass = reader.ReadByte() == 1;
+                eeclass.DebuggingClass = reader.ReadInt() == 1;
+                reader.ReadInt(); // Padding
             }
 
-            eeclass.OptionalFields = reader.ReadIntPtr();
-            eeclass.MethodTablePointer = reader.ReadIntPtr();
-            eeclass.FieldDescList = reader.ReadIntPtr();
-            eeclass.MethodDescChunks = reader.ReadIntPtr();
+            Debugger.Break();
 
-            eeclass.NativeSize = reader.ReadIntPtr();
-            //eeclass.ComCallableWrapper = reader.ReadIntPtr();
+            eeclass.OptionalFields = reader.ReadRelativeIntPtr();
+            eeclass.MethodTablePointer = reader.ReadRelativeIntPtr();
+            eeclass.FieldDescList = reader.ReadRelativeIntPtr();
+            eeclass.MethodDescChunks = reader.ReadRelativeIntPtr();
+
+            eeclass.NativeSize = reader.ReadUInt();
+            eeclass.ComCallableWrapper = reader.ReadIntPtr();
 
             eeclass.AttrClass = reader.ReadUInt();
             eeclass.VmFlags = (VmFlags)reader.ReadUInt();
 
             if (ClrEnvironment.IsDebug())
             {
-                eeclass.AuxFlags = reader.ReadUInt();
+                eeclass.AuxFlags = reader.ReadUShort();
             }
 
             eeclass.NormType = reader.ReadByte();
@@ -172,6 +180,17 @@ namespace ClrSpector
             return eeclass;
         }
 
+        public ClrEEClassLayoutInfo GetLayoutInfo()
+        {
+            if (!this.HasLayout)
+            {
+                throw new InvalidOperationException("EEClass does not contain a layoutinfo");
+            }
+
+            return ClrEEClassLayoutInfo.Create(new MemoryReader(new IntPtr((byte*)this.BasePointer + this.Size)));
+        }
+
+        // packedfields.inl -> BitVectorGet:291
         private static uint GetField(uint* fieldsBase, EEClassFields field, bool fieldsArePacked)
         {
             if (fieldsArePacked)
@@ -184,7 +203,9 @@ namespace ClrSpector
         {
             var offset = 0u;
             for (int i = 0; i < (int)field; i++)
+            {
                 offset += ClrEEClass.kMaxLengthBits + ClrEEClass.GetBitVector(fieldsBase, (int)offset, ClrEEClass.kMaxLengthBits) + 1;
+            }
 
             var fieldLength = ClrEEClass.GetBitVector(fieldsBase, (int)offset, ClrEEClass.kMaxLengthBits) + 1;
             offset += ClrEEClass.kMaxLengthBits;
