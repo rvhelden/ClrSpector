@@ -9,8 +9,17 @@ namespace ClrSpector
         public static bool IsDebug()
         {
             var assemblies = AppDomain.CurrentDomain.GetAssemblies();
-            var coreLibrary = assemblies.FirstOrDefault(a => a.Modules.Any(m => m.Name == "System.Private.CoreLib.dll"));
-            return coreLibrary.CustomAttributes.OfType<DebuggableAttribute>() != null;
+            var coreLibrary = assemblies.First(a => a.Modules.Any(m => m.Name == "System.Private.CoreLib.dll"));
+
+            foreach (var attribute in coreLibrary.GetCustomAttributes(false))
+            {
+                if (attribute is DebuggableAttribute debuggableAttribute)
+                {
+                    return debuggableAttribute.IsJITTrackingEnabled;
+                }
+            }
+
+            return false;
         }
     }
 }

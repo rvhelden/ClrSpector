@@ -1,4 +1,5 @@
-﻿//-------------------------------------------------------------------
+﻿// methodtable.h -> 1467
+//-------------------------------------------------------------------
 // The VTABLE
 //
 // Rather than the traditional array of code pointers (or "slots") we use a two-level vtable in
@@ -150,7 +151,8 @@ using System.Collections.Generic;
 using ClrSpector.Methods;
 
 namespace ClrSpector
-{
+{ 
+    // methodtable.h -> 3889
     public unsafe class ClrMethodTable
     {
         public const uint VTABLE_SLOTS_PER_CHUNK = 8;
@@ -186,6 +188,7 @@ namespace ClrSpector
         public IntPtr ElementTypeHnd { get; set; }
         public IntPtr PerInstInfo { get; set; }
         public IntPtr InterfaceMap { get; set; }
+        public IntPtr DebugClassName { get; set; }
         public bool HasNonVirtualSlots => this.Flags2.HasFlag(MethodTableFlags2.HasNonVirtualSlots);
         public bool HasSingleNonVirtualSlot => this.Flags2.HasFlag(MethodTableFlags2.HasSingleNonVirtualSlot);
         public bool HasNonVirtualSlotsArray => this.HasNonVirtualSlots && !this.HasSingleNonVirtualSlot;
@@ -218,6 +221,11 @@ namespace ClrSpector
             mt.Token = reader.ReadShort();
             mt.NumberOfVirtuals = reader.ReadUShort();
             mt.NumberOfInterfaces = reader.ReadUShort();
+
+            if (ClrEnvironment.IsDebug())
+            {
+                mt.DebugClassName = reader.ReadIntPtr();
+            }
 
             var parentMtPointer = reader.ReadIntPtr();
             /*if (parentMtPointer != IntPtr.Zero)
@@ -327,15 +335,23 @@ namespace ClrSpector
             var precodeType = (PrecodeType)reader.ReadByte();
 
             if ((byte)precodeType == ClrMethodTable.X86_INSTR_MOV_RM_R)
+            {
                 reader.Position = ClrMethodTable.OFFSETOF_PRECODE_TYPE_MOV_RM_R_X86;
+            }
             else if ((byte)precodeType == ClrMethodTable.X86_INSTR_MOV_RM_R)
+            {
                 reader.Position = ClrMethodTable.OFFSETOF_PRECODE_TYPE_MOV_R10_X64;
+            }
             else if ((byte)precodeType == ClrMethodTable.X86_INSTR_CALL_REL32 || (byte)precodeType == ClrMethodTable.X86_INSTR_JMP_REL32)
+            {
                 reader.Position = ClrMethodTable.OFFSETOF_PRECODE_TYPE_CALL_OR_JMP_X64;
+            }
 
             precodeType = (PrecodeType)reader.ReadByte();
             if ((byte)precodeType == FixupPrecode.TypePrestub)
+            {
                 precodeType = PrecodeType.Fixup;
+            }
 
             reader.Position = 0;
 
@@ -369,16 +385,15 @@ namespace ClrSpector
         {
             return (IntPtr*)((byte*)this.BasePointer + this.Size);
         }
-
-
+        
         // methodtable.h -> PCODE MethodTable::GetRestoredSlot(DWORD slotNumber):9597
         // methodtable.h -> PCODE GetSlot(UINT32 slotNumber):1393
         // methodtable.h -> TADDR GetSlotPtrRaw(UINT32 slotNum):1426
         private IntPtr GetSlotPtrRaw(uint slotNumber)
         {
+            // Virtual slots live in chunks pointed to by vtable indirections
             if (slotNumber < this.NumberOfVirtuals)
             {
-                // Virtual slots live in chunks pointed to by vtable indirections
                 var index = this.GetIndexOfVtableIndirection(slotNumber);
                 var indirectionSlots = this.GetIndirectionSlots();
                 var methodTableChunk = (IntPtr *)*(indirectionSlots + index);
@@ -386,10 +401,10 @@ namespace ClrSpector
                 return *vtableEntry;
             }
 
+            // Non-virtual slots < GetNumVtableSlots live in a single chunk pointed to by an optional member,
+            // except when there is only one in which case it lives in the optional member itself
             if (this.HasSingleNonVirtualSlot)
             {
-                // Non-virtual slots < GetNumVtableSlots live in a single chunk pointed to by an optional member,
-                // except when there is only one in which case it lives in the optional member itself
 
                 if (IntPtr.Size == 4)
                 {

@@ -40,6 +40,12 @@ namespace ClrSpector
     // Method.hpp:
     public unsafe class ClrMethodDescription : ClrInternalObject
     {
+        public string DebugMethodName { get; set; }
+        public string DebugClassName { get; set; }
+        public string DebugMethodSignature { get; set; }
+        public IntPtr DebugMethodTablePointer { get; set; }
+        public IntPtr GcCover { get; set; }
+        public ClrMethodTable DebugMethodTable => ClrMethodTable.Create(new MemoryReader(this.DebugMethodTablePointer));
         public ushort Flags3AndTokenRemainder { get; set; }
         public byte ChunkIndex { get; set; }
         public MethodDescFlag2 Flags2 { get; set; }
@@ -55,6 +61,15 @@ namespace ClrSpector
         public static ClrMethodDescription Create(MemoryReader reader)
         {
             var md = new ClrMethodDescription();
+
+            if (ClrEnvironment.IsDebug())
+            {
+                md.DebugMethodName = reader.Dereference().ReadString();
+                md.DebugClassName = reader.Dereference().ReadString();
+                md.DebugMethodSignature = reader.Dereference().ReadString();
+                md.DebugMethodTablePointer = reader.ReadIntPtr();
+                md.GcCover = reader.ReadIntPtr();
+            }
 
             md.Flags3AndTokenRemainder = reader.ReadUShort();
             md.ChunkIndex = reader.ReadByte();

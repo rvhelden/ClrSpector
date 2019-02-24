@@ -2,6 +2,7 @@
 
 namespace ClrSpector.Methods
 {
+    // 
     public unsafe class FixupPrecode : Precode
     {
         public const byte TypePrestub = 0x5E;

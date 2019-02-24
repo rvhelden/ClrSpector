@@ -1,7 +1,76 @@
-﻿using System;
+﻿//@GENERICS:
+// For most types there is a one-to-one mapping between MethodTable* and EEClass*
+// However this is not the case for instantiated types where code and representation
+// are shared between compatible instantiations (e.g. List<string> and List<object>)
+// Then a single EEClass structure is shared between multiple MethodTable structures
+// Uninstantiated generic types (e.g. List) have their own EEClass and MethodTable,
+// used (a) as a representative for the generic type itself, (b) for static fields and
+// methods, which aren't present in the instantiations, and (c) to hold some information
+// (e.g. formal instantiations of superclass and implemented interfaces) that is common
+// to all instantiations and isn't stored in the EEClass structures for instantiated types
+//
+//
+// **  NOTE  **  NOTE  **  NOTE  **  NOTE  **  NOTE  **  NOTE  **  NOTE  **  NOTE
+//
+// A word about EEClass vs. MethodTable
+// ------------------------------------
+//
+// At compile-time, we are happy to touch both MethodTable and EEClass.  However,
+// at runtime we want to restrict ourselves to the MethodTable.  This is critical
+// for common code paths, where we want to keep the EEClass out of our working
+// set.  For uncommon code paths, like throwing exceptions or strange Contexts
+// issues, it's okay to access the EEClass.
+//
+// To this end, the TypeHandle (CLASS_HANDLE) abstraction is now based on the
+// MethodTable pointer instead of the EEClass pointer.  If you are writing a
+// runtime helper that calls GetClass() to access the associated EEClass, please
+// stop to wonder if you are making a mistake.
+//
+// **  NOTE  **  NOTE  **  NOTE  **  NOTE  **  NOTE  **  NOTE  **  NOTE  **  NOTE
+
+
+// An code:EEClass is a representation of the part of a managed type that is not used very frequently (it is
+// cold), and thus is segregated from the hot portion (which lives in code:MethodTable).  As noted above an
+// it is also the case that EEClass is SHARED among all instantiations of a generic type, so anything that
+// is specific to a paritcular type can not live off the EEClass.
+// 
+// From here you can get to 
+//     code:MethodTable - The representation of the hot portion of a type.
+//     code:MethodDesc - The representation of a method 
+//     code:FieldDesc - The representation of a field. 
+// 
+// EEClasses hold the following important fields
+//     * code:EEClass.m_pMethodTable - Points a MethodTable associated with 
+//     * code:EEClass.m_pChunks - a list of code:MethodDescChunk which is simply a list of code:MethodDesc
+//         which represent the methods.  
+//     * code:EEClass.m_pFieldDescList - a list of fields in the type.  
+//
+
+//-------------------------------------------------------------
+// CONCRETE DATA LAYOUT
+//
+// Although accessed far less frequently than MethodTables, EEClasses are still
+// pulled into working set, especially at startup.  This has motivated several space
+// optimizations in field layout where each is balanced against the need to access
+// a particular field efficiently.
+//
+// Currently, the following strategy is used:
+//
+//     - Any field that has a default value for the vast majority of EEClass instances
+//       should be stored in the EEClassOptionalFields (see header comment)
+//
+//     - Any field that is nearly always a small positive integer and is infrequently
+//       accessed should be in the EEClassPackedFields (see header comment)
+//
+// If none of these categories apply - such as for always-meaningful pointer members or
+// sets of flags - a full field is used.  Please avoid adding such members if possible.
+//-------------------------------------------------------------
+
+using System;
 
 namespace ClrSpector
 {
+    // class.h -> 1822
     public unsafe class ClrEEClass
     {
         public const int kMaxLengthBits = 5;  // Number of bits needed to express the maximum length of a field (32-bits)
@@ -11,6 +80,10 @@ namespace ClrSpector
         public uint Size { get; set; }
 
         public IntPtr GuidInfo { get; set; }
+
+        public IntPtr DebugClassName { get; set; }
+        public bool DebuggingClass {  get; set; }
+
         public IntPtr OptionalFields { get; set; }
         public IntPtr MethodTablePointer { get; set; }
         public ClrMethodTable MethodTable => this.MethodTablePointer == IntPtr.Zero ? null : ClrMethodTable.Create(new MemoryReader(this.MethodTablePointer));
@@ -22,6 +95,10 @@ namespace ClrSpector
 
         public uint AttrClass { get; set; }
         public VmFlags VmFlags { get; set; }
+        public uint AuxFlags {  get; set; }
+
+        // NOTE: Following BYTE fields are layed out together so they'll fit within the same DWORD for efficient
+        // structure packing.
         public byte NormType { get; set; }
         public bool FieldsArePacked { get; set; } // TRUE iff fields pointed to by GetPackedFields() are in packed state
         public byte FixedEEClassFields { get; set; } // Count of bytes of normal fields of this instance (EEClass,
@@ -47,16 +124,28 @@ namespace ClrSpector
             eeclass.BasePointer = reader.BasePointer;
 
             eeclass.GuidInfo = reader.ReadIntPtr();
+
+            if (ClrEnvironment.IsDebug())
+            {
+                eeclass.DebugClassName = reader.ReadIntPtr();
+                eeclass.DebuggingClass = reader.ReadByte() == 1;
+            }
+
             eeclass.OptionalFields = reader.ReadIntPtr();
             eeclass.MethodTablePointer = reader.ReadIntPtr();
             eeclass.FieldDescList = reader.ReadIntPtr();
             eeclass.MethodDescChunks = reader.ReadIntPtr();
 
             eeclass.NativeSize = reader.ReadIntPtr();
-            eeclass.ComCallableWrapper = reader.ReadIntPtr();
+            //eeclass.ComCallableWrapper = reader.ReadIntPtr();
 
             eeclass.AttrClass = reader.ReadUInt();
             eeclass.VmFlags = (VmFlags)reader.ReadUInt();
+
+            if (ClrEnvironment.IsDebug())
+            {
+                eeclass.AuxFlags = reader.ReadUInt();
+            }
 
             eeclass.NormType = reader.ReadByte();
             eeclass.FieldsArePacked = reader.ReadByte() == 0x01;
