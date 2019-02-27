@@ -74,6 +74,7 @@ namespace ClrSpector
     // class.h -> 1822
     public unsafe class ClrEEClass
     {
+        private const int tdClassSemanticsMask = 0x00000020;
         public const int kMaxLengthBits = 5;  // Number of bits needed to express the maximum length of a field (32-bits)
         public const int kBitsPerint = 32; // Number of bits in a int
 
@@ -100,7 +101,7 @@ namespace ClrSpector
 
         // NOTE: Following BYTE fields are layed out together so they'll fit within the same DWORD for efficient
         // structure packing.
-        public byte NormType { get; set; }
+        public CorElementType NormType { get; set; } // The CorElementType for this class (most classes = ELEMENT_TYPE_CLASS)
         public bool FieldsArePacked { get; set; } // TRUE iff fields pointed to by GetPackedFields() are in packed state
         public byte FixedEEClassFields { get; set; } // Count of bytes of normal fields of this instance (EEClass,
                                                      // LayoutEEClass etc.). Doesn't count bytes of "packed" fields
@@ -122,6 +123,15 @@ namespace ClrSpector
 
         public bool IsBlittable => this.HasLayout && this.GetLayoutInfo().IsBlittable;
         public bool HasLayout => this.VmFlags.HasFlag(VmFlags.HasLayout);
+        public bool IsSealed => (int)(this.AttrClass & (int)CorTypeAttr.tdAbstract) == 1;
+
+        public bool IsInterface => (int)(this.AttrClass & (int)CorTypeAttr.tdClassSemanticsMask) == (int)CorTypeAttr.tdInterface;
+        public bool IsClass => (int)(this.AttrClass & (int)CorTypeAttr.tdClassSemanticsMask) == (int)CorTypeAttr.tdClass;
+        
+        public bool IsAutoLayout => (int)(this.AttrClass & (int)CorTypeAttr.tdLayoutMask) == (int)CorTypeAttr.tdAutoLayout;
+        public bool IsSequentialLayout => (int)(this.AttrClass & (int)CorTypeAttr.tdLayoutMask) == (int)CorTypeAttr.tdSequentialLayout;
+        public bool IsExplicitLayout => (int)(this.AttrClass & (int)CorTypeAttr.tdLayoutMask) == (int)CorTypeAttr.tdExplicitLayout;
+
 
         public static ClrEEClass Create(MemoryReader reader)
         {
@@ -134,10 +144,11 @@ namespace ClrSpector
             {
                 eeclass.DebugClassName = reader.ReadIntPtr();
                 eeclass.DebuggingClass = reader.ReadInt() == 1;
-                reader.ReadInt(); // Padding
+                if (IntPtr.Size == 8)
+                {
+                    reader.ReadInt(); // Padding
+                }
             }
-
-            Debugger.Break();
 
             eeclass.OptionalFields = reader.ReadRelativeIntPtr();
             eeclass.MethodTablePointer = reader.ReadRelativeIntPtr();
@@ -145,6 +156,10 @@ namespace ClrSpector
             eeclass.MethodDescChunks = reader.ReadRelativeIntPtr();
 
             eeclass.NativeSize = reader.ReadUInt();
+            if (IntPtr.Size == 8)
+            {
+                reader.ReadInt(); // Padding
+            }
             eeclass.ComCallableWrapper = reader.ReadIntPtr();
 
             eeclass.AttrClass = reader.ReadUInt();
@@ -155,7 +170,7 @@ namespace ClrSpector
                 eeclass.AuxFlags = reader.ReadUShort();
             }
 
-            eeclass.NormType = reader.ReadByte();
+            eeclass.NormType = (CorElementType)reader.ReadByte();
             eeclass.FieldsArePacked = reader.ReadByte() == 0x01;
             eeclass.FixedEEClassFields = reader.ReadByte();
             eeclass.BaseSizePadding = reader.ReadByte();

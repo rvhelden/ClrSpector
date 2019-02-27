@@ -1,7 +1,9 @@
 ﻿using System;
+using System.Diagnostics;
 
 namespace ClrSpectorConsole
 {
+    [DebuggerDisplay("{IntValue1}")]
     public class SampleClass : IDisposable, IComparable<SampleClass>
     {
         public int IntValue1;

@@ -1,10 +1,20 @@
 ﻿using System;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Microsoft.Diagnostics.Runtime;
 using ClrObject = ClrSpector.ClrObject;
 
 namespace ClrSpectorConsole
 {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct TestStruct
+    {
+        public readonly byte Test1;
+        public readonly byte Test2;
+        public readonly byte Test3;
+        public readonly byte Test4;
+    }
+
     class Program
     {
         static void Main(string[] args)
@@ -23,6 +33,7 @@ namespace ClrSpectorConsole
             Debugger.Break();
 
             ClrObject clrObject;
+            //clrObject = ClrObject.From<TestStruct>();
             clrObject = ClrObject.From<SampleClass>();
 
             /*using (var dataTarget = DataTarget.CreateSnapshotAndAttach(Process.GetCurrentProcess().Id))
