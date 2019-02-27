@@ -316,9 +316,14 @@ namespace ClrSpector
             this.Methods = new List<ClrMethodDescription>();
 
             for (uint slotNumber = 0; slotNumber < this.NumberOfVTableSlots; slotNumber++)
+            {
                 this.Methods.Add(this.CreateMethodDescription(slotNumber));
+            }
         }
 
+        // methodtable.inl -> MethodDesc* MethodTable::GetMethodDescForSlot(DWORD slot):595
+        // methodtable.cpp -> MethodDesc* MethodTable::GetMethodDescForSlotAddress(PCODE addr, BOOL fSpeculative /*=FALSE*/):7917
+        // codeman.cpp -> MethodDesc * ExecutionManager::GetCodeMethodDesc(PCODE currentPC):4230
         private ClrMethodDescription CreateMethodDescription(uint slotNumber)
         {
             var slotPointer = this.GetSlotPtrRaw(slotNumber);
@@ -330,6 +335,8 @@ namespace ClrSpector
             return md;
         }
 
+        // https://github.com/dotnet/coreclr/blob/master/Documentation/botr/method-descriptor.md#precode
+        // https://mattwarren.org/2017/12/15/How-does-.NET-JIT-a-method-and-Tiered-Compilation/
         private Precode CreatePrecode(MemoryReader reader)
         {
             var precodeType = (PrecodeType)reader.ReadByte();

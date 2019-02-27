@@ -24,6 +24,12 @@ namespace ClrSpectorConsole
             Console.WriteLine($"The location is {typeof(object).Assembly.Location}");
 
             var sampleClass = new SampleClass(2);
+            sampleClass.Method1();
+            sampleClass.Method2();
+            SampleClass.Method3();
+            sampleClass.ToString();
+            sampleClass.CompareTo(sampleClass);
+            sampleClass.Dispose();
 
             if (!Debugger.IsAttached)
             {
