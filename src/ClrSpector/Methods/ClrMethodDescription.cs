@@ -1,86 +1,96 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
+using System;
+using ClrSpector.Cdac;
 
 namespace ClrSpector
 {
-    public enum PackedSlotLayout : ushort
-    {
-        SlotMask = 0x03ff,
-        NameHashMask = 0xFC00
-    }
-
-    [Flags]
-    public enum MethodDescFlag2 : byte
-    {
-        // HasPrecode implies that HasStableEntryPoint is set.
-        HasStableEntryPoint = 0x01, // The method entrypoint is stable (either precode or actual code)
-        HasPrecode = 0x02,          // Precode has been allocated for this method
-        IsUnboxingStub = 0x04,
-        HasNativeCodeSlot = 0x08,   // Has slot for native code
-        IsJitIntrinsic = 0x10,      // Jit may expand method as an intrinsic
-        IsEligibleForTieredCompilation = 0x20
-    }
-
-    [Flags]
-    public enum MethodDescFlag3 : ushort
-    {
-        // There are flags available for use here (currently 5 flags bits are available); however, new bits are hard to come by, so any new flags bits should
-        // have a fairly strong justification for existence.
-        TokenRemainderMask = 0x3FFF, // This must equal METHOD_TOKEN_REMAINDER_MASK calculated higher in this file
-                                     // These are seperate to allow the flags space available and used to be obvious here
-                                     // and for the logic that splits the token to be algorithmically generated based on the
-                                     // #define
-        HasForwardedValuetypeParameter = 0x4000,           // Indicates that a type-forwarded type is used as a valuetype parameter (this flag is only valid for ngenned items)
-        ValueTypeParametersWalked = 0x4000,                // Indicates that all typeref's in the signature of the method have been resolved to typedefs (or that process failed) (this flag is only valid for non-ngenned methods)
-        DoesNotHaveEquivalentValuetypeParameters = 0x8000, // Indicates that we have verified that there are no equivalent valuetype parameters for this method
-    }
-
-
-    // Method.hpp:
+    /// <summary>
+    /// A single method as the runtime represents it (a MethodDesc).
+    /// </summary>
     public unsafe class ClrMethodDescription : ClrInternalObject
     {
-        public string DebugMethodName { get; set; }
-        public string DebugClassName { get; set; }
-        public string DebugMethodSignature { get; set; }
-        public IntPtr DebugMethodTablePointer { get; set; }
-        public IntPtr GcCover { get; set; }
-        public ClrMethodTable DebugMethodTable => ClrMethodTable.Create(new MemoryReader(this.DebugMethodTablePointer));
-        public ushort Flags3AndTokenRemainder { get; set; }
-        public byte ChunkIndex { get; set; }
-        public MethodDescFlag2 Flags2 { get; set; }
-        
-        // The slot number of this MethodDesc in the vtable array.
-        // Note that we may store other information in the high bits if available -- 
-        // see enum_packedSlotLayout and mdcRequiresFullSlotNumber for details.
-        public ushort SlotNumber { get; set; }
-        public PackedSlotLayout Flags { get; set; }
-        public MethodDescFlag3 Flags3 => (MethodDescFlag3)(this.Flags3AndTokenRemainder & ~(ushort)MethodDescFlag3.TokenRemainderMask);
-        public ushort Token => (ushort)(this.Flags3AndTokenRemainder & (ushort)MethodDescFlag3.TokenRemainderMask);
-        
-        public static ClrMethodDescription Create(MemoryReader reader)
+        /// <summary>mdMethodDef - the metadata table that method tokens live in.</summary>
+        private const uint MethodDefTokenType = 0x06000000;
+
+        /// <summary>The slot number of this method in the type's vtable.</summary>
+        public ushort SlotNumber { get; private set; }
+
+        /// <summary>
+        /// This MethodDesc's position within its chunk, in units of MethodDescAlignment.
+        /// </summary>
+        public byte ChunkIndex { get; private set; }
+
+        public ushort Flags { get; private set; }
+
+        public ushort Flags3AndTokenRemainder { get; private set; }
+
+        public byte EntryPointFlags { get; private set; }
+
+        public IntPtr CodeData { get; private set; }
+
+        /// <summary>
+        /// The method's ECMA-335 metadata token.
+        /// </summary>
+        /// <remarks>
+        /// The runtime does not store the whole token on the MethodDesc. The low bits live on
+        /// the MethodDesc (as the token remainder) and the high bits on the owning
+        /// MethodDescChunk (as the token range), so the token is reassembled from both plus
+        /// the MethodDescTokenRemainderBitCount global. Resolving this token through
+        /// <see cref="System.Reflection.Module.ResolveMethod(int)"/> is what lets a decoded
+        /// MethodDesc be tied back to a name and signature.
+        /// </remarks>
+        public uint MetadataToken { get; private set; }
+
+        /// <summary>The classification bits that say what kind of MethodDesc this is.</summary>
+        public MethodClassification Classification => (MethodClassification)(this.Flags & ClassificationMask);
+
+        internal const ushort ClassificationMask = 0x0007;
+
+        /// <summary>
+        /// Flags that widen the MethodDesc beyond its base size; these participate in the
+        /// size-table index alongside the classification.
+        /// </summary>
+        internal const ushort SizeAffectingFlagsMask = 0x0038;
+
+        public static ClrMethodDescription Create(MemoryReader reader, ushort tokenRange, int tokenRemainderBitCount)
         {
+            var layout = ContractDescriptor.Current.GetDataType("MethodDesc");
+
             var md = new ClrMethodDescription();
+            md.ClrPointer = reader.Address;
+            md.Size = layout.Size ?? 0;
 
-            if (ClrEnvironment.IsDebug())
-            {
-                md.DebugMethodName = reader.Dereference().ReadString();
-                md.DebugClassName = reader.Dereference().ReadString();
-                md.DebugMethodSignature = reader.Dereference().ReadString();
-                md.DebugMethodTablePointer = reader.ReadIntPtr();
-                md.GcCover = reader.ReadIntPtr();
-            }
+            md.Flags3AndTokenRemainder = reader.ReadUShort(layout["Flags3AndTokenRemainder"]);
+            md.ChunkIndex = reader.ReadByte(layout["ChunkIndex"]);
+            md.EntryPointFlags = reader.ReadByte(layout["EntryPointFlags"]);
+            md.SlotNumber = reader.ReadUShort(layout["Slot"]);
+            md.Flags = reader.ReadUShort(layout["Flags"]);
+            md.CodeData = reader.ReadIntPtr(layout["CodeData"]);
 
-            md.Flags3AndTokenRemainder = reader.ReadUShort();
-            md.ChunkIndex = reader.ReadByte();
-            md.Flags2 = (MethodDescFlag2)reader.ReadByte();
-            md.SlotNumber = reader.ReadUShort();
-            md.Flags = (PackedSlotLayout)reader.ReadUShort();
-
-            md.ClrPointer = new IntPtr(reader.BasePointer);
-            md.Size = reader.Position;
+            var remainderMask = (ushort)((1 << tokenRemainderBitCount) - 1);
+            var remainder = (uint)(md.Flags3AndTokenRemainder & remainderMask);
+            md.MetadataToken = MethodDefTokenType | ((uint)tokenRange << tokenRemainderBitCount) | remainder;
 
             return md;
         }
+
+        public override string ToString()
+        {
+            return $"MethodDesc @0x{this.ClrPointer.ToInt64():x} slot={this.SlotNumber} token=0x{this.MetadataToken:x8}";
+        }
+    }
+
+    /// <summary>
+    /// What kind of MethodDesc this is; the low bits of MethodDesc.Flags.
+    /// </summary>
+    public enum MethodClassification
+    {
+        IL = 0,
+        FCall = 1,
+        PInvoke = 2,
+        EEImpl = 3,
+        Array = 4,
+        Instantiated = 5,
+        ComInterop = 6,
+        Dynamic = 7
     }
 }

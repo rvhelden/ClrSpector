@@ -1,14 +1,19 @@
-﻿using System;
+using System;
 using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace ClrSpector
 {
+    /// <summary>
+    /// Reads a runtime structure at a known base address.
+    /// </summary>
+    /// <remarks>
+    /// Reads are addressed by explicit offset rather than sequentially. Offsets come from the
+    /// runtime's own contract descriptor, so field order in this process is irrelevant - which
+    /// is what makes the reader independent of the runtime's private layout choices.
+    /// </remarks>
     public unsafe class MemoryReader
     {
-        public void* BasePointer { get; set; }
-        public uint Position { get; set; }
-
         public MemoryReader(IntPtr basePtr)
         {
             this.BasePointer = basePtr.ToPointer();
@@ -19,105 +24,50 @@ namespace ClrSpector
             this.BasePointer = basePtr;
         }
 
+        public void* BasePointer { get; }
+
+        public IntPtr Address => (IntPtr)this.BasePointer;
+
+        public bool IsNull => this.BasePointer == null;
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void* GetCurrentPointer()
+        private void* At(int offset) => (byte*)this.BasePointer + offset;
+
+        public byte ReadByte(int offset) => *(byte*)this.At(offset);
+
+        public ushort ReadUShort(int offset) => *(ushort*)this.At(offset);
+
+        public short ReadShort(int offset) => *(short*)this.At(offset);
+
+        public uint ReadUInt(int offset) => *(uint*)this.At(offset);
+
+        public int ReadInt(int offset) => *(int*)this.At(offset);
+
+        public IntPtr ReadIntPtr(int offset) => *(IntPtr*)this.At(offset);
+
+        /// <summary>A reader positioned at the pointer stored at <paramref name="offset"/>.</summary>
+        public MemoryReader Dereference(int offset) => new MemoryReader(this.ReadIntPtr(offset));
+
+        /// <summary>A reader positioned <paramref name="offset"/> bytes further along.</summary>
+        public MemoryReader Offset(int offset) => new MemoryReader(this.At(offset));
+
+        public string ReadNullTerminatedString(int offset)
         {
-            return (byte*)this.BasePointer + this.Position;
-        }
-
-        public byte ReadByte()
-        {
-            var value = *(byte*)this.GetCurrentPointer();
-            this.Position += sizeof(byte);
-
-            return value;
-        }
-
-        public int ReadInt()
-        {
-            var value = *(int*)this.GetCurrentPointer();
-            this.Position += sizeof(int);
-
-            return value;
-        }
-
-        public uint ReadUInt()
-        {
-            var value = *(uint*) this.GetCurrentPointer();
-            this.Position += sizeof(uint);
-
-            return value;
-        }
-
-        public ushort ReadUShort()
-        {
-            var value = *(ushort*)this.GetCurrentPointer();
-            this.Position += sizeof(ushort);
-
-            return value;
-        }
-
-        public short ReadShort()
-        {
-            var value = *(short*)this.GetCurrentPointer();
-            this.Position += sizeof(short);
-
-            return value;
-        }
-
-        public MemoryReader Dereference()
-        {
-            var dereferenced = new MemoryReader(*(IntPtr*)this.GetCurrentPointer());
-            this.Position += (uint)IntPtr.Size;
-
-            return dereferenced;
-        }
-
-        public string ReadString()
-        {
-            var charBase = (byte*)this.GetCurrentPointer();
+            var start = (byte*)this.At(offset);
+            if (start == null)
+                return null;
 
             var builder = new StringBuilder();
-
-            int count = 0;
-            while (true)
+            for (var i = 0; ; i++)
             {
-                var value = *(charBase + count++);
-                if (value == '\0')
+                var value = start[i];
+                if (value == 0)
                     break;
 
                 builder.Append((char)value);
             }
 
-            this.Position += (uint)count;
-
             return builder.ToString();
-        }
-
-        public IntPtr ReadIntPtr()
-        {
-            var value = *(IntPtr*)this.GetCurrentPointer();
-            this.Position += (uint)IntPtr.Size;
-
-            return value;
-        }
-
-        public IntPtr ReadRelativeIntPtr()
-        {
-            var value = *(IntPtr*)this.GetCurrentPointer();
-            if (value == IntPtr.Zero)
-            {
-                this.Position += (uint)IntPtr.Size;
-                return IntPtr.Zero;
-            }
-
-            value = IntPtr.Size == 8 ? 
-                new IntPtr(value.ToInt64() + (byte*)this.BasePointer + this.Position) : 
-                new IntPtr(value.ToInt32() + (byte*)this.BasePointer + this.Position);
-
-            this.Position += (uint)IntPtr.Size;
-
-            return value;
         }
     }
 }
