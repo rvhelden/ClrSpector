@@ -2,7 +2,8 @@
 
 Reads CoreCLR's private in-memory data structures from inside the running process, and uses that
 to **detour a method call** — swapping a concrete method for a stand-in so it can be mocked
-without the production type needing an interface.
+without the production type needing an interface. Static, non-virtual and virtual methods are all
+supported, and the precode and vtable machinery it relies on is exposed for inspection.
 
 Targets **.NET 10**. Verified on .NET 10.0.4 / linux-x64.
 
@@ -12,7 +13,8 @@ var methodTable = ClrObject.From<Order>().MethodTable;
 foreach (var method in methodTable.Methods)
     Console.WriteLine(method.MetadataToken);
 
-// Stand in for a concrete, non-virtual method for the duration of a test
+// Stand in for a concrete method for the duration of a test - no interface required.
+// Works for static, non-virtual and virtual methods alike.
 using (MethodDetour.Redirect(
            typeof(PriceService), nameof(PriceService.GetPrice),
            typeof(PriceServiceProxy), nameof(PriceServiceProxy.GetPrice)))
@@ -20,6 +22,11 @@ using (MethodDetour.Redirect(
     Assert.Equal(42m, new PriceService().GetPrice("abc"));  // the proxy answers
 }
 // original behaviour restored here
+
+// Or just look at how a method is dispatched
+Console.WriteLine(MethodPrecode.Of(typeof(PriceService).GetMethod("GetPrice")));
+// PriceService.GetPrice entryPoint=0x… [ff 25 fa 3f 00 00 …] jmp qword [rip+16378]
+//                       slot=0x… -> 0x…
 ```
 
 ---
@@ -36,14 +43,19 @@ using (MethodDetour.Redirect(
   - [Failing loudly](#failing-loudly)
 - [How method detouring works](#how-method-detouring-works)
   - [The problem](#the-problem)
+  - [What can be detoured](#what-can-be-detoured)
   - [What does not work: patching the code](#what-does-not-work-patching-the-code)
   - [What a precode is](#what-a-precode-is)
   - [Finding the dispatch slot](#finding-the-dispatch-slot)
+  - [Virtual calls go through the vtable instead](#virtual-calls-go-through-the-vtable-instead)
+  - [Where the vtable lives, and why it is chunked](#where-the-vtable-lives-and-why-it-is-chunked)
   - [Performing the swap](#performing-the-swap)
   - [Why it catches every call shape](#why-it-catches-every-call-shape)
+  - [Interface dispatch cannot be undone](#interface-dispatch-cannot-be-undone)
   - [Keeping it safe](#keeping-it-safe)
   - [Limits you must know](#limits-you-must-know)
   - [Writing a proxy](#writing-a-proxy)
+  - [Inspecting a precode yourself](#inspecting-a-precode-yourself)
 - [Project layout](#project-layout)
 - [Building and testing](#building-and-testing)
 - [Platform support](#platform-support)
@@ -285,6 +297,24 @@ for the test. `MethodDetour` provides that seam without the interface: it redire
 concrete, non-virtual method so they run a stand-in instead, and restores the original when
 disposed.
 
+### What can be detoured
+
+A method can be reached two different ways, and which one applies decides how it is redirected.
+Every row below is exercised by the test suite.
+
+| Method kind | Dispatched through | Supported |
+|---|---|---|
+| `static` | precode | yes |
+| non-virtual instance | precode | yes |
+| `virtual` | vtable **and** precode | yes — both are patched |
+| `override` | vtable | yes, including through a base-typed reference |
+| sealed `override` via abstract base | vtable | yes |
+| `abstract` declaration | nothing — no implementation | refused, with an explanation |
+| reached by **interface** dispatch | interface stub cache | refused by default — [it cannot be undone](#interface-dispatch-cannot-be-undone) |
+
+`MethodDetour.PatchedTargets` reports which paths a given redirect actually patched
+(`Precode`, `Vtable`, or both).
+
 ### What does not work: patching the code
 
 The obvious approach is to overwrite the target's machine code with a jump to the replacement. It
@@ -326,7 +356,21 @@ entry point ──▶  ff 25 fa 3f 00 00        jmp qword [rip+0x3ffa]
                               dispatch slot: ──▶ current real code
 ```
 
-That slot is the interception point. Everything reaching the method goes through it.
+That slot is the interception point for every **non-virtual** call. (Virtual calls take a
+different route — see below.)
+
+The runtime publishes its own precode constants in the contract descriptor, and
+`PrecodeMachineInfo` exposes them rather than guessing:
+
+```
+PrecodeMachineDescriptor @0x742689022fb8  fixup=2  stub=3  invalid=255
+                         fixupCodeOffset=6  stubPrecodeSize=24  codePageSize=16384
+```
+
+`fixupCodeOffset=6` independently confirms the 6-byte jump length used below, and
+`codePageSize=16384` explains where the slot lands: the decoded displacement puts it exactly
+`0x4000` past the stub, because the dispatch slots live on a writable data page one code page away
+from the executable stub page. That relationship is asserted in the tests.
 
 ### Finding the dispatch slot
 
@@ -351,15 +395,109 @@ appears before adding it.
 Both methods are jitted first with `RuntimeHelpers.PrepareMethod`, since an entry point is
 meaningless until the method has one.
 
-### Performing the swap
+### Virtual calls go through the vtable instead
 
-The redirect is one pointer-sized store. The method's machine code is never modified:
+A virtual call never consults the precode. It reads the target straight out of the receiver's
+MethodTable vtable, which the runtime has already backpatched to the real code:
+
+```
+non-virtual / static call ──▶ precode stub ──▶ dispatch slot ──▶ real code
+                                                    ▲
+                                   patching here catches these calls
+
+virtual call ──▶ receiver's MethodTable ──▶ vtable[slot] ──▶ real code
+                                                 ▲
+                              …but virtual calls never look at the slot above
+```
+
+So redirecting the precode alone leaves every virtual call running the original — and it does so
+**silently**, with no error. That was measured before this was fixed: `virtual`, `override`, sealed
+`override` and interface-implementing methods all reported "not redirected" while non-virtual and
+static worked.
+
+`MethodDetour` therefore patches **both** paths whenever both exist. Patching the vtable alone
+would miss a virtual method invoked non-virtually — `base.M()`, or a call the JIT devirtualized —
+so both are needed, not either.
+
+That the vtable holds real code rather than the precode entry point is asserted directly:
 
 ```csharp
-CodeProtection.MakeWritable((IntPtr)slot, IntPtr.Size);
+var vtableSlotValue = new MemoryReader(MethodVtable.FindSlot(method)).ReadIntPtr(0);
 
-var original = *slot;                                     // remember
-*slot = replacement.MethodHandle.GetFunctionPointer();     // redirect
+await Assert.That(vtableSlotValue).IsNotEqualTo(precode.EntryPoint);      // not the stub
+await Assert.That(vtableSlotValue).IsEqualTo(precode.DispatchTarget);     // the real code
+```
+
+### Where the vtable lives, and why it is chunked
+
+The vtable is **not** one contiguous array. It is an array of *chunk pointers* beginning
+immediately after the MethodTable's fixed fields, with **8 slots per chunk**:
+
+```
+MethodTable
+ +0                       fixed fields (MTFlags, BaseSize, …)
+ +MethodTable.Size   ┌──▶ chunk pointer [0] ─────┐
+                     │    chunk pointer [1] ──┐  │
+                     │    …                   │  │
+                     └── (slot / 8) selects   │  │
+                                              │  └──▶ chunk: 8 slots, (slot % 8) selects
+                                              └─────▶ chunk: 8 slots
+```
+
+```csharp
+chunkPointer = *(IntPtr*)(methodTable + MethodTable.Size + (slot / 8) * IntPtr.Size);
+slotAddress  = chunkPointer + (slot % 8) * IntPtr.Size;
+```
+
+The offset of the chunk-pointer array is the descriptor-published `MethodTable` size, so it is not
+hardcoded. The 8-slots-per-chunk figure is a CoreCLR compile-time constant that the descriptor does
+*not* publish; it is verified against types with more than one chunk, and exposed as
+`MethodVtable.SlotsPerVtableChunk`.
+
+**Chunks are not adjacent, and they are shared.** A derived type that overrides nothing in a chunk
+reuses its base type's chunk, which can sit at a *lower* address than the MethodTable itself. This
+is why treating the vtable as contiguous is wrong rather than merely inelegant — measured on a
+subclass overriding only a late slot:
+
+```
+Sub MethodTable 0x7dd8e6cc3600   numVirtuals=16
+  chunk 0 -> 0x7dd8e6cc3518   (MethodTable-232)   ← shared with the base type
+  chunk 1 -> 0x7dd8e6cc3650   (MethodTable+80)
+
+  name  slot   contiguous model      chunked model
+  V0    4      MATCH                 MATCH
+  V5    9      MATCH                 MATCH
+  V9    13     MATCH                 MATCH
+  V11   15     wrong address         MATCH        ← the overridden slot
+```
+
+The two models agree only when chunks happen to be laid out adjacently, which is why a naive
+implementation can pass casual testing and still be wrong.
+
+Chunk sharing has a visible consequence: a vtable patch applies to the **declaring type**, and
+subclasses that inherit the slot unchanged are affected too. Subclasses that *override* have their
+own slot and are unaffected — asserted by
+`RedirectingTheBaseLeavesAnOverridingSubclassAlone`.
+
+The slot index itself comes from the inspector: the decoded `MethodDesc` for the method carries its
+`SlotNumber`, matched by metadata token. So the detour is built on the descriptor-driven decoding
+described earlier.
+
+### Performing the swap
+
+Each redirect is one pointer-sized store, applied to every dispatch path the method has. The
+method's machine code is never modified:
+
+```csharp
+private static Patch Apply(IntPtr address, IntPtr value)
+{
+    CodeProtection.MakeWritable(address, IntPtr.Size);
+
+    var original = *(IntPtr*)address;      // remember
+    *(IntPtr*)address = value;             // redirect
+
+    return new Patch(address, original);
+}
 ```
 
 `CodeProtection` makes the page writable with `mprotect` (POSIX) or `VirtualProtect` (Windows),
@@ -369,14 +507,16 @@ Note the replacement's *own* entry point is stored — its precode, not raw code
 becomes `target precode slot → replacement precode → replacement code`. That is more robust than
 pointing at a code address directly.
 
-Restoring is the same store in reverse, and `Dispose` is idempotent:
+Restoring replays every patch in reverse, and `Dispose` is idempotent:
 
 ```csharp
 public void Dispose()
 {
     if (!this.IsActive) return;
 
-    *this.slot = this.original;
+    foreach (var patch in this.patches)
+        patch.Undo();
+
     this.IsActive = false;
 }
 ```
@@ -386,8 +526,8 @@ exception, which is what you want when a test fails partway through.
 
 ### Why it catches every call shape
 
-There is one slot and every caller goes through it, so the redirect is not specific to how the call
-is written. All three of these are asserted in the test suite:
+For a non-virtual method there is one slot and every caller goes through it, so the redirect is not
+specific to how the call is written. All three of these are asserted:
 
 ```csharp
 using (MethodDetour.Redirect(method, replacement))
@@ -397,6 +537,51 @@ using (MethodDetour.Redirect(method, replacement))
     method.Invoke(service, new object[] { "x" });  // reflection       → proxy
 }
 ```
+
+For a virtual method, patching precode *and* vtable covers the virtual call, the non-virtual
+`base.M()` call, and a devirtualized call alike.
+
+### Interface dispatch cannot be undone
+
+One case is genuinely not supportable, and it is the sharpest edge here.
+
+Interface dispatch does not read the class vtable directly — it resolves through a dispatch stub
+and **caches the result**. That cache is not reverted when the detour is disposed, so a call made
+through an interface reference while redirected leaks the proxy *permanently and process-wide*.
+Measured:
+
+```
+concrete before : real
+interface during: PROXY
+concrete after  : real       ← the vtable and precode were restored correctly
+interface after : PROXY      ← but interface dispatch still resolves to the proxy
+
+fresh instance, after restore:
+interface on new instance: PROXY     ← even objects created later
+```
+
+Restoring the vtable and precode is not enough, and there is no supported way to flush that cache.
+In a test suite this is the worst possible failure: silent contamination of every later test.
+
+So `MethodDetour` **refuses** to redirect a method that implements an interface member:
+
+```
+'Exporter.Export' implements an interface method. A call made through an interface reference
+while redirected is cached by the runtime's interface dispatch and is NOT undone on dispose -
+the redirect leaks permanently and process-wide, reaching even instances created afterwards.
+Redirect the interface method itself, or pass allowInterfaceDispatch: true if you are sure the
+method is never called through an interface reference.
+```
+
+If the method genuinely is never called through an interface reference, the guard can be lifted
+knowingly:
+
+```csharp
+MethodDetour.Redirect(target, replacement, allowInterfaceDispatch: true);
+```
+
+That works and restores correctly — as long as the interface path is never exercised. If a type has
+an interface, mocking through the interface is the better tool.
 
 ### Keeping it safe
 
@@ -431,6 +616,8 @@ type itself.
 | **Inlined calls cannot be intercepted** | If the JIT inlined the callee, no call happens at all, so there is no dispatch to redirect. | Mark redirectable methods `[MethodImpl(MethodImplOptions.NoInlining)]`. |
 | **Tiered compilation rewrites the same slot** | Promoting a method to optimised code updates the dispatch slot, silently dropping your redirect. | Set `<TieredCompilation>false</TieredCompilation>` in test projects that rely on this. |
 | **The slot is process-wide** | Two tests redirecting the same method concurrently each undo the other. | Serialize them. With TUnit, `[NotInParallel]`. |
+| **Interface dispatch leaks** | Interface dispatch caches the resolved target and the cache is not reverted. Permanent and process-wide. | Refused by default; see above. Mock through the interface instead. |
+| **A vtable patch is per declaring type** | Subclasses inheriting the slot are affected; overriding subclasses are not. | Redirect the type whose behaviour you mean to replace. |
 | **x64 / POSIX verified only** | The `jmp` decoding is x64-specific and `mprotect` is POSIX. | The Windows `VirtualProtect` path exists but is untested; arm64 is unverified. |
 | **Not for production** | Mutating runtime dispatch state is not thread-safe against concurrent calls to the target. | Use it in tests. |
 
@@ -481,6 +668,61 @@ public async Task UsesThePriceFromTheService()
 `MethodDetour.Redirect` also takes `MethodBase` overloads directly when you need to pick a specific
 overload.
 
+### Inspecting a precode yourself
+
+The precode and vtable machinery is public, so you can look at what a method's dispatch actually
+looks like without performing a redirect:
+
+```csharp
+var precode = MethodPrecode.Of(typeof(Svc).GetMethod("Virt"));
+
+precode.EntryPoint        // 0x74260af7bb10  - the stable entry point (the stub, not the body)
+precode.HexBytes          // "ff 25 fa 3f 00 00 4c 8b 15 fb 3f 00 00 ff 25 fd"
+precode.IsRipRelativeJump // true
+precode.Disassembly       // "jmp qword [rip+16378]"
+precode.DispatchSlot      // 0x74260af7fb10  - the one slot a redirect writes to
+precode.DispatchTarget    // 0x74260a9d9300  - where it currently points
+```
+
+`ToString()` gives the whole picture on one line, which is handy in a debugger or a log:
+
+```
+Svc.Virt entryPoint=0x74260af7bb10 [ff 25 fa 3f 00 00 …] jmp qword [rip+16378]
+         slot=0x74260af7fb10 -> 0x74260a9d9300
+```
+
+The runtime's own precode constants:
+
+```csharp
+var machine = PrecodeMachineInfo.Current;
+
+machine.FixupPrecodeType     // 2
+machine.StubPrecodeType      // 3
+machine.InvalidPrecodeType   // 255
+machine.FixupCodeOffset      // 6      - matches the rip-relative jump length
+machine.StubPrecodeSize      // 24
+machine.StubCodePageSize     // 16384  - the stub-to-slot distance
+```
+
+And the vtable side:
+
+```csharp
+MethodVtable.FindSlotNumber(method)   // vtable slot index, or -1 if it occupies none
+MethodVtable.FindSlot(method)         // the slot's address, or IntPtr.Zero
+MethodVtable.SlotsPerVtableChunk      // 8
+```
+
+A live detour also reports what it did:
+
+```csharp
+using var detour = MethodDetour.Redirect(target, replacement);
+
+detour.PatchedTargets   // Precode | Vtable
+detour.VtableSlot       // patched slot address, or IntPtr.Zero for non-virtual
+detour.Precode          // the MethodPrecode above
+detour.IsActive         // false after Dispose
+```
+
 ---
 
 ## Project layout
@@ -493,6 +735,9 @@ src/ClrSpector/                     the library
     Globals.cs                      literal and pointer-data globals
   Detours/
     MethodDetour.cs                 redirect a method, restore on dispose
+    MethodPrecode.cs                a method's precode and its dispatch slot
+    MethodVtable.cs                 locate a virtual method's vtable slot
+    PrecodeMachineInfo.cs           the runtime's own precode constants
     CodeProtection.cs               mprotect / VirtualProtect
   ClrObject.cs                      entry point: ClrObject.From<T>()
   ClrEEClass.cs                     the cold half of a type
