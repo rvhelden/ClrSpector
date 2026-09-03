@@ -241,6 +241,100 @@ namespace ClrSpector.Detours
         }
 
         /// <summary>
+        /// Replaces <paramref name="target"/>'s body with <paramref name="instructions"/> until
+        /// the returned handle is disposed.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The usual source of the instructions is the target's own decoded IL - read it with
+        /// <see cref="ClrMethodIl.Of"/>, change what you want, and pass the list back. Operands
+        /// are the resolved members the decoder produced, so the emitter can issue fresh tokens
+        /// for them; a token left unresolved as a bare integer is refused rather than emitted
+        /// against the wrong module.
+        /// </para>
+        /// <para>
+        /// The original bytes are not overwritten - they live in a read-only image and the method
+        /// is likely jitted already. The new body is emitted as a method of its own and the
+        /// target's dispatch slots point at it, so disposing restores the original exactly as any
+        /// other redirect does.
+        /// </para>
+        /// </remarks>
+        /// <param name="locals">
+        /// The local variable types, in slot order. Pass the original method's
+        /// <see cref="ClrMethodIl.Locals"/> types when the body still uses them.
+        /// </param>
+        public static MethodDetour ReplaceIl(
+            MethodBase target,
+            IReadOnlyList<ClrIlInstruction> instructions,
+            IReadOnlyList<Type> locals = null,
+            bool allowTieredCompilation = false)
+        {
+            return ReplaceBody(
+                target,
+                () => MethodIlEmitter.Emit(target, instructions, locals),
+                allowTieredCompilation);
+        }
+
+        /// <summary>
+        /// Replaces <paramref name="target"/>'s body with one written directly against an
+        /// <see cref="System.Reflection.Emit.ILGenerator"/>.
+        /// </summary>
+        /// <remarks>
+        /// The escape hatch for a body built from scratch rather than edited from decoded IL -
+        /// and the way to write one that needs try/catch, which cannot be expressed as a flat
+        /// instruction list. The generator is for a method whose receiver and arguments arrive
+        /// exactly as the target's do.
+        /// </remarks>
+        public static MethodDetour ReplaceBody(
+            MethodBase target,
+            Action<System.Reflection.Emit.ILGenerator> body,
+            bool allowTieredCompilation = false)
+        {
+            if (body == null) throw new ArgumentNullException(nameof(body));
+
+            return ReplaceBody(target, () => MethodIlEmitter.Emit(target, body), allowTieredCompilation);
+        }
+
+        private static MethodDetour ReplaceBody(
+            MethodBase target, Func<MethodInfo> emit, bool allowTieredCompilation)
+        {
+            if (target == null) throw new ArgumentNullException(nameof(target));
+
+            // The replacement is generated to fit, so only the target's own shape can rule this
+            // out - there is no pairing to classify.
+            var refusal = MethodPairingAnalysis.RefuseUnsupportedTarget(target);
+            if (refusal != null)
+                throw new MethodDetourException(refusal);
+
+            if (!allowTieredCompilation)
+                EnsureTieringWillNotUndoIt(target);
+
+            RuntimeHelpers.PrepareMethod(target.MethodHandle);
+
+            var replacement = emit();
+            var entryPoint = EmittedCode.EntryPointOf(replacement);
+
+            var detour = new MethodDetour(target, replacement, new List<Patch>())
+            {
+                Pairing = MethodPairing.Direct,
+                Thunk = replacement,
+                ThunkEntryPoint = entryPoint
+            };
+
+            try
+            {
+                detour.Apply(entryPoint);
+            }
+            catch
+            {
+                detour.Dispose();
+                throw;
+            }
+
+            return detour;
+        }
+
+        /// <summary>
         /// Points every dispatch path the target can be reached through at
         /// <paramref name="to"/>.
         /// </summary>

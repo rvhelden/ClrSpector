@@ -52,15 +52,25 @@ namespace ClrSpector
         /// carry. The segment structure is read once and a collection rebuilds it, so refresh
         /// with <see cref="ClrGcHeap.Refresh"/> if the layout may have changed underneath.
         /// </remarks>
-        public ClrHeapSegment Segment
-        {
-            get
-            {
-                var address = this.Address.ToInt64();
+        public ClrHeapSegment Segment => this.SegmentIn(ClrGcHeap.Current);
 
-                return ClrGcHeap.Current.Segments.FirstOrDefault(
-                    segment => address >= segment.Mem.ToInt64() && address < segment.Committed.ToInt64());
-            }
+        /// <summary>
+        /// The segment of <paramref name="heap"/> this object lives in, or null when that
+        /// snapshot covers no such address.
+        /// </summary>
+        /// <remarks>
+        /// Prefer this over <see cref="Segment"/> when the object was allocated after the heap
+        /// was last read: a fresh allocation can land in a segment that did not exist then, and
+        /// the cached snapshot would report no segment at all.
+        /// </remarks>
+        public ClrHeapSegment SegmentIn(ClrGcHeap heap)
+        {
+            if (heap == null) throw new ArgumentNullException(nameof(heap));
+
+            var address = this.Address.ToInt64();
+
+            return heap.Segments.FirstOrDefault(
+                segment => address >= segment.Mem.ToInt64() && address < segment.Committed.ToInt64());
         }
 
         /// <summary>
@@ -72,6 +82,9 @@ namespace ClrSpector
         /// same question through the supported API without reading the heap.
         /// </remarks>
         public int Generation => this.Segment?.Generation ?? -1;
+
+        /// <summary>The generation this object is in according to <paramref name="heap"/>.</summary>
+        public int GenerationIn(ClrGcHeap heap) => this.SegmentIn(heap)?.Generation ?? -1;
 
         /// <summary>
         /// The GC's entry for a live object: its address, its size as the collector computes it,

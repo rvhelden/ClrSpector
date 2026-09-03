@@ -88,12 +88,16 @@ namespace ClrSpectorTests
             using var scope = GcWalkScope.Enter();
 
             var large = new byte[100_000];
+
+            // The allocation may have created a segment that did not exist when the heap was
+            // last read, so the lookup is made against a snapshot taken after it.
+            var heap = ClrGcHeap.Refresh();
             var entry = ClrHeapObject.Of(large, scope);
-            var segment = entry.Segment;
+            var segment = entry.SegmentIn(heap);
 
             await Assert.That(segment).IsNotNull();
             await Assert.That(segment.IsLargeObjectHeap).IsTrue();
-            await Assert.That(entry.Generation).IsEqualTo(segment.Generation);
+            await Assert.That(entry.GenerationIn(heap)).IsEqualTo(segment.Generation);
 
             scope.ThrowIfInvalidated();
         }
@@ -104,7 +108,8 @@ namespace ClrSpectorTests
             using var scope = GcWalkScope.Enter();
 
             var instance = new GcSample();
-            var segment = ClrHeapObject.Of(instance, scope).Segment;
+            var heap = ClrGcHeap.Refresh();
+            var segment = ClrHeapObject.Of(instance, scope).SegmentIn(heap);
 
             await Assert.That(segment).IsNotNull();
             await Assert.That(segment.IsLargeObjectHeap).IsFalse();

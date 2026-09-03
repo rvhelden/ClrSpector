@@ -828,6 +828,274 @@ Byte[]     addr=0x19284c00048 size=100024 count=100000 gen=3 loh=True   System.B
 `GcWalkScope` for anything longer than a single read. `Of` also re-checks the MethodTable it
 decoded against the object's actual type, so a move is reported rather than returned as nonsense.
 
+### Field layout
+
+`Methods` has a counterpart. `EEClass.FieldDescList` holds this type's own instance fields
+followed by its statics, and each `FieldDesc` packs a token plus storage flags into one word and
+a 27-bit offset plus a 5-bit element type into another:
+
+```csharp
+foreach (var field in ClrObject.From(typeof(Sample)).MethodTable.Fields)
+    Console.WriteLine($"{module.ResolveField((int)field.MetadataToken).Name} at {field.Offset}");
+```
+
+```
+First        offset=4    type=I4     reads 0x11111111
+Second       offset=16   type=I8     reads 0x2222222222222222
+Text         offset=8    type=CLASS  reads ptr 0x25fbe843b88
+Small        offset=24   type=U1     reads 0x33
+StaticField  offset=0    type=I4     static
+PerThread    offset=16   type=I4     threadstatic
+```
+
+Note the runtime **reordered** them - `Text` sits between `First` and `Second`. Reflection reports
+declaration order and no offsets at all; this is where the fields actually are, and the tests
+prove it by reading each one out of a live object at its reported offset.
+
+### Turning an address back into a method
+
+`ClrCodeMap` goes the opposite way to everything else here: from a bare code address to the
+method it belongs to. Two structures do the work - a five-level range section map that partitions
+the address space by successive bytes of the address, then a nibble map that finds the individual
+method inside a code heap. The code header sits one pointer behind the method's code and names
+the MethodDesc.
+
+```csharp
+var block = ClrCodeMap.Current.Find(someAddress);
+// 0x7ffa29988444 Sample.Add+0x4 (start=0x7ffa29988440)
+
+ClrCodeMap.Current.FindMethod(returnAddress);   // -> MethodBase
+```
+
+An address anywhere *inside* a method resolves to it, not just its entry point, which is what
+makes it useful on a return address. Precodes and dispatch stubs report as `Stub`, ready-to-run
+and interpreter ranges report as themselves, and an address that is not code returns null.
+
+### What tiering actually did
+
+`IsEligibleForTieredCompilation` says the runtime *may* recompile a method. `CodeVersions` says
+what it has done - and with the code map, you can watch it happen:
+
+```
+first compile: slot -> 0x7ffa2999b410  Hot.Work+0x0
+after work:    slot -> 0x7ffa2999fcf0  Hot.Work+0x0        <- the slot was rewritten
+   versions=2
+      tier=Tier1             code=0x7ffa2999fd20
+      tier=Tier0Instrumented code=0x7ffa2999fcf0
+```
+
+That rewrite is exactly what silently drops a detour, which is why the tiering guard exists.
+
+### Managed threads
+
+The runtime's own ThreadStore, which is both complete and managed-only - unlike
+`Process.Threads`, which lists OS threads and cannot tell you which are managed:
+
+```csharp
+foreach (var thread in ClrThreadStore.Read().Threads)
+    Console.WriteLine(thread);
+```
+
+```
+thread @0x26942521980 managedId=1 osId=16000 coop=False stack=1536KB
+thread @0x2694430e690 managedId=2 osId=33216 coop=True  stack=1536KB
+```
+
+`coop` is the one you cannot get otherwise: whether the thread is running managed code, so the GC
+must suspend it rather than ignore it.
+
+### An exception's captured frames
+
+`Exception.StackTrace` gives you a formatted string. The underlying data is an array of
+`(instruction pointer, MethodDesc)` pairs on the exception object:
+
+```csharp
+foreach (var frame in ClrExceptionTrace.Of(caught))
+    Console.WriteLine(ClrCodeMap.Current.Find(frame.InstructionPointer));
+```
+
+```
+0x7ffa29971be1 Program.Deep+0x31
+0x7ffa29971b89 Program.Middle+0x9
+0x7ffa29971b59 Program.Outer+0x9
+0x7ffa2997188a Program.Main+0x2a
+```
+
+Each frame is a `MethodBase` you can act on rather than text to parse, and it works on an
+exception that was never thrown far enough to have its string built.
+
+### Tokens without types
+
+A module keeps a lookup table from each metadata token to the runtime structure for it, so a
+token can reach a MethodTable with no `Type` ever existing - the direction reflection will not go:
+
+```csharp
+var module = ClrModule.Of(typeof(Sample));
+module.TypeDefToMethodTable(0x02000002);     // -> MethodTable
+module.MethodDefToMethodDesc(methodToken);   // -> MethodDesc
+```
+
+Zero means "not loaded yet" rather than "no such type" - the runtime builds a MethodTable on
+first use. `ClrAssembly` and `ClrLoaderAllocator` sit alongside, the latter naming the heaps
+precodes are allocated from.
+
+### Disassembling IL
+
+```csharp
+Console.WriteLine(ClrMethodIl.Of(method).Dump());
+```
+
+```
+// Sample::Branchy
+.maxstack 2
+.locals init (
+    [0] System.Int32,
+    [1] System.Int32
+)
+IL_0000:  ldc.i4.0
+IL_0001:  stloc.0
+...
+IL_0044:  br.s         IL_0058
+IL_0046:  ldarg.2
+IL_0047:  ldstr        "zero"
+IL_004c:  call         System.String::Concat
+// Clause try IL_001e..IL_0029 handler IL_0029..IL_002e catch System.InvalidOperationException
+// Finally try IL_001e..IL_002e handler IL_002e..IL_0039
+```
+
+The opcode tables are built from the framework's own `OpCodes` at startup rather than written
+out, so they cannot drift. Tokens resolve through the declaring module with the type's and
+method's generic arguments supplied as context - without those, a token inside a generic method
+will not resolve. The tests assert that the decoded instruction lengths sum to exactly the body
+size and that every branch target lands on an instruction boundary, which is what catches a
+mis-sized operand.
+
+Pass `IlDumpStyle.Ansi` for colour, or `IlDumpStyle.Auto` to colour only when the output looks
+like a terminal that wants it - `Auto` honours `NO_COLOR` and treats a redirected stream as not a
+terminal, so the same call is right for a console and for a log file. Instructions are coloured by
+what they *do* rather than by opcode, since control flow, calls and the loads that name something
+outside the method are the parts worth finding by eye. A test asserts that stripping the escapes
+from a coloured dump gives back the plain one exactly, so the two renderings cannot drift apart.
+
+### Names without reflection
+
+A MethodTable stores a TypeDef token and a MethodDesc a MethodDef token. Neither stores a name -
+those live in the module's string heap - so until now recovering one meant handing the token back
+to reflection. `ClrModuleMetadata` reads them out of the mapped image instead:
+
+```csharp
+var table = ClrObject.From(typeof(Shop)).MethodTable;
+
+table.MetadataName          // "AbiProbe.Shop"        - from the string heap
+table.Name                  // "AbiProbe.Shop"        - via the type handle
+
+var method = table.Methods.First(m => m.Name == "Check");
+method.Name                 // "Check"
+method.DeclaringTypeName    // "AbiProbe.Shop"
+```
+
+The metadata is found by walking the image's own headers: the PE data directory gives the COR20
+header, which gives the metadata directory. Because the image is *mapped*, an RVA is simply an
+offset from the module base, so no section translation is needed, and `MetadataReader` is pointed
+straight at those bytes without copying them.
+
+The two name routes differ deliberately. `Name` goes through the type handle and reports the full
+instantiation, `List<string>`; `MetadataName` reports what the TypeDef row holds, ``List`1``. A
+nested type comes back as `Outer+Nested` either way, which costs a walk to the enclosing row.
+
+### IL from a MethodDesc
+
+The same token gives the body's RVA, so a method's IL can be read with no
+`MethodBase` in sight:
+
+```csharp
+var body = method.ReadIl();      // ClrMethodBodyImage
+body.Il                          // the bytes
+body.MaxStack, body.IsFatFormat, body.LocalSignatureToken
+
+Console.WriteLine(ClrMethodIl.Of(method).Dump());
+```
+
+```
+// AbiProbe.Shop::Check
+.maxstack 3
+IL_0000:  ldarg.1
+IL_0001:  ldarg.0
+IL_0002:  ldfld        AbiProbe.Shop::Stock
+IL_0007:  ble.s        IL_0024
+IL_0009:  ldstr        "short by "
+...
+IL_0019:  call         System.Int32::ToString
+```
+
+Operands are `ClrIlToken` - named from the metadata, not resolved to reflection objects - and
+string literals come from the user string heap. A test asserts that no operand is a `MemberInfo`,
+so the route stays reflection-free, and that the bytes and opcode stream are identical to what
+reflection produces.
+
+The body begins with one of two headers: a **tiny** one-byte header when the method has no locals,
+no handlers and a stack no deeper than eight, and a **fat** twelve-byte one otherwise, carrying the
+real stack depth and the local signature token. Both are decoded, and a test checks each against a
+method known to need it.
+
+Because these operands are names rather than members, IL decoded this way cannot be handed to
+`ReplaceIl` - the emitter refuses a `ClrIlToken`, since a name is not something it can issue a
+token for. Decode through reflection when you mean to re-emit.
+
+### Replacing a method body
+
+The bytes cannot be written back over the original: they live in a read-only mapped image, the
+method is likely jitted already, and the supported route to new IL - a profiler's ReJIT - is not
+reachable in-process. So a replacement body is **emitted as a method of its own** and the target's
+dispatch slots point at it, which is the mechanism `MethodDetour` already uses and is reversible
+in exactly the same way.
+
+```csharp
+// edit the method's own IL and put it back
+var il = ClrMethodIl.Of(method);
+var edited = il.Instructions.Where(i => i.OpCode != OpCodes.Ldfld).ToList();
+
+using (MethodDetour.ReplaceIl(method, edited, il.Locals.Select(l => l.LocalType).ToList()))
+{
+    ...
+}
+
+// or write a body from scratch
+using (MethodDetour.ReplaceBody(method, il =>
+{
+    il.Emit(OpCodes.Ldarg_1);
+    il.Emit(OpCodes.Ldc_I4, 100);
+    il.Emit(OpCodes.Mul);
+    il.Emit(OpCodes.Ret);
+}))
+{
+    calc.Scale(7);   // 700
+}
+```
+
+Three things this gets right that are easy to get wrong:
+
+- **Tokens are re-issued, not copied.** A metadata token only means something in its own module, so
+  raw IL moved elsewhere would reference whatever member happened to share that number. The body is
+  rebuilt through an `ILGenerator` with each operand handed over as the resolved `MemberInfo`. An
+  operand the decoder could not resolve - which reads back as a plain `int` - is **refused**, since
+  emitting it would produce an invalid program discovered only at the call.
+- **Short branches become long ones.** Re-emission moves instructions relative to each other, and a
+  one-byte displacement that fitted before need not fit after.
+- **The replacement is an instance method** whenever the target is one, so the receiver stays in
+  argument slot zero and the hidden return buffer keeps its place behind it. A test replaces a
+  `decimal`-returning method and asserts the receiver's fields are *not* written over, which is
+  exactly what a displaced return buffer would do.
+
+The strongest test of decoder and emitter together is a round trip: decode a body, emit it back
+unchanged, and the method must behave identically - including one that reads `this.Factor` through
+its own slot 0, and one with branches.
+
+Not supported: a body with try/catch cannot be expressed as a flat instruction list, so use
+`ReplaceBody` and the generator's `BeginExceptionBlock` for those. Generic methods, methods on
+generic types, varargs and value-type declaring types are refused for the same reasons a redirect
+refuses them.
+
 ### Recognising a precode without hardcoding opcodes
 
 The descriptor publishes the byte pattern the runtime built its own precodes from, plus a mask of
@@ -1071,6 +1339,41 @@ the walk gives up 24 bytes later.
 being read. Using the absent size makes every probe zero-length, which reads as unreadable — and
 then no buffers are collected at all, silently, and you are back to the 13% case.
 
+### Workstation and server GC
+
+The two flavours keep the same structures in different places, and the descriptor publishes a
+different set of globals for each — so this is genuinely two routes to the generation table, not
+one route with a different starting address:
+
+| | Workstation | Server |
+|---|---|---|
+| Heaps | one | one per core |
+| Generation table | `GCHeapGenerationTable` **is** the table | inline in each `gc_heap`, at `GCHeap.GenerationTable` |
+| Ephemeral segment, alloc pointer | `GCHeapEphemeralHeapSegment`, `GCHeapAllocAllocated` globals | fields of each `gc_heap` |
+| Heap list | — | `Heaps` (a `gc_heap**`) and `NumHeaps` |
+
+The per-heap globals workstation uses are not published under server GC at all, which is what
+makes the branch necessary. `ClrGeneration.ReadAll` picks the route from `GCIdentifiers`; only the
+two lines that locate the table differ, and the decode itself is shared.
+
+Generations are flattened across heaps so a walk covers the whole process either way.
+`HeapIndex` says which heap a generation came from, and `HeapCount` / `GenerationsOfHeap(i)`
+separate them again:
+
+```
+gc heap "server, regions, background, dynamic_heap" heaps=4 generations=20 segments=37
+
+  heap0 @0x1d561238d50 gens=5 segments=10 live=468720
+  heap1 @0x1d56123dc30 gens=5 segments=9  live=0
+  heap2 @0x1d5612498f0 gens=5 segments=9  live=0
+  heap3 @0x1d56124f4c0 gens=5 segments=9  live=0
+
+walked 4636 objects, 460688 bytes across 4 heap(s)
+```
+
+Cross-check: the same program under workstation GC walks 4614 objects and 459640 bytes, so the
+server path is finding the same heap rather than one core's share of it.
+
 ### Reading a heap that is moving
 
 Walking a live heap from inside it is not the same as walking a suspended target. The honest limits:
@@ -1090,9 +1393,6 @@ Walking a live heap from inside it is not the same as walking a suspended target
 
 ### What is not covered
 
-- **Server GC.** Its descriptor is found and selected correctly, but reading the per-core heaps
-  needs the `Heaps`/`NumHeaps` globals and the `GCHeap` type. `ClrGeneration` fails loudly rather
-  than pretending; workstation GC only for now.
 - **Some regions do not decode.** After repeated forced collections a minority of regions hold data
   the bump walk cannot follow, and the walk raises rather than fabricating objects. What is in them
   is not yet understood — most likely regions on a free list or not yet swept, which would need the
@@ -1117,8 +1417,21 @@ Tests use **TUnit**, which runs on Microsoft.Testing.Platform. Two consequences:
   ```
 - `dotnet test` takes `--project`, not a bare project path.
 
-The test project sets `<TieredCompilation>false</TieredCompilation>` so entry points stay stable
-for the detour tests.
+The test project pins one runtime setting, because a test needs the runtime in a particular mode
+rather than because it is convenient:
+
+| Setting | Why |
+|---|---|
+| `<TieredCompilation>false</TieredCompilation>` | Entry points stay stable for the detour tests. It also keeps the tiering guard dormant — with tiering on, nearly every method is flagged eligible and every redirect would be refused. |
+
+The GC flavour is deliberately *not* pinned: both are supported, so the suite runs as-is under
+either. To exercise the server path:
+
+```bash
+DOTNET_gcServer=1 DOTNET_GCDynamicAdaptationMode=0 DOTNET_GCHeapCount=4   dotnet run --project ClrSpectorTests/ClrSpectorTests.csproj
+```
+
+Verified green at 1, 4 and 8 heaps as well as workstation.
 
 The suite is built around facts obtainable **independently** of the decoder, since those are what
 distinguish a correct decode from one that merely does not crash: parent-MethodTable identity
@@ -1126,6 +1439,13 @@ against `typeof(object)`, the `EEClass` back-pointer round-trip, field and metho
 reflection, reconstructed tokens against `MethodInfo.MetadataToken`, category flags against
 `Type.IsValueType`/`IsInterface`/`IsArray`, component sizes against element widths, and the
 descriptor's own globals against `typeof(object|string|object[]).TypeHandle.Value`.
+
+Where a decode has no independent oracle, the test reads memory instead of trusting the decode:
+field offsets are proved by writing known values into an object and reading them back at the
+offsets the runtime reported, and the IL decoder is checked by asserting that the decoded
+instruction lengths sum to exactly the body size and that every branch target lands on an
+instruction boundary — the assertions that catch a mis-sized operand, which a "does not crash"
+test would not.
 
 ## Platform support
 

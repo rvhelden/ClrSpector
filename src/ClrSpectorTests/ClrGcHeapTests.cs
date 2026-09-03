@@ -64,18 +64,59 @@ namespace ClrSpectorTests
             await Assert.That(ContractDescriptor.Current.TryGetDataType("HeapSegment", out _)).IsFalse();
         }
 
+        /// <summary>
+        /// Five generations per heap on .NET 11 - gen0..gen2, then LOH and POH - and server GC
+        /// has one such table per heap, so the totals are per heap rather than per process.
+        /// </summary>
         [Test]
         public async Task GenerationsCoverTheSmallLargeAndPinnedHeaps()
         {
             var heap = ClrGcHeap.Current;
 
-            // Five on .NET 11: gen0..gen2, then LOH and POH.
-            await Assert.That(heap.Generations.Count).IsEqualTo(heap.Layouts.TotalGenerationCount);
-            await Assert.That(heap.Generations.Count(g => g.IsLargeObjectHeap)).IsEqualTo(1);
-            await Assert.That(heap.Generations.Count(g => g.IsPinnedObjectHeap)).IsEqualTo(1);
+            await Assert.That(heap.HeapCount).IsGreaterThanOrEqualTo(1);
+            await Assert.That(heap.Generations.Count)
+                .IsEqualTo(heap.Layouts.TotalGenerationCount * heap.HeapCount);
 
-            for (var number = 0; number < heap.Generations.Count; number++)
-                await Assert.That(heap.Generations[number].Number).IsEqualTo(number);
+            for (var index = 0; index < heap.HeapCount; index++)
+            {
+                var generations = heap.GenerationsOfHeap(index).ToList();
+
+                await Assert.That(generations.Count).IsEqualTo(heap.Layouts.TotalGenerationCount);
+                await Assert.That(generations.Count(g => g.IsLargeObjectHeap)).IsEqualTo(1);
+                await Assert.That(generations.Count(g => g.IsPinnedObjectHeap)).IsEqualTo(1);
+
+                for (var number = 0; number < generations.Count; number++)
+                {
+                    await Assert.That(generations[number].Number).IsEqualTo(number);
+                    await Assert.That(generations[number].HeapIndex).IsEqualTo(index);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Workstation GC keeps its state in globals and has no heap structure; server GC has one
+        /// per core, and every generation must name the heap it came from.
+        /// </summary>
+        [Test]
+        public async Task HeapCountMatchesTheGcFlavour()
+        {
+            var heap = ClrGcHeap.Current;
+
+            await Assert.That(heap.IsServer).IsEqualTo(GCSettings.IsServerGC);
+
+            if (!heap.IsServer)
+            {
+                await Assert.That(heap.HeapCount).IsEqualTo(1);
+                await Assert.That(heap.Generations.All(g => g.HeapAddress == IntPtr.Zero)).IsTrue();
+
+                return;
+            }
+
+            // Every server heap must be a distinct, non-null gc_heap.
+            var addresses = heap.Generations.Select(g => g.HeapAddress).Distinct().ToList();
+
+            await Assert.That(addresses.Count).IsEqualTo(heap.HeapCount);
+            await Assert.That(addresses.All(a => a != IntPtr.Zero)).IsTrue();
         }
 
         /// <summary>

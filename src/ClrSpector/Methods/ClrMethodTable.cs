@@ -92,6 +92,8 @@ namespace ClrSpector
         /// <summary>mdtTypeDef - the metadata table that type tokens live in.</summary>
         private const uint TypeDefTokenType = 0x02000000;
 
+        private List<ClrFieldDescription> fields;
+
         public void* BasePointer { get; private set; }
 
         public uint Size { get; private set; }
@@ -252,8 +254,75 @@ namespace ClrSpector
         /// <summary>This type's full name, or null when the address is not a live type handle.</summary>
         public string Name => this.Type?.FullName;
 
+        /// <summary>
+        /// This type's full name read from its module's metadata, without asking the runtime for
+        /// a <see cref="System.Type"/>.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="Name"/> goes through the type handle and so reports the full instantiation
+        /// (<c>List&lt;string&gt;</c>); this reports what metadata records, which is the generic
+        /// definition (<c>List`1</c>). Null when the module has no mapped image.
+        /// </remarks>
+        public string MetadataName => this.Metadata?.FullTypeName(this.TypeDefToken);
+
+        /// <summary>The namespace metadata records for this type.</summary>
+        public string MetadataNamespace => this.Metadata?.TypeName(this.TypeDefToken).Namespace;
+
+        /// <summary>The metadata of the module that declares this type.</summary>
+        public ClrModuleMetadata Metadata =>
+            this.Module == IntPtr.Zero
+                ? null
+                : ClrModuleMetadata.AtImageBase(ClrModule.At(this.Module).Base);
+
         /// <summary>The methods this type declares, in MethodDescChunk order.</summary>
         public List<ClrMethodDescription> Methods { get; private set; }
+
+        /// <summary>
+        /// The fields this type declares itself - its own instance fields, then its statics.
+        /// Inherited fields belong to the type that declares them, so walk
+        /// <see cref="ParentMethodTable"/> for those.
+        /// </summary>
+        /// <remarks>
+        /// Read on first access rather than eagerly like <see cref="Methods"/>, because a
+        /// MethodTable gets decoded for every distinct type on a heap walk and most callers never
+        /// look at fields.
+        /// </remarks>
+        public List<ClrFieldDescription> Fields => this.fields ??= this.ReadFields();
+
+        /// <summary>
+        /// How many instance fields this type adds on top of its parent's - which is what the
+        /// FieldDesc list actually holds, since the parent's live on the parent.
+        /// </summary>
+        public int DeclaredInstanceFieldCount
+        {
+            get
+            {
+                if (this.EEClass == null)
+                    return 0;
+
+                var inherited = this.ParentMethodTable?.EEClass?.NumberOfInstanceFields ?? 0;
+
+                return Math.Max(0, this.EEClass.NumberOfInstanceFields - inherited);
+            }
+        }
+
+        private List<ClrFieldDescription> ReadFields()
+        {
+            var fieldList = new List<ClrFieldDescription>();
+
+            if (this.EEClass == null || this.EEClass.FieldDescList == IntPtr.Zero)
+                return fieldList;
+
+            // The array holds this type's own instance fields followed by its static fields, all
+            // of one fixed size - so it is indexed rather than walked.
+            var stride = (int)ContractDescriptor.Current.GetDataType("FieldDesc").RequiredSize;
+            var count = this.DeclaredInstanceFieldCount + this.EEClass.NumberOfStaticFields;
+
+            for (var i = 0; i < count; i++)
+                fieldList.Add(ClrFieldDescription.Create(new MemoryReader(this.EEClass.FieldDescList + i * stride)));
+
+            return fieldList;
+        }
 
         /// <summary>
         /// The decoded MethodDesc this type declares for <paramref name="method"/>, or null when
@@ -375,6 +444,7 @@ namespace ClrSpector
             var sizes = new MethodDescSizes(descriptor);
 
             var nextOffset = chunkLayout["Next"];
+            var methodTableOffset = chunkLayout["MethodTable"];
             var countOffset = chunkLayout["Count"];
             var tokenRangeOffset = chunkLayout["FlagsAndTokenRange"];
 
@@ -393,6 +463,7 @@ namespace ClrSpector
                 {
                     var methodReader = chunkReader.Offset(chunkHeaderSize + offset);
                     var method = ClrMethodDescription.Create(methodReader, tokenRange, tokenRemainderBits);
+                    method.MethodTablePointer = chunkReader.ReadIntPtr(methodTableOffset);
 
                     if (method.ChunkIndex * alignment != offset)
                         throw new ClrSpectorUnsupportedRuntimeException(
@@ -416,7 +487,7 @@ namespace ClrSpector
             return $"MethodTable {this.Name ?? "<unnamed>"} @0x{this.Address.ToInt64():x} " +
                    $"token=0x{this.TypeDefToken:x8} baseSize={this.BaseSize} " +
                    $"virtuals={this.NumberOfVirtuals} interfaces={this.NumberOfInterfaces} " +
-                   $"methods={this.Methods?.Count ?? 0}";
+                   $"methods={this.Methods?.Count ?? 0} fields={this.DeclaredInstanceFieldCount}";
         }
     }
 }

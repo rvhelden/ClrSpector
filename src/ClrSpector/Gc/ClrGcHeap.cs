@@ -21,8 +21,9 @@ namespace ClrSpector
     /// </remarks>
     public sealed class ClrGcHeap
     {
-        private static readonly Lazy<ClrGcHeap> current =
-            new Lazy<ClrGcHeap>(Create, isThreadSafe: true);
+        private static readonly object gate = new object();
+
+        private static ClrGcHeap current;
 
         private ClrGcHeap(ClrHeapLayouts layouts, List<ClrGeneration> generations, string identifiers)
         {
@@ -37,7 +38,14 @@ namespace ClrSpector
         /// not. A collection rebuilds that structure, so call <see cref="Refresh"/> to re-read
         /// it - and read it from inside a <see cref="GcWalkScope"/>, since entering one collects.
         /// </remarks>
-        public static ClrGcHeap Current => current.Value;
+        public static ClrGcHeap Current
+        {
+            get
+            {
+                lock (gate)
+                    return current ??= Create();
+            }
+        }
 
         public ClrHeapLayouts Layouts { get; }
 
@@ -46,6 +54,36 @@ namespace ClrSpector
 
         /// <summary>The GC flavour the descriptor named, e.g. "workstation, regions, background,".</summary>
         public string Identifiers { get; }
+
+        /// <summary>True when the process is running server GC, which keeps one heap per core.</summary>
+        public bool IsServer => GcContractDescriptor.IsServer;
+
+        /// <summary>
+        /// How many GC heaps this process has: one under workstation GC, one per core under
+        /// server GC. <see cref="Generations"/> holds every heap's generations flattened
+        /// together, so this is what tells them apart.
+        /// </summary>
+        public int HeapCount
+        {
+            get
+            {
+                var heaps = 0;
+                foreach (var generation in this.Generations)
+                    heaps = Math.Max(heaps, generation.HeapIndex + 1);
+
+                return heaps;
+            }
+        }
+
+        /// <summary>The generations belonging to one heap, in generation order.</summary>
+        public IEnumerable<ClrGeneration> GenerationsOfHeap(int heapIndex)
+        {
+            foreach (var generation in this.Generations)
+            {
+                if (generation.HeapIndex == heapIndex)
+                    yield return generation;
+            }
+        }
 
         /// <summary>Every segment of every generation.</summary>
         public IEnumerable<ClrHeapSegment> Segments
@@ -61,7 +99,22 @@ namespace ClrSpector
         }
 
         /// <summary>Re-reads the generation and segment structure.</summary>
-        public static ClrGcHeap Refresh() => Create();
+        /// <remarks>
+        /// The re-read also replaces what <see cref="Current"/> hands out. Without that, anything
+        /// reached through <see cref="Current"/> - including
+        /// <see cref="ClrHeapObject.Segment"/> - would keep answering from the snapshot taken at
+        /// first use and could not see a segment allocated since, which is exactly the case a
+        /// refresh exists to handle.
+        /// </remarks>
+        public static ClrGcHeap Refresh()
+        {
+            var heap = Create();
+
+            lock (gate)
+                current = heap;
+
+            return heap;
+        }
 
         /// <summary>
         /// Every object on the heap, in address order within each segment.
@@ -272,7 +325,9 @@ namespace ClrSpector
                 live += segment.LiveBytes;
             }
 
-            return $"gc heap \"{this.Identifiers}\" generations={this.Generations.Count} " +
+            var heaps = this.IsServer ? $" heaps={this.HeapCount}" : string.Empty;
+
+            return $"gc heap \"{this.Identifiers}\"{heaps} generations={this.Generations.Count} " +
                    $"segments={segments} live={live}";
         }
     }

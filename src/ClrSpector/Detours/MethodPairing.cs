@@ -131,17 +131,33 @@ namespace ClrSpector.Detours
         }
 
         /// <summary>
-        /// Shapes no redirect can honour, whichever pairing they would otherwise form.
+        /// Shapes no redirect can honour in a target, whatever it is redirected to. Also used on
+        /// its own by a replacement that is generated rather than supplied.
         /// </summary>
-        private static string RefuseUnsupportedShapes(MethodBase target, MethodBase replacement)
+        public static string RefuseUnsupportedTarget(MethodBase target)
         {
             if (target.IsAbstract)
                 return $"'{Describe(target)}' is abstract and has no implementation to redirect. " +
                        "Redirect the overriding method on a concrete type instead.";
 
-            foreach (var method in new[] { target, replacement })
+            return RefuseUnsupportedShape(target, "target");
+        }
+
+        /// <summary>
+        /// Shapes no redirect can honour, whichever pairing they would otherwise form.
+        /// </summary>
+        private static string RefuseUnsupportedShapes(MethodBase target, MethodBase replacement)
+        {
+            var refusal = RefuseUnsupportedTarget(target);
+            if (refusal != null)
+                return refusal;
+
+            return RefuseUnsupportedShape(replacement, "replacement");
+        }
+
+        private static string RefuseUnsupportedShape(MethodBase method, string role)
+        {
             {
-                var role = ReferenceEquals(method, target) ? "target" : "replacement";
 
                 if (method.DeclaringType == null)
                     return $"The {role} has no declaring type - a dynamic method cannot take part " +
