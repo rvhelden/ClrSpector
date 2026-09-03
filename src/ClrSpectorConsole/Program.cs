@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using ClrSpector;
 using ClrSpector.Cdac;
@@ -25,10 +26,13 @@ namespace ClrSpectorConsole
         /// <summary>How many instances of each type the heap dump shows the value of.</summary>
         private const int SampleLimit = 3;
 
-        /// <summary>Fields and elements shown per sampled object, and the width of each value.</summary>
-        private const int MembersPerSample = 4;
+        /// <summary>How many of the heap's types the dump shows, largest first.</summary>
+        private const int TypeLimit = 5;
 
-        private const int ValueWidth = 48;
+        /// <summary>Fields and elements shown per sampled object, and the width of each value.</summary>
+        private const int MembersPerSample = 3;
+
+        private const int ValueWidth = 256;
 
         /// <summary>
         /// The running totals for one type on the heap, plus the first few instances of it.
@@ -61,7 +65,7 @@ namespace ClrSpectorConsole
         private static void Main()
         {
             PrintRuntime();
-
+            
             foreach (var type in new[]
                      {
                          typeof(SampleClass),
@@ -181,7 +185,8 @@ namespace ClrSpectorConsole
                 $"Collected    : {scope.CollectionOccurred} - a walk a collection ran through is unreliable");
 
             Console.WriteLine();
-            Console.WriteLine($"Types on the heap, largest first - up to {SampleLimit} instances each");
+            Console.WriteLine($"Largest {TypeLimit} of the {byType.Count} types on the heap, " +
+                              $"with up to {SampleLimit} instances each");
             Console.WriteLine();
 
             // Rendered while the scope is still open, so nothing has moved since the addresses
@@ -189,7 +194,7 @@ namespace ClrSpectorConsole
             // values would be nonsense, so only the counts are printed.
             var stale = scope.CollectionOccurred;
 
-            foreach (var entry in byType.OrderByDescending(e => e.Value.Bytes))
+            foreach (var entry in byType.OrderByDescending(e => e.Value.Bytes).Take(TypeLimit))
             {
                 Console.WriteLine($"  {entry.Value.Count,7} objects  {entry.Value.Bytes,10} bytes  " +
                                   $"{NameOf(entry.Key)}");
@@ -230,6 +235,155 @@ namespace ClrSpectorConsole
             {
                 return $"0x{methodTable.ToInt64():x} <unresolved>";
             }
+        }
+
+        /// <summary>
+        /// The value of the object at <paramref name="address"/>, as one short readable line.
+        /// </summary>
+        /// <remarks>
+        /// The walk yields addresses, not references, so reading a value means turning one back
+        /// into a reference. A reference *is* an address - reinterpreting the bytes is exactly
+        /// what the runtime holds in a local - so once that is done it is an ordinary reference
+        /// and reflection can read the fields, with no offset decoding at all.
+        ///
+        /// That is only sound because the walk has already established this is an object start
+        /// whose MethodTable is mapped. Handing the GC a reference to something that is not an
+        /// object corrupts the heap at the next collection, so free-space fillers - which have
+        /// no type to resolve - are never passed here, and neither should anything unvalidated
+        /// be. It is also why this is done inside the walk's scope, while nothing is moving.
+        /// </remarks>
+        private static string Render(IntPtr address)
+        {
+            try
+            {
+                var instance = ReferenceAt(address);
+
+                return instance switch
+                {
+                    null => "null",
+                    string text => Quote(text),
+                    Array array => RenderArray(array),
+                    _ => RenderFields(instance)
+                };
+            }
+            catch (Exception error)
+            {
+                return $"<{error.GetType().Name}>";
+            }
+        }
+
+        /// <summary>Reinterprets a heap address as the object reference it is.</summary>
+        private static unsafe object ReferenceAt(IntPtr address)
+        {
+            return Unsafe.Read<object>(&address);
+        }
+
+        private static string RenderArray(Array array)
+        {
+            if (array.Rank != 1)
+                return $"rank {array.Rank}, {array.Length} elements";
+
+            if (array.Length == 0)
+                return "[]";
+
+            var shown = Math.Min(array.Length, MembersPerSample);
+            var elements = new List<string>(shown);
+
+            for (var i = 0; i < shown; i++)
+            {
+                try
+                {
+                    elements.Add(Scalar(array.GetValue(i)));
+                }
+                catch (Exception)
+                {
+                    elements.Add("?");
+                }
+            }
+
+            var ellipsis = array.Length > shown ? ", …" : string.Empty;
+            return $"[{string.Join(", ", elements)}{ellipsis}]";
+        }
+
+        /// <summary>
+        /// The first few instance fields of an object, as name=value pairs.
+        /// </summary>
+        /// <remarks>
+        /// Reflection reads the fields rather than the field offsets being decoded from the
+        /// EEClass, which the inspector does not walk. The point here is to show that the object
+        /// the walk found really is the object it claims to be.
+        /// </remarks>
+        private static string RenderFields(object instance)
+        {
+            var type = instance.GetType();
+            var fields = type
+                .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .Take(MembersPerSample)
+                .ToList();
+
+            if (fields.Count == 0)
+                return "{}";
+
+            var rendered = new List<string>(fields.Count);
+            foreach (var field in fields)
+            {
+                try
+                {
+                    rendered.Add($"{field.Name}={Scalar(field.GetValue(instance))}");
+                }
+                catch (Exception)
+                {
+                    rendered.Add($"{field.Name}=?");
+                }
+            }
+
+            return "{ " + string.Join(", ", rendered) + " }";
+        }
+
+        /// <summary>
+        /// One field or element value.
+        /// </summary>
+        /// <remarks>
+        /// Only types whose ToString is known to be cheap and total are formatted. Anything else
+        /// gets its type name: calling an arbitrary ToString here could allocate heavily, throw,
+        /// or recurse, and this runs while collection is being held off.
+        /// </remarks>
+        private static string Scalar(object value)
+        {
+            switch (value)
+            {
+                case null:
+                    return "null";
+
+                case string text:
+                    return Quote(text);
+
+                case decimal or DateTime or DateTimeOffset or TimeSpan or Guid:
+                    return value.ToString();
+            }
+
+            var type = value.GetType();
+            if (type.IsPrimitive || type.IsEnum)
+                return value.ToString();
+
+            return "{" + FriendlyName(type) + "}";
+        }
+
+        /// <summary>A string value, quoted, with control characters and length made visible.</summary>
+        private static string Quote(string text)
+        {
+            var length = text.Length;
+            var body = length > ValueWidth ? text.Substring(0, ValueWidth) : text;
+
+            body = body
+                .Replace("\\", "\\\\")
+                .Replace("\"", "\\\"")
+                .Replace("\r", "\\r")
+                .Replace("\n", "\\n")
+                .Replace("\t", "\\t");
+
+            var ellipsis = length > ValueWidth ? "…" : string.Empty;
+            return $"\"{body}{ellipsis}\" ({length} chars)";
         }
 
         private static void PrintRuntime()

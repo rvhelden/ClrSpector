@@ -89,11 +89,60 @@ namespace ClrSpector.Detours
         /// </summary>
         private static int SlotNumberOf(ClrMethodTable methodTable, MethodBase method)
         {
-            var token = (uint)method.MetadataToken;
-
-            var match = methodTable.Methods.FirstOrDefault(m => m.MetadataToken == token);
+            var match = methodTable.FindMethod(method);
 
             return match == null ? -1 : match.SlotNumber;
+        }
+
+        /// <summary>
+        /// The address of a <b>non-virtual</b> slot - one the runtime assigned above
+        /// <c>NumVirtuals</c> - or <see cref="IntPtr.Zero"/> when this method does not occupy one.
+        /// </summary>
+        /// <remarks>
+        /// These do not live in the vtable chunks. They sit in an array that grows <i>backwards</i>
+        /// from a point inside the MethodTable's auxiliary data:
+        /// <code>
+        /// slotAddress = AuxiliaryData + OffsetToNonVirtualSlots
+        ///               - (1 + slot - NumVirtuals) * pointerSize
+        /// </code>
+        /// A non-virtual slot is only allocated for a method that needs a stable indirection
+        /// without a vtable entry, so most methods have neither and this returns zero.
+        /// </remarks>
+        public static IntPtr FindNonVirtualSlot(MethodBase method)
+        {
+            var declaringType = method?.DeclaringType;
+            if (declaringType == null || declaringType.IsInterface || declaringType.ContainsGenericParameters)
+                return IntPtr.Zero;
+
+            var methodTable = ClrObject.From(declaringType).MethodTable;
+
+            var slot = SlotNumberOf(methodTable, method);
+            if (slot < methodTable.NumberOfVirtuals || slot >= TotalSlotCount(methodTable))
+                return IntPtr.Zero;
+
+            if (methodTable.AuxiliaryData == IntPtr.Zero)
+                return IntPtr.Zero;
+
+            var layout = ContractDescriptor.Current.GetDataType("MethodTableAuxiliaryData");
+            var offsetToNonVirtualSlots =
+                new MemoryReader(methodTable.AuxiliaryData).ReadInt(layout["OffsetToNonVirtualSlots"]);
+
+            var arrayEnd = methodTable.AuxiliaryData + offsetToNonVirtualSlots;
+
+            return arrayEnd - (1 + slot - methodTable.NumberOfVirtuals) * IntPtr.Size;
+        }
+
+        /// <summary>
+        /// Every slot the type has: its virtuals, plus the non-virtual slots its EEClass records.
+        /// Only a canonical MethodTable owns non-virtual slots.
+        /// </summary>
+        public static int TotalSlotCount(ClrMethodTable methodTable)
+        {
+            var nonVirtual = methodTable.IsCanonicalMethodTable && methodTable.EEClass != null
+                ? methodTable.EEClass.NumberOfNonVirtualSlots
+                : 0;
+
+            return methodTable.NumberOfVirtuals + nonVirtual;
         }
     }
 }

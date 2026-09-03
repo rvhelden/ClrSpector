@@ -62,12 +62,17 @@ namespace ClrSpectorTests
 
             await Assert.That(machine.Address).IsNotEqualTo(IntPtr.Zero);
             await Assert.That(machine.StubCodePageSize).IsGreaterThan(0u);
-            await Assert.That(machine.StubPrecodeSize).IsGreaterThan((byte)0);
-            await Assert.That(machine.FixupStubPrecodeSize).IsGreaterThan((byte)0);
+            // These are optional in the contract - a runtime need not publish them - so the
+            // assertion is that this runtime does, and that what it publishes is sane.
+            await Assert.That(machine.StubPrecodeSize).IsNotNull();
+            await Assert.That((int)machine.StubPrecodeSize.Value).IsGreaterThan(0);
+            await Assert.That(machine.FixupStubPrecodeSize).IsNotNull();
+            await Assert.That((int)machine.FixupStubPrecodeSize.Value).IsGreaterThan(0);
 
             // the precode kinds must be distinguishable from each other and from "invalid"
-            await Assert.That(machine.FixupPrecodeType).IsNotEqualTo(machine.StubPrecodeType);
-            await Assert.That(machine.FixupPrecodeType).IsNotEqualTo(machine.InvalidPrecodeType);
+            await Assert.That(machine.FixupPrecodeType).IsNotNull();
+            await Assert.That(machine.FixupPrecodeType.Value).IsNotEqualTo(machine.StubPrecodeType);
+            await Assert.That(machine.FixupPrecodeType.Value).IsNotEqualTo(machine.InvalidPrecodeType);
 
             // on x64 the fixup code follows the 6-byte rip-relative jump
             await Assert.That(machine.FixupCodeOffset).IsEqualTo((byte)6);

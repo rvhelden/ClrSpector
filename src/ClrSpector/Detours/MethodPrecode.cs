@@ -37,8 +37,24 @@ namespace ClrSpector.Detours
         /// </summary>
         internal const int JmpInstructionLength = 6;
 
-        /// <summary>How many entry-point bytes are captured for inspection.</summary>
-        private const int PreviewLength = 16;
+        /// <summary>A floor for the capture, for a runtime that publishes no precode sizes.</summary>
+        private const int MinimumPreviewLength = 16;
+
+        /// <summary>
+        /// How many entry-point bytes are captured for inspection: enough to hold whichever
+        /// precode template this runtime publishes, so a precode can be matched against the
+        /// runtime's own bytes rather than against opcodes written down here.
+        /// </summary>
+        private static int PreviewLength
+        {
+            get
+            {
+                var machine = Machine;
+                var longest = Math.Max((int)(machine.StubPrecodeSize ?? 0), (int)(machine.FixupStubPrecodeSize ?? 0));
+
+                return Math.Max(MinimumPreviewLength, longest);
+            }
+        }
 
         private MethodPrecode(MethodBase method, IntPtr entryPoint, byte[] bytes)
         {
@@ -54,6 +70,20 @@ namespace ClrSpector.Detours
 
         /// <summary>The first bytes at the entry point, for inspection and diagnostics.</summary>
         public byte[] EntryPointBytes { get; }
+
+        /// <summary>
+        /// Whether the entry point matches the FixupPrecode template this runtime published.
+        /// </summary>
+        /// <remarks>
+        /// This asks the runtime what its own precodes look like rather than testing for an
+        /// opcode, so it stays right on a machine whose precodes are built differently. The
+        /// varying positions - the embedded addresses - are excluded by the runtime's companion
+        /// "ignored bytes" mask.
+        /// </remarks>
+        public bool IsFixupPrecode => Machine.IsFixupPrecode(this.EntryPointBytes);
+
+        /// <summary>Whether the entry point matches this runtime's StubPrecode template.</summary>
+        public bool IsStubPrecode => Machine.IsStubPrecode(this.EntryPointBytes);
 
         /// <summary>Whether the entry point is the rip-relative jump shape this library decodes.</summary>
         public bool IsRipRelativeJump =>
@@ -89,11 +119,12 @@ namespace ClrSpector.Detours
 
             var entryPoint = method.MethodHandle.GetFunctionPointer();
 
-            var bytes = new byte[PreviewLength];
+            var captureLength = PreviewLength;
+            var bytes = new byte[captureLength];
             if (entryPoint != IntPtr.Zero)
             {
                 var code = (byte*)entryPoint;
-                for (var i = 0; i < PreviewLength; i++)
+                for (var i = 0; i < captureLength; i++)
                     bytes[i] = code[i];
             }
 
@@ -126,7 +157,9 @@ namespace ClrSpector.Detours
 
         public override string ToString()
         {
-            return $"{this.Method.DeclaringType?.Name}.{this.Method.Name} " +
+            var kind = this.IsFixupPrecode ? "fixup" : this.IsStubPrecode ? "stub" : "unrecognised";
+
+            return $"{this.Method.DeclaringType?.Name}.{this.Method.Name} {kind} " +
                    $"entryPoint=0x{this.EntryPoint.ToInt64():x} [{this.HexBytes}] " +
                    $"{this.Disassembly} slot=0x{this.DispatchSlot.ToInt64():x} " +
                    $"-> 0x{this.DispatchTarget.ToInt64():x}";

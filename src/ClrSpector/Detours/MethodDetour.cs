@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using ClrSpector.Cdac;
 
 namespace ClrSpector.Detours
 {
@@ -41,7 +42,8 @@ namespace ClrSpector.Detours
     /// <b>Tiered compilation</b> rewrites these same slots when it promotes a method to optimised
     /// code, which would silently drop the redirect. Disable tiering
     /// (<c>&lt;TieredCompilation&gt;false&lt;/TieredCompilation&gt;</c>) in test projects that
-    /// rely on this.
+    /// rely on this. This is not left to trust: the runtime records eligibility per method, so a
+    /// target it would recompile is refused unless <c>allowTieredCompilation</c> says otherwise.
     /// </description></item>
     /// <item><description>
     /// The replacement runs with the target's arguments exactly as passed, so the two frames
@@ -143,9 +145,10 @@ namespace ClrSpector.Detours
         public static MethodDetour Redirect(
             MethodBase target,
             MethodBase replacement,
-            bool allowInterfaceDispatch = false)
+            bool allowInterfaceDispatch = false,
+            bool allowTieredCompilation = false)
         {
-            return Redirect(target, null, replacement, allowInterfaceDispatch);
+            return Redirect(target, null, replacement, allowInterfaceDispatch, allowTieredCompilation);
         }
 
         /// <summary>
@@ -162,7 +165,8 @@ namespace ClrSpector.Detours
             MethodBase target,
             object replacementReceiver,
             MethodBase replacement,
-            bool allowInterfaceDispatch = false)
+            bool allowInterfaceDispatch = false,
+            bool allowTieredCompilation = false)
         {
             if (target == null) throw new ArgumentNullException(nameof(target));
             if (replacement == null) throw new ArgumentNullException(nameof(replacement));
@@ -193,6 +197,9 @@ namespace ClrSpector.Detours
                     "process-wide, reaching even instances created afterwards. Redirect the " +
                     "interface method itself, or pass allowInterfaceDispatch: true if you are sure " +
                     "the method is never called through an interface reference.");
+
+            if (!allowTieredCompilation)
+                EnsureTieringWillNotUndoIt(target);
 
             // Both must be jitted before their entry points mean anything.
             RuntimeHelpers.PrepareMethod(target.MethodHandle);
@@ -275,6 +282,44 @@ namespace ClrSpector.Detours
         }
 
         /// <summary>
+        /// Refuses a target that tiered compilation is allowed to recompile.
+        /// </summary>
+        /// <remarks>
+        /// Promotion to optimised code rewrites the very slot a redirect patches, so the redirect
+        /// disappears partway through a test with nothing to show for it - the failure this
+        /// library is least able to explain after the fact. The runtime records eligibility per
+        /// method, so it can simply be asked: with tiering off no method carries the flag, and
+        /// with it on nearly every method does, which makes this a reliable check rather than a
+        /// guess about configuration.
+        /// </remarks>
+        private static void EnsureTieringWillNotUndoIt(MethodBase target)
+        {
+            ClrMethodDescription descriptor;
+
+            try
+            {
+                descriptor = ClrObject.From(target.DeclaringType).MethodTable.FindMethod(target);
+            }
+            catch (ClrSpectorUnsupportedRuntimeException)
+            {
+                // Cannot decode this runtime's method tables, so there is nothing to check
+                // against. Better an unguarded redirect than no redirect at all.
+                return;
+            }
+
+            if (descriptor?.IsEligibleForTieredCompilation != true)
+                return;
+
+            throw new MethodDetourException(
+                $"'{Describe(target)}' is eligible for tiered compilation, so the runtime may " +
+                "recompile it and rewrite the very slot this redirect patches - the redirect " +
+                "would then vanish mid-run with no error. Set " +
+                "<TieredCompilation>false</TieredCompilation> in the test project (or set " +
+                "DOTNET_TieredCompilation=0), or pass allowTieredCompilation: true to accept the " +
+                "risk deliberately.");
+        }
+
+        /// <summary>
         /// The implementation a virtual replacement resolves to on the proxy actually supplied,
         /// so a subclassed stand-in behaves the way a normal call on it would.
         /// </summary>
@@ -308,7 +353,8 @@ namespace ClrSpector.Detours
             string targetMethod,
             Type replacementType,
             string replacementMethod,
-            bool allowInterfaceDispatch = false)
+            bool allowInterfaceDispatch = false,
+            bool allowTieredCompilation = false)
         {
             const BindingFlags all = BindingFlags.Public | BindingFlags.NonPublic
                                                          | BindingFlags.Instance | BindingFlags.Static;
@@ -319,7 +365,7 @@ namespace ClrSpector.Detours
                               ?? throw new MethodDetourException(
                                   $"No method '{replacementMethod}' on {replacementType}.");
 
-            return Redirect(target, replacement, allowInterfaceDispatch);
+            return Redirect(target, replacement, allowInterfaceDispatch, allowTieredCompilation);
         }
 
         /// <summary>
@@ -331,7 +377,8 @@ namespace ClrSpector.Detours
             string targetMethod,
             object replacementReceiver,
             string replacementMethod,
-            bool allowInterfaceDispatch = false)
+            bool allowInterfaceDispatch = false,
+            bool allowTieredCompilation = false)
         {
             if (replacementReceiver == null) throw new ArgumentNullException(nameof(replacementReceiver));
 
@@ -341,7 +388,8 @@ namespace ClrSpector.Detours
                 Find(targetType, targetMethod),
                 replacementReceiver,
                 Find(replacementType, replacementMethod),
-                allowInterfaceDispatch);
+                allowInterfaceDispatch,
+                allowTieredCompilation);
         }
 
         /// <summary>
@@ -352,7 +400,8 @@ namespace ClrSpector.Detours
         public static MethodDetour Redirect(
             MethodBase target,
             Delegate replacement,
-            bool allowInterfaceDispatch = false)
+            bool allowInterfaceDispatch = false,
+            bool allowTieredCompilation = false)
         {
             if (replacement == null) throw new ArgumentNullException(nameof(replacement));
 
@@ -368,7 +417,8 @@ namespace ClrSpector.Detours
                     "argument occupies the parameter the target's receiver needs. Use an " +
                     "unbound method group, or an instance method on a proxy object.");
 
-            return Redirect(target, replacement.Target, replacement.Method, allowInterfaceDispatch);
+            return Redirect(target, replacement.Target, replacement.Method, allowInterfaceDispatch,
+                allowTieredCompilation);
         }
 
         /// <summary>
@@ -379,9 +429,11 @@ namespace ClrSpector.Detours
             Type targetType,
             string targetMethod,
             Delegate replacement,
-            bool allowInterfaceDispatch = false)
+            bool allowInterfaceDispatch = false,
+            bool allowTieredCompilation = false)
         {
-            return Redirect(Find(targetType, targetMethod), replacement, allowInterfaceDispatch);
+            return Redirect(Find(targetType, targetMethod), replacement, allowInterfaceDispatch,
+                allowTieredCompilation);
         }
 
         private static MethodBase Find(Type type, string name)

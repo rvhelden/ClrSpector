@@ -1,4 +1,6 @@
 using System;
+using System.Linq;
+using System.Runtime.CompilerServices;
 using ClrSpector.Cdac;
 
 namespace ClrSpector
@@ -40,6 +42,116 @@ namespace ClrSpector
         /// <summary>The decoded type. Free objects have one too - the runtime's Free type.</summary>
         public ClrMethodTable MethodTable =>
             this.methodTable ??= ClrMethodTable.Create(new MemoryReader(this.MethodTablePointer));
+
+        /// <summary>
+        /// The heap segment this object lives in, or null when no segment covers its address.
+        /// </summary>
+        /// <remarks>
+        /// The segment is what says which generation the object is in and whether it is on the
+        /// large or pinned object heap - facts about placement that the object itself does not
+        /// carry. The segment structure is read once and a collection rebuilds it, so refresh
+        /// with <see cref="ClrGcHeap.Refresh"/> if the layout may have changed underneath.
+        /// </remarks>
+        public ClrHeapSegment Segment
+        {
+            get
+            {
+                var address = this.Address.ToInt64();
+
+                return ClrGcHeap.Current.Segments.FirstOrDefault(
+                    segment => address >= segment.Mem.ToInt64() && address < segment.Committed.ToInt64());
+            }
+        }
+
+        /// <summary>
+        /// The generation this object currently lives in, or -1 when no segment covers it.
+        /// </summary>
+        /// <remarks>
+        /// This is the generation of the segment the object was found in - the GC's own
+        /// placement, not a promotion count. <see cref="GC.GetGeneration(object)"/> answers the
+        /// same question through the supported API without reading the heap.
+        /// </remarks>
+        public int Generation => this.Segment?.Generation ?? -1;
+
+        /// <summary>
+        /// The GC's entry for a live object: its address, its size as the collector computes it,
+        /// and its type.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <see cref="ClrGcHeap.EnumerateObjects()"/> goes the other way - it finds every object
+        /// by walking segments. This goes straight to one object already in hand, which is the
+        /// usual thing to want when investigating a specific instance.
+        /// </para>
+        /// <para>
+        /// The size is the part reflection cannot supply: it is what a heap walk advances by, and
+        /// it accounts for the header, the component count of an array or string, and the GC's
+        /// alignment rules.
+        /// </para>
+        /// <para>
+        /// <b>An object's address is only true until the GC moves it.</b> Nothing here pins
+        /// anything, so for more than a single read take a <see cref="GcWalkScope"/> and use
+        /// <see cref="Of(object, GcWalkScope)"/>. The MethodTable decoded here is checked against
+        /// the object's actual type either way, so a move is reported rather than returned as
+        /// nonsense.
+        /// </para>
+        /// </remarks>
+        public static ClrHeapObject Of(object instance)
+        {
+            if (instance == null) throw new ArgumentNullException(nameof(instance));
+
+            var address = AddressOf(instance);
+            var layouts = ClrGcHeap.Current.Layouts;
+
+            if (!layouts.IsReadableObjectHeader(address.ToInt64()))
+                throw new ClrSpectorUnsupportedRuntimeException(
+                    $"0x{address.ToInt64():x} does not look like a readable object header, so the " +
+                    "object cannot be decoded. A collection may have moved it since its address " +
+                    "was taken.");
+
+            var entry = Create(new MemoryReader(address), layouts);
+
+            // The object knows its own type, so the decode can be checked rather than trusted: a
+            // MethodTable that disagrees means the address no longer refers to this object.
+            var expected = instance.GetType().TypeHandle.Value;
+            if (entry.MethodTablePointer != expected)
+                throw new ClrSpectorUnsupportedRuntimeException(
+                    $"The object at 0x{address.ToInt64():x} decodes to MethodTable " +
+                    $"0x{entry.MethodTablePointer.ToInt64():x}, but {instance.GetType().Name} is " +
+                    $"0x{expected.ToInt64():x}. A collection moved the object between taking its " +
+                    "address and reading it - retry inside a GcWalkScope.");
+
+            return entry;
+        }
+
+        /// <summary>
+        /// The GC's entry for a live object, failing if <paramref name="scope"/> saw a collection
+        /// while it was being read.
+        /// </summary>
+        public static ClrHeapObject Of(object instance, GcWalkScope scope)
+        {
+            var entry = Of(instance);
+
+            scope?.ThrowIfInvalidated();
+
+            return entry;
+        }
+
+        /// <summary>
+        /// The address of a live object on the heap - where its MethodTable pointer sits, which
+        /// is what a reference actually points at.
+        /// </summary>
+        /// <remarks>
+        /// True at the moment it is read and no longer, since nothing pins the object.
+        /// </remarks>
+        public static IntPtr AddressOf(object instance)
+        {
+            if (instance == null) throw new ArgumentNullException(nameof(instance));
+
+            // A managed reference is the object's address. Reinterpreting the local that holds it
+            // is the only way to read that value without the runtime handing out a copy.
+            return Unsafe.As<object, IntPtr>(ref instance);
+        }
 
         /// <summary>
         /// Decodes the object at <paramref name="reader"/>'s address.
@@ -86,6 +198,12 @@ namespace ClrSpector
             var components = this.ComponentCount > 0 ? $" count={this.ComponentCount}" : string.Empty;
             return $"object @0x{this.Address.ToInt64():x} size={this.Size}{components}{kind} " +
                    $"mt=0x{this.MethodTablePointer.ToInt64():x}";
+        }
+
+        public object GetValue()
+        {
+            var address = Address;
+            return Unsafe.Read<object>(&address);
         }
     }
 }

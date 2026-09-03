@@ -217,14 +217,23 @@ EEClass.MethodDescChunk ──▶ chunk (follow MethodDescChunk.Next until null)
     MethodDescs begin at chunk + sizeof(MethodDescChunk)
 ```
 
-Each `MethodDesc`'s own byte size varies with its classification, so stepping through a chunk uses
-the runtime's classification size table (`MethodDescSizeTable`):
+Each `MethodDesc`'s own byte size varies with its classification and with which optional slots
+trail it, so stepping through a chunk needs that size:
 
 ```csharp
-classification = Flags & 0x0007
-index          = classification | (Flags & 0x0038)   // HasNonVtableSlot | MethodImpl | HasNativeCodeSlot
-size           = sizeTable[index]
+classification = Flags & 0x0007                 // -> sizeof(MethodDesc | FCallMethodDesc | ...)
+size           = baseSizeOf(classification)
+if (Flags & 0x0008) size += sizeof(NonVtableSlot)      //  8
+if (Flags & 0x0010) size += sizeof(MethodImpl)         // 16
+if (Flags & 0x0020) size += sizeof(NativeCodeSlot)     //  8
+if (Flags & 0x0040) size += sizeof(AsyncMethodData)    // 24  <- .NET 11
 ```
+
+Every size on the right comes from the contract descriptor, so none of the numbers above are
+compiled in. `AsyncMethodData` is new in .NET 11's runtime async work and is the largest of the
+four; omitting it undercounts every async method's `MethodDesc` by 24 bytes and desynchronises
+the rest of its chunk. That was measured: 68 of ~2500 CoreLib types failed to walk, every
+`Task`-related type among them.
 
 Every step is then **cross-checked** against the `MethodDesc`'s own `ChunkIndex`, which
 independently records where it sits (in units of the `MethodDescAlignment` global). If the two
@@ -662,7 +671,7 @@ type itself.
 | Limit | Why | What to do |
 |---|---|---|
 | **Inlined calls cannot be intercepted** | If the JIT inlined the callee, no call happens at all, so there is no dispatch to redirect. | Mark redirectable methods `[MethodImpl(MethodImplOptions.NoInlining)]`. |
-| **Tiered compilation rewrites the same slot** | Promoting a method to optimised code updates the dispatch slot, silently dropping your redirect. | Set `<TieredCompilation>false</TieredCompilation>` in test projects that rely on this. |
+| **Tiered compilation rewrites the same slot** | Promoting a method to optimised code updates the dispatch slot, silently dropping your redirect. | **Refused automatically** - the runtime records tiering eligibility per method, so an eligible target is rejected. Set `<TieredCompilation>false</TieredCompilation>`, or pass `allowTieredCompilation: true`. |
 | **The slot is process-wide** | Two tests redirecting the same method concurrently each undo the other. | Serialize them. With TUnit, `[NotInParallel]`. |
 | **Interface dispatch leaks** | Interface dispatch caches the resolved target and the cache is not reverted. Permanent and process-wide. | Refused by default; see above. Mock through the interface instead. |
 | **A vtable patch is per declaring type** | Subclasses inheriting the slot are affected; overriding subclasses are not. | Redirect the type whose behaviour you mean to replace. |
@@ -764,6 +773,79 @@ using (MethodDetour.Redirect(
 The proxy is bound to the redirect, not baked into the adapter, so disposing releases it rather
 than leaking it for the life of the process. The adapter code itself is emitted once per distinct
 pairing and is never reclaimed.
+
+### The tiering guard
+
+`MethodDesc.Flags3AndTokenRemainder` carries `IsEligibleForTieredCompilation` (`0x8000`), so
+"will the runtime recompile this and undo my redirect?" is a question that can be *asked* rather
+than assumed from build configuration:
+
+```csharp
+var descriptor = ClrObject.From(target.DeclaringType).MethodTable.FindMethod(target);
+if (descriptor?.IsEligibleForTieredCompilation == true)
+    throw new MethodDetourException(...);
+```
+
+The flag tracks configuration exactly, which is what makes the guard worth having rather than
+noisy. Measured on this runtime:
+
+| | methods flagged eligible |
+|---|---|
+| `<TieredCompilation>false</TieredCompilation>` | 0 of 11621 sampled |
+| tiering enabled | 10424 of 11621 sampled |
+
+So the refusal fires precisely when someone forgot the setting, and never otherwise. It can be
+waived per redirect with `allowTieredCompilation: true`.
+
+### Reaching one object's GC entry
+
+`ClrGcHeap.EnumerateObjects()` finds every object by walking segments. When you already hold the
+object, `ClrHeapObject.Of` goes straight to it:
+
+```csharp
+using var scope = GcWalkScope.Enter();
+
+var entry = ClrHeapObject.Of(myObject, scope);   // address, size, component count, type
+
+Console.WriteLine($"{entry.Size} bytes, gen {entry.Generation}, {entry.MethodTable.Name}");
+Console.WriteLine($"on the LOH: {entry.Segment?.IsLargeObjectHeap}");
+```
+
+`Segment` and `Generation` are properties of the entry rather than of the object, so they work
+the same for an entry that came out of a heap walk.
+
+The size is the part reflection cannot give you: it is what a heap walk advances by, including
+the header, an array or string's component count, and the GC's alignment rules.
+
+```
+Sample     addr=0x1928486a310 size=32     count=0      gen=0 loh=False  AbiProbe.Sample
+String     addr=0x1b1942b0dc8 size=40     count=8      gen=2 loh=False  System.String
+Int32[]    addr=0x1928486a330 size=64     count=10     gen=0 loh=False  System.Int32[]
+Byte[]     addr=0x19284c00048 size=100024 count=100000 gen=3 loh=True   System.Byte[]
+```
+
+**An object's address is only true until the GC moves it.** Nothing here pins anything, so take a
+`GcWalkScope` for anything longer than a single read. `Of` also re-checks the MethodTable it
+decoded against the object's actual type, so a move is reported rather than returned as nonsense.
+
+### Recognising a precode without hardcoding opcodes
+
+The descriptor publishes the byte pattern the runtime built its own precodes from, plus a mask of
+the positions that vary (the embedded addresses):
+
+```
+FixupBytes        = ff 25 fa 3f 00 00 4c 8b 15 fb 3f 00 00 ff 25 fd 3f 00 00 00 00 00 00 00
+FixupIgnoredBytes = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 01 01 01 01
+actual entry      = ff 25 fa 3f 00 00 4c 8b 15 fb 3f 00 00 ff 25 fd 3f 00 00 90 66 66 66 66
+```
+
+So `precode.IsFixupPrecode` compares against the template from the same build that emitted the
+stub, rather than testing for `ff 25`. The `jmp` decoding is still what locates the dispatch slot
+to patch - that part is inherently x64 - but identifying the precode no longer is.
+
+Fields the runtime need not publish (every precode type but `Stub`, both precode sizes, the byte
+templates) are read as optional and reported absent rather than throwing, matching how the
+runtime's own reader treats them.
 
 ### Inspecting a precode yourself
 
@@ -1071,6 +1153,9 @@ re-verify, which is what the fail-loud checks exist for.
   optional trailing slots", and the descriptor still publishes the size of every one of those
   types. `MethodDescSizes` reconstructs it. The chunk walk cross-checks every step against each
   MethodDesc's own `ChunkIndex`, which is what proved the reconstruction right.
+- **MethodDesc gained a fourth optional slot.** `HasAsyncMethodData` (`Flags & 0x0040`) appends a
+  24-byte `AsyncMethodData` structure, and it is set on a great many methods - 1379 of the 43342
+  walked across CoreLib. It must be added to the size above.
 
 Also gone in 11.0: the `ObjectHeaderSize` global and the `ArrayClass` and `GCHandle` types.
 

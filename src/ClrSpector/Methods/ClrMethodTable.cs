@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using ClrSpector.Cdac;
 
 namespace ClrSpector
@@ -36,11 +37,60 @@ namespace ClrSpector
         /// </summary>
         private const uint CategoryGroupMask = 0x000C0000;
 
+        private const uint CategoryNullable = 0x00050000;
+        private const uint CategoryPrimitive = 0x00060000;
+        private const uint CategoryTruePrimitive = 0x00070000;
+
+        /// <summary>
+        /// Groups the primitive sub-categories, so a true primitive still reads as a primitive.
+        /// </summary>
+        private const uint CategoryElementTypeMask = 0x000E0000;
+
+        private const uint CollectibleFlag = 0x00200000;
+        private const uint RequiresAlign8Flag = 0x00800000;
+        private const uint ContainsGcPointersFlag = 0x01000000;
+        private const uint ContainsGenericVariablesFlag = 0x20000000;
+
+        /// <summary>
+        /// The low word of MTFlags, which only holds flags when it is not holding a component
+        /// size. See <see cref="LowFlagsAre"/>.
+        /// </summary>
+        private const uint GenericsMask = 0x00000030;
+
+        private const uint GenericsNonGeneric = 0x00000000;
+        private const uint GenericsSharedInstantiation = 0x00000020;
+        private const uint GenericsTypicalInstantiation = 0x00000030;
+
+        private const uint IsByRefLikeFlag = 0x00001000;
+
+        /// <summary>
+        /// The low-word value the runtime substitutes for a string or array, whose own low word
+        /// is a component size rather than flags.
+        /// </summary>
+        private const uint StringArrayLowFlags = GenericsNonGeneric;
+
+        /// <summary>A string's component size: one UTF-16 code unit.</summary>
+        private const uint StringComponentSize = 2;
+
         /// <summary>MethodTable.EEClassOrCanonMT carries its discriminator in the low bit.</summary>
         private const long UnionTagMask = 1;
 
-        /// <summary>The token range occupies the low bits of MethodDescChunk.FlagsAndTokenRange.</summary>
-        private const ushort TokenRangeMask = 0x0FFF;
+        /// <summary>
+        /// How many bits an ECMA-335 row id occupies - the low three bytes of a token.
+        /// </summary>
+        private const int RowIdBitCount = 24;
+
+        /// <summary>All row-id bits set; the rest of a token is the table index.</summary>
+        private const uint RowIdMask = (1u << RowIdBitCount) - 1;
+
+        /// <summary>
+        /// MTFlags2 holds the type's TypeDef row id above its flag bits, so the rid is the whole
+        /// field shifted down.
+        /// </summary>
+        private const int TypeDefRidShift = 8;
+
+        /// <summary>mdtTypeDef - the metadata table that type tokens live in.</summary>
+        private const uint TypeDefTokenType = 0x02000000;
 
         public void* BasePointer { get; private set; }
 
@@ -102,8 +152,128 @@ namespace ClrSpector
 
         public bool IsClass => this.Category == CategoryClass;
 
+        /// <summary>True for <see cref="System.Nullable{T}"/>, a sub-category of value type.</summary>
+        public bool IsNullable => this.Category == CategoryNullable;
+
+        /// <summary>True for a primitive, including the ones the runtime calls "true" primitives.</summary>
+        public bool IsPrimitive => (this.Flags & CategoryElementTypeMask) == CategoryPrimitive;
+
+        /// <summary>
+        /// True for a primitive the runtime treats as intrinsic rather than merely primitive-like.
+        /// </summary>
+        public bool IsTruePrimitive => this.Category == CategoryTruePrimitive;
+
+        /// <summary>
+        /// True for <see cref="string"/>: it carries a component size like an array, but is not
+        /// one, and its components are UTF-16 code units.
+        /// </summary>
+        public bool IsString =>
+            this.HasComponentSize && !this.IsArray && this.ComponentSize == StringComponentSize;
+
+        /// <summary>True when instances of this type contain references the GC must trace.</summary>
+        public bool ContainsGcPointers => (this.Flags & ContainsGcPointersFlag) != 0;
+
+        /// <summary>True for a type in a collectible load context, which the GC can unload.</summary>
+        public bool IsCollectible => (this.Flags & CollectibleFlag) != 0;
+
+        /// <summary>True when instances need 8-byte alignment on a 32-bit runtime.</summary>
+        public bool RequiresAlign8 => (this.Flags & RequiresAlign8Flag) != 0;
+
+        /// <summary>True for an open type - one still mentioning its own type parameters.</summary>
+        public bool ContainsGenericVariables => (this.Flags & ContainsGenericVariablesFlag) != 0;
+
+        /// <summary>True for any generic type, however instantiated.</summary>
+        public bool HasInstantiation => !this.LowFlagsAre(GenericsMask, GenericsNonGeneric);
+
+        /// <summary>True for the open definition, e.g. <c>List&lt;T&gt;</c> itself.</summary>
+        public bool IsGenericTypeDefinition =>
+            this.LowFlagsAre(GenericsMask, GenericsTypicalInstantiation);
+
+        /// <summary>
+        /// True when this instantiation shares its code with others, e.g.
+        /// <c>List&lt;__Canon&gt;</c> standing in for every reference instantiation.
+        /// </summary>
+        public bool IsSharedByGenericInstantiations =>
+            this.LowFlagsAre(GenericsMask, GenericsSharedInstantiation);
+
+        /// <summary>
+        /// True for a byref-like value type - <c>ref struct</c>, such as
+        /// <see cref="System.Span{T}"/> - which may hold managed pointers and so cannot live on
+        /// the heap.
+        /// </summary>
+        public bool IsByRefLike => this.LowFlagsAre(IsByRefLikeFlag, IsByRefLikeFlag);
+
+        /// <summary>
+        /// Tests flags in the low word of MTFlags.
+        /// </summary>
+        /// <remarks>
+        /// A string or array spends that word on its component size, so reading flags out of it
+        /// would be reading a length as a bitfield. The runtime substitutes a fixed value for
+        /// those types instead, and so does this.
+        /// </remarks>
+        private bool LowFlagsAre(uint mask, uint expected)
+        {
+            var low = this.HasComponentSize ? StringArrayLowFlags : this.Flags;
+
+            return (low & mask) == expected;
+        }
+
+        /// <summary>
+        /// The row id of this type's TypeDef, which the runtime packs into the high bits of
+        /// MTFlags2 rather than storing a whole token.
+        /// </summary>
+        public uint TypeDefRid => this.Flags2 >> TypeDefRidShift;
+
+        /// <summary>
+        /// This type's ECMA-335 TypeDef token, reassembled from <see cref="TypeDefRid"/>.
+        /// Resolving it through <see cref="System.Reflection.Module.ResolveType(int)"/> on the
+        /// type's own module is the metadata route to its name, and the only route available
+        /// when there is no live type handle to ask.
+        /// </summary>
+        /// <remarks>
+        /// For a generic instantiation this names the generic type definition - the TypeDef is
+        /// <c>List`1</c>, not <c>List&lt;string&gt;</c> - because that is what metadata records.
+        /// </remarks>
+        public uint TypeDefToken => TypeDefTokenType | this.TypeDefRid;
+
+        /// <summary>
+        /// The managed type this MethodTable is the runtime representation of. A type handle is
+        /// a MethodTable address, so this is the inverse of <see cref="ClrObject.From(Type)"/>.
+        /// </summary>
+        /// <remarks>
+        /// Unlike <see cref="TypeDefToken"/> this carries the full instantiation
+        /// (<c>List&lt;string&gt;</c>), but a shared instantiation names itself honestly as
+        /// <c>List&lt;__Canon&gt;</c>. Only meaningful for a MethodTable belonging to this
+        /// process; a stale or invented address will fault rather than return null.
+        /// </remarks>
+        public System.Type Type =>
+            System.Type.GetTypeFromHandle(RuntimeTypeHandle.FromIntPtr(this.Address));
+
+        /// <summary>This type's full name, or null when the address is not a live type handle.</summary>
+        public string Name => this.Type?.FullName;
+
         /// <summary>The methods this type declares, in MethodDescChunk order.</summary>
         public List<ClrMethodDescription> Methods { get; private set; }
+
+        /// <summary>
+        /// The decoded MethodDesc this type declares for <paramref name="method"/>, or null when
+        /// the type does not declare it.
+        /// </summary>
+        /// <remarks>
+        /// Matched on the metadata token, which is the only identity a MethodDesc carries - it
+        /// stores no name. An inherited method belongs to the type that declares it, so look it
+        /// up on that type's MethodTable rather than a subclass's.
+        /// </remarks>
+        public ClrMethodDescription FindMethod(System.Reflection.MethodBase method)
+        {
+            return method == null ? null : this.FindMethod((uint)method.MetadataToken);
+        }
+
+        /// <summary>The decoded MethodDesc with this metadata token, or null.</summary>
+        public ClrMethodDescription FindMethod(uint metadataToken)
+        {
+            return this.Methods?.FirstOrDefault(m => m.MetadataToken == metadataToken);
+        }
 
         public static ClrMethodTable Create(MemoryReader reader)
         {
@@ -213,7 +383,10 @@ namespace ClrSpector
             {
                 var chunkReader = new MemoryReader(chunk);
                 var count = chunkReader.ReadByte(countOffset) + 1;
-                var tokenRange = (ushort)(chunkReader.ReadUShort(tokenRangeOffset) & TokenRangeMask);
+                // The token is split between the chunk (its range) and each MethodDesc (its
+                // remainder), so the range keeps whatever row-id bits the remainder does not.
+                var tokenRangeMask = (ushort)(RowIdMask >> tokenRemainderBits);
+                var tokenRange = (ushort)(chunkReader.ReadUShort(tokenRangeOffset) & tokenRangeMask);
 
                 var offset = 0;
                 for (var i = 0; i < count; i++)
@@ -240,7 +413,8 @@ namespace ClrSpector
 
         public override string ToString()
         {
-            return $"MethodTable @0x{this.Address.ToInt64():x} baseSize={this.BaseSize} " +
+            return $"MethodTable {this.Name ?? "<unnamed>"} @0x{this.Address.ToInt64():x} " +
+                   $"token=0x{this.TypeDefToken:x8} baseSize={this.BaseSize} " +
                    $"virtuals={this.NumberOfVirtuals} interfaces={this.NumberOfInterfaces} " +
                    $"methods={this.Methods?.Count ?? 0}";
         }
