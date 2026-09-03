@@ -47,6 +47,25 @@ namespace ClrSpector
         Comment
     }
 
+    /// <summary>How much of the compiler's work a projection tries to undo.</summary>
+    public enum ClrCSharpForm
+    {
+        /// <summary>
+        /// One statement per group of instructions, with the control flow left exactly as the
+        /// IL has it: branches as <c>goto</c>, every statement labelled with its offset. Nothing
+        /// is inferred, so nothing can be inferred wrongly.
+        /// </summary>
+        Faithful,
+
+        /// <summary>
+        /// The same projection with the compiler's scaffolding recognised and undone: its
+        /// temporaries folded into the expressions they carry, its conditional jumps back into
+        /// conditional expressions, its bottom-tested jumps back into loops. Every rewrite is a
+        /// pattern the projection can prove; a shape it cannot prove keeps its gotos.
+        /// </summary>
+        Structured
+    }
+
     /// <summary>One coloured run of text in a projected C# line.</summary>
     public sealed class ClrCSharpToken
     {
@@ -148,16 +167,13 @@ namespace ClrSpector
     /// <c>loc0 = loc0 + 1;</c>, which is the part of IL that is genuinely hard to read by eye.
     /// </para>
     /// <para>
-    /// The output is a reading aid and will not compile. Types are only as good as the source
-    /// the IL came from: read through <see cref="MethodBase"/> the locals and signature are
-    /// exact, while IL read from a MethodDesc has no local signature to decode, so its locals
-    /// are declared untyped and its expressions are named from metadata alone.
-    /// </para>
-    /// <para>
-    /// The try, catch, filter and finally blocks are projected from either source: reflection's
-    /// clauses, or the exception handling table <see cref="ClrMethodBodyImage"/> reads out of
-    /// the data sections that follow the code. What a MethodDesc-sourced projection still lacks
-    /// is local variable types, which live in a signature nothing here decodes yet.
+    /// The output is a reading aid and will not compile. Both sources of IL project the same
+    /// shape: the signature and locals are typed, and the try, catch, filter and finally blocks
+    /// are there. What differs is where that came from - reflection's own metadata, or, for IL
+    /// read from a MethodDesc, the module's tables: the local signature decoded through
+    /// <see cref="ClrModuleMetadata.LocalSignature"/>, the handlers out of the body's data
+    /// sections, and every operand named from the string heap. A slot whose signature will not
+    /// decode is declared untyped rather than guessed at.
     /// </para>
     /// <para>
     /// Statements carry the IL they came from as a trailing comment, so nothing is hidden by the
@@ -167,15 +183,20 @@ namespace ClrSpector
     /// </remarks>
     public sealed class ClrMethodCSharp
     {
-        internal ClrMethodCSharp(ClrMethodIl il, IReadOnlyList<ClrCSharpLine> lines, bool isExact)
+        internal ClrMethodCSharp(
+            ClrMethodIl il, IReadOnlyList<ClrCSharpLine> lines, bool isExact, ClrCSharpForm form)
         {
             this.Il = il;
             this.Lines = lines;
             this.IsExact = isExact;
+            this.Form = form;
         }
 
         /// <summary>The IL this was projected from.</summary>
         public ClrMethodIl Il { get; }
+
+        /// <summary>Which form this was projected in.</summary>
+        public ClrCSharpForm Form { get; }
 
         public IReadOnlyList<ClrCSharpLine> Lines { get; }
 
@@ -191,21 +212,28 @@ namespace ClrSpector
         public bool IsExact { get; }
 
         /// <summary>Projects <paramref name="il"/>, or null when <paramref name="il"/> is null.</summary>
-        public static ClrMethodCSharp Of(ClrMethodIl il)
+        public static ClrMethodCSharp Of(ClrMethodIl il, ClrCSharpForm form = ClrCSharpForm.Faithful)
         {
-            return il == null ? null : new CSharpProjector(il).Project();
+            return il == null ? null : new CSharpProjector(il, form).Project();
         }
 
         /// <summary>
         /// Projects <paramref name="method"/>'s IL, or null when it has no body.
         /// </summary>
-        public static ClrMethodCSharp Of(MethodBase method) => Of(ClrMethodIl.Of(method));
+        public static ClrMethodCSharp Of(MethodBase method, ClrCSharpForm form = ClrCSharpForm.Faithful)
+        {
+            return Of(ClrMethodIl.Of(method), form);
+        }
 
         /// <summary>
         /// Projects the IL read from <paramref name="method"/>'s module image, or null when it
         /// has no body.
         /// </summary>
-        public static ClrMethodCSharp Of(ClrMethodDescription method) => Of(ClrMethodIl.Of(method));
+        public static ClrMethodCSharp Of(
+            ClrMethodDescription method, ClrCSharpForm form = ClrCSharpForm.Faithful)
+        {
+            return Of(ClrMethodIl.Of(method), form);
+        }
 
         /// <summary>The projection as plain text.</summary>
         public string Dump() => this.Dump(IlDumpStyle.Plain);
@@ -226,7 +254,8 @@ namespace ClrSpector
 
         public override string ToString()
         {
-            return $"{this.Lines.Count} lines of C# from {this.Il.Instructions.Count} instructions" +
+            return $"{this.Lines.Count} lines of {this.Form.ToString().ToLowerInvariant()} C# " +
+                   $"from {this.Il.Instructions.Count} instructions" +
                    (this.IsExact ? string.Empty : " (approximate)");
         }
     }

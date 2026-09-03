@@ -336,12 +336,15 @@ namespace ClrSpector
         /// What kind of generic method this is, for an instantiated MethodDesc.
         /// </summary>
         /// <remarks>
-        /// Read from InstantiatedMethodDesc.Flags2. Only
-        /// <see cref="GenericMethodKind.GenericMethodDefinition"/> is confirmed by measurement
-        /// here, because it is the only kind reachable through a MethodTable's chunks - the
-        /// instantiations themselves live in the module's InstMethodHashTable, which nothing
-        /// walks yet. The other names come from the runtime's own enum, so treat a value other
-        /// than the definition as indicative rather than verified.
+        /// Read from InstantiatedMethodDesc.Flags2. All four kinds have been observed against a
+        /// live runtime, by enumerating <see cref="ClrModule.InstantiatedMethods"/>, and they
+        /// behave as their names claim: a value type argument produces
+        /// <see cref="GenericMethodKind.UnsharedMethodInstantiation"/>, a <c>__Canon</c> argument
+        /// <see cref="GenericMethodKind.SharedMethodInstantiation"/>, the concrete reference
+        /// instantiation that wraps it
+        /// <see cref="GenericMethodKind.WrapperStubWithInstantiations"/>, and the open definition
+        /// found in a type's own chunks
+        /// <see cref="GenericMethodKind.GenericMethodDefinition"/>.
         /// </remarks>
         public GenericMethodKind GenericKind
         {
@@ -385,8 +388,9 @@ namespace ClrSpector
         /// Echo&lt;int&gt;.
         /// </summary>
         /// <remarks>
-        /// These are the generic methods a MethodTable's chunks actually hold, which is why this
-        /// is the one kind measurement can confirm.
+        /// These are the generic methods a MethodTable's chunks hold. The instantiations are not
+        /// there at all - they live in the module's side table, which
+        /// <see cref="ClrModule.InstantiatedMethods"/> enumerates.
         /// </remarks>
         public bool IsGenericMethodDefinition =>
             this.GenericKind == GenericMethodKind.GenericMethodDefinition;
@@ -571,10 +575,29 @@ namespace ClrSpector
         }
 
         /// <summary>The decoded type that declares this method, or null when it is not known.</summary>
-        public ClrMethodTable DeclaringMethodTable =>
-            this.MethodTablePointer == IntPtr.Zero
-                ? null
-                : ClrMethodTable.Create(new MemoryReader(this.MethodTablePointer));
+        /// <remarks>
+        /// The pointer is checked before it is followed. A MethodDesc reached from a bare address
+        /// or a side table can carry one that does not point at a MethodTable, and decoding that
+        /// would be an access violation rather than a wrong answer - which takes the process down
+        /// instead of failing the call.
+        /// </remarks>
+        public ClrMethodTable DeclaringMethodTable
+        {
+            get
+            {
+                var table = this.MethodTablePointer;
+
+                if (!ClrMethodTable.IsMethodTableHandle(table))
+                    return null;
+
+                var descriptor = ContractDescriptor.Current;
+                var size = descriptor.GetDataType("MethodTable").Size ?? (uint)IntPtr.Size;
+
+                return ProcessMemoryRegions.IsReadable(table, size)
+                    ? ClrMethodTable.Create(new MemoryReader(table))
+                    : null;
+            }
+        }
 
         /// <summary>The metadata of the module that declares this method.</summary>
         public ClrModuleMetadata Metadata
@@ -734,8 +757,8 @@ namespace ClrSpector
     /// </summary>
     /// <remarks>
     /// The values are the runtime's own, from the kind bits of InstantiatedMethodDesc.Flags2.
-    /// Only <see cref="GenericMethodDefinition"/> is confirmed against a live runtime here - see
-    /// <see cref="ClrMethodDescription.GenericKind"/>.
+    /// Each has been observed against a live runtime - see
+    /// <see cref="ClrMethodDescription.GenericKind"/> for what produces which.
     /// </remarks>
     public enum GenericMethodKind
     {
@@ -745,16 +768,24 @@ namespace ClrSpector
         /// <summary>The open definition, Echo&lt;T&gt;.</summary>
         GenericMethodDefinition = 1,
 
-        /// <summary>An instantiation with its own code, as a value type argument gets.</summary>
+        /// <summary>
+        /// An instantiation with its own code, which is what a value type argument gets.
+        /// Measured: <c>Echo&lt;int&gt;</c>, <c>Echo&lt;double&gt;</c> and <c>Echo&lt;Small&gt;</c>.
+        /// </summary>
         UnsharedMethodInstantiation = 2,
 
         /// <summary>
-        /// An instantiation sharing code with others, which is what reference type arguments get
-        /// - and why its type arguments read as System.__Canon.
+        /// The one body of code every reference instantiation shares, whose own type arguments
+        /// are System.__Canon. Measured: <c>Echo&lt;System.__Canon&gt;</c> exists alongside
+        /// <c>Echo&lt;string&gt;</c>, and is what the latter's code actually is.
         /// </summary>
         SharedMethodInstantiation = 3,
 
-        /// <summary>A wrapper stub that carries an instantiation of its own.</summary>
+        /// <summary>
+        /// The concrete reference instantiation, which is a stub carrying its real type
+        /// arguments over the shared code. Measured: <c>Echo&lt;string&gt;</c> and
+        /// <c>Pair&lt;string, double&gt;</c>.
+        /// </summary>
         WrapperStubWithInstantiations = 4
     }
 

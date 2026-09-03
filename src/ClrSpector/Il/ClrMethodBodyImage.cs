@@ -96,6 +96,10 @@ namespace ClrSpector
         /// The standalone signature token describing the locals, or zero when the method has
         /// none. Only a fat header carries one.
         /// </summary>
+        /// <remarks>
+        /// The locals themselves are not here: the token names a blob in the module's metadata,
+        /// which <see cref="ClrModuleMetadata.LocalSignature"/> decodes into slots.
+        /// </remarks>
         public uint LocalSignatureToken { get; private set; }
 
         /// <summary>True for the twelve-byte header, false for the one-byte one.</summary>

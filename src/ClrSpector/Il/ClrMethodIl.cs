@@ -264,8 +264,18 @@ namespace ClrSpector
 
         public IReadOnlyList<ClrIlInstruction> Instructions { get; private set; }
 
-        /// <summary>The method's local variables, in slot order.</summary>
+        /// <summary>
+        /// The method's local variables as reflection reports them, in slot order. Always empty
+        /// for IL read from a MethodDesc; use <see cref="LocalVariables"/> for the slots of
+        /// either source.
+        /// </summary>
         public IReadOnlyList<LocalVariableInfo> Locals { get; private set; }
+
+        /// <summary>
+        /// The method's local variable slots, from whichever source the IL came from -
+        /// reflection's locals, or the body's own local signature decoded from metadata.
+        /// </summary>
+        public IReadOnlyList<ClrIlLocal> LocalVariables { get; private set; }
 
         /// <summary>
         /// The try/catch/finally regions the method declares, as reflection reports them. Always
@@ -319,6 +329,7 @@ namespace ClrSpector
 
             il.Instructions = Decode(method, bytes);
             il.ExceptionRegions = il.ExceptionHandlers.Select(RegionOf).ToArray();
+            il.LocalVariables = il.Locals.Select(ClrIlLocal.Of).ToArray();
 
             return il;
         }
@@ -348,6 +359,8 @@ namespace ClrSpector
                 Locals = Array.Empty<LocalVariableInfo>(),
                 ExceptionHandlers = Array.Empty<ExceptionHandlingClause>(),
                 ExceptionRegions = NameCaughtTypes(body.ExceptionRegions, metadata),
+                LocalVariables = metadata?.LocalSignature((int)body.LocalSignatureToken)
+                                 ?? (IReadOnlyList<ClrIlLocal>)Array.Empty<ClrIlLocal>(),
                 MaxStackSize = body.MaxStack,
                 InitLocals = body.InitLocals,
                 Description = method
@@ -634,10 +647,17 @@ namespace ClrSpector
         /// control flow left as it is. See <see cref="ClrMethodCSharp"/> for what the projection
         /// does and does not claim.
         /// </summary>
-        public ClrMethodCSharp ToCSharp() => ClrMethodCSharp.Of(this);
+        public ClrMethodCSharp ToCSharp(ClrCSharpForm form = ClrCSharpForm.Faithful)
+        {
+            return ClrMethodCSharp.Of(this, form);
+        }
 
         /// <summary>The C# projection rendered as text, coloured like an IL dump.</summary>
-        public string DumpCSharp(IlDumpStyle style = IlDumpStyle.Plain) => this.ToCSharp().Dump(style);
+        public string DumpCSharp(
+            IlDumpStyle style = IlDumpStyle.Plain, ClrCSharpForm form = ClrCSharpForm.Faithful)
+        {
+            return this.ToCSharp(form).Dump(style);
+        }
 
         /// <summary>
         /// The method rendered as IL text: signature, locals, then one instruction per line.
@@ -660,19 +680,19 @@ namespace ClrSpector
 
             text.AppendLine(IlPalette.Paint($".maxstack {this.MaxStackSize}", IlPalette.Directive, colouring));
 
-            if (this.Locals.Count > 0)
+            if (this.LocalVariables.Count > 0)
             {
                 text.AppendLine(IlPalette.Paint(
                     $".locals {(this.InitLocals ? "init " : string.Empty)}(", IlPalette.Directive, colouring));
 
-                for (var i = 0; i < this.Locals.Count; i++)
+                for (var i = 0; i < this.LocalVariables.Count; i++)
                 {
-                    var local = this.Locals[i];
+                    var local = this.LocalVariables[i];
                     var pinned = local.IsPinned ? " pinned" : string.Empty;
-                    var comma = i == this.Locals.Count - 1 ? string.Empty : ",";
+                    var comma = i == this.LocalVariables.Count - 1 ? string.Empty : ",";
 
-                    text.AppendLine($"    {IlPalette.Paint($"[{local.LocalIndex}]", IlPalette.Number, colouring)} " +
-                                    $"{IlPalette.Paint(local.LocalType?.FullName ?? "?", IlPalette.Member, colouring)}{pinned}{comma}");
+                    text.AppendLine($"    {IlPalette.Paint($"[{local.Index}]", IlPalette.Number, colouring)} " +
+                                    $"{IlPalette.Paint(local.TypeName ?? "?", IlPalette.Member, colouring)}{pinned}{comma}");
                 }
 
                 text.AppendLine(IlPalette.Paint(")", IlPalette.Directive, colouring));

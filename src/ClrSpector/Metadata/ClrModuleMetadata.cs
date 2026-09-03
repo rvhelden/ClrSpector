@@ -58,6 +58,15 @@ namespace ClrSpector
         /// <summary>The calling convention byte that marks a signature blob as a field's.</summary>
         private const byte FieldSignatureConvention = 0x06;
 
+        /// <summary>The calling convention byte that marks a signature blob as a method's locals.</summary>
+        private const byte LocalSignatureConvention = 0x07;
+
+        /// <summary>
+        /// A stop on a local count read from a blob. ECMA-335 allows 0xFFFE locals and no more,
+        /// so a larger count means the blob is not being read as a LocalVarSig at all.
+        /// </summary>
+        private const uint MaximumLocals = 0xFFFE;
+
         private static readonly ConcurrentDictionary<IntPtr, ClrModuleMetadata> cache =
             new ConcurrentDictionary<IntPtr, ClrModuleMetadata>();
 
@@ -291,6 +300,55 @@ namespace ClrSpector
                 return null;
 
             return ClrMethodSignature.Decode(ref blob, this.Image);
+        }
+
+        /// <summary>
+        /// The local variable slots a method body's signature token describes, in slot order.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// A method body carries its locals only as a token
+        /// (<see cref="ClrMethodBodyImage.LocalSignatureToken"/>) for a standalone signature.
+        /// Decoding it is what makes a MethodDesc-sourced listing able to say <c>int loc0</c>
+        /// rather than only <c>loc0</c> - the runtime keeps no decoded form to ask for.
+        /// </para>
+        /// <para>
+        /// Empty when the token is zero, names something that is not a locals signature, or
+        /// cannot be read - a partly readable listing is worth more than none.
+        /// </para>
+        /// </remarks>
+        public IReadOnlyList<ClrIlLocal> LocalSignature(int token)
+        {
+            var locals = new List<ClrIlLocal>();
+
+            try
+            {
+                if (token == 0 || !this.TryRow((uint)token, MetadataTable.StandAloneSig, out var rowId))
+                    return locals;
+
+                var blob = this.Image.Blob(
+                    this.Image.ReadColumn(MetadataTable.StandAloneSig, rowId, 0));
+
+                // The same table holds calli signatures, which are methods and not locals.
+                if (blob.ReadByte() != LocalSignatureConvention)
+                    return locals;
+
+                var count = blob.ReadCompressedUInt();
+
+                if (count > MaximumLocals)
+                    throw new ClrSpectorUnsupportedRuntimeException(
+                        $"A local signature declares {count} locals, which is beyond anything " +
+                        "ECMA-335 allows, so the blob is not being read correctly.");
+
+                for (var i = 0; i < (int)count; i++)
+                    locals.Add(ClrIlLocal.Of(i, SignatureTypeReader.ReadType(ref blob, this.Image)));
+            }
+            catch (Exception)
+            {
+                // Whatever was decoded before the blob stopped making sense still names slots.
+            }
+
+            return locals;
         }
 
         /// <summary>The user string a <c>ldstr</c> token names.</summary>

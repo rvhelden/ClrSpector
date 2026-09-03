@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 
 namespace ClrSpector
 {
@@ -51,7 +52,21 @@ namespace ClrSpector
 
         private readonly ClrMethodIl il;
 
-        private readonly List<ClrCSharpLine> body = new List<ClrCSharpLine>();
+        private readonly ClrCSharpForm form;
+
+        /// <summary>
+        /// The offsets the exception table names, which control reaches without any jump saying
+        /// so - so a structuring pass may not fold them away.
+        /// </summary>
+        private readonly HashSet<int> handlerOffsets = new HashSet<int>();
+
+        /// <summary>
+        /// The names still mentioned once the passes have run, or null when everything declared
+        /// is to be declared - which is the faithful form, where nothing was folded away.
+        /// </summary>
+        private HashSet<string> used;
+
+        private readonly List<CSharpNode> body = new List<CSharpNode>();
 
         private readonly List<Slot> stack = new List<Slot>();
 
@@ -93,9 +108,10 @@ namespace ClrSpector
 
         private bool exact = true;
 
-        internal CSharpProjector(ClrMethodIl il)
+        internal CSharpProjector(ClrMethodIl il, ClrCSharpForm form = ClrCSharpForm.Faithful)
         {
             this.il = il;
+            this.form = form;
         }
 
         /// <summary>What a projected expression's type is known to be, if anything.</summary>
@@ -158,13 +174,24 @@ namespace ClrSpector
 
             this.CloseRegionsUpTo(int.MaxValue);
 
-            var lines = new List<ClrCSharpLine>();
-            lines.AddRange(this.Header());
-            lines.AddRange(this.Declarations());
-            lines.AddRange(this.body);
-            lines.Add(this.Scaffold(0, Punctuation("}")));
+            if (this.form == ClrCSharpForm.Structured)
+            {
+                var declared = CSharpStructurer.Apply(this.body, this.handlerOffsets, this.LocalTypeOf);
 
-            return new ClrMethodCSharp(this.il, lines, this.exact);
+                // Declarations come after the passes, because a slot the passes folded into the
+                // statement that read it is no longer a variable the method has.
+                this.used = new HashSet<string>(this.body.SelectMany(Names));
+                this.used.ExceptWith(declared);
+            }
+
+            var nodes = new List<CSharpNode>();
+            nodes.AddRange(this.Header());
+            nodes.AddRange(this.Declarations());
+            nodes.AddRange(this.body);
+            nodes.Add(this.Scaffold(0, Punctuation("}")));
+
+            return new ClrMethodCSharp(
+                this.il, nodes.Select(node => node.ToLine()).ToArray(), this.exact, this.form);
         }
 
         // ---------- the method's own shape ----------
@@ -221,7 +248,7 @@ namespace ClrSpector
             this.argumentNames = Array.Empty<string>();
         }
 
-        private IEnumerable<ClrCSharpLine> Header()
+        private IEnumerable<CSharpNode> Header()
         {
             // The first line is the IL dump's own header, unchanged, so the two listings can be
             // lined up next to each other.
@@ -314,29 +341,47 @@ namespace ClrSpector
         /// The locals, the spill slots and the temporaries, declared where C# wants them - which
         /// is why this runs after the body rather than before it.
         /// </summary>
-        private IEnumerable<ClrCSharpLine> Declarations()
+        private IEnumerable<CSharpNode> Declarations()
         {
-            if (this.il.Locals.Count > 0)
+            var any = false;
+
+            if (this.il.LocalVariables.Count > 0)
             {
-                foreach (var local in this.il.Locals)
+                foreach (var local in this.il.LocalVariables)
                 {
+                    if (!this.IsUsed($"loc{local.Index}"))
+                        continue;
+
+                    any = true;
+
+                    // A pinned slot is spelled as a fixed one: it is a pointer the GC has been
+                    // told to leave alone, which is what fixed means in source.
                     yield return this.Scaffold(
                         1,
-                        Type(CSharpNames.Of(local.LocalType) + (local.IsPinned ? "*" : string.Empty)),
-                        Punctuation(" "),
-                        Identifier($"loc{local.LocalIndex}"),
-                        Punctuation(";"));
+                        Join(
+                            local.IsPinned
+                                ? new[] { Keyword("fixed"), Punctuation(" ") }
+                                : Array.Empty<ClrCSharpToken>(),
+                            Type(LocalTypeText(local)),
+                            Punctuation(" "),
+                            Identifier($"loc{local.Index}"),
+                            Punctuation(";")));
                 }
             }
             else if (this.highestLocal >= 0)
             {
-                // IL read from a module image carries a local signature token but no decoded
-                // signature, so the count comes from what the instructions actually use and the
+                // No signature could be read - a body with no local signature token, or a module
+                // with no readable metadata - so the count is what the instructions used and the
                 // types are not known at all.
                 yield return this.Scaffold(1, Comment("locals: no signature read, types unknown"));
 
                 for (var i = 0; i <= this.highestLocal; i++)
                 {
+                    if (!this.IsUsed($"loc{i}"))
+                        continue;
+
+                    any = true;
+
                     yield return this.Scaffold(
                         1, Type("var"), Punctuation(" "), Identifier($"loc{i}"), Punctuation(";"));
                 }
@@ -344,6 +389,11 @@ namespace ClrSpector
 
             for (var i = 0; i < this.spillSlots; i++)
             {
+                if (!this.IsUsed($"st{i}"))
+                    continue;
+
+                any = true;
+
                 yield return this.Scaffold(
                     1,
                     Type("var"),
@@ -353,8 +403,47 @@ namespace ClrSpector
                     Comment("  // evaluation stack carried across a branch"));
             }
 
-            if (this.il.Locals.Count > 0 || this.highestLocal >= 0 || this.spillSlots > 0)
+            // The blank line separates the declarations from the body, so it only belongs
+            // where there were any.
+            if (any)
                 yield return this.Scaffold(1);
+        }
+
+        /// <summary>
+        /// The type to declare <paramref name="name"/> as, when it is one of this method's
+        /// locals and its type is known; null otherwise.
+        /// </summary>
+        private string LocalTypeOf(string name)
+        {
+            for (var i = 0; i < this.il.LocalVariables.Count; i++)
+            {
+                if (name != $"loc{this.il.LocalVariables[i].Index}")
+                    continue;
+
+                var local = this.il.LocalVariables[i];
+
+                return local.IsPinned || local.Type == null && local.SignatureType == null
+                    ? null
+                    : LocalTypeText(local);
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Whether <paramref name="name"/> is still mentioned. Everything is, until the passes
+        /// have run and said otherwise.
+        /// </summary>
+        private bool IsUsed(string name) => this.used == null || this.used.Contains(name);
+
+        /// <summary>Every name a line mentions, however it mentions it.</summary>
+        private static IEnumerable<string> Names(CSharpNode node)
+        {
+            return node.Tokens
+                .Concat(node.Value ?? Enumerable.Empty<ClrCSharpToken>())
+                .Concat(node.Condition ?? Enumerable.Empty<ClrCSharpToken>())
+                .Where(token => token.Kind == ClrCSharpTokenKind.Identifier)
+                .Select(token => token.Text);
         }
 
         // ---------- block structure ----------
@@ -390,6 +479,12 @@ namespace ClrSpector
 
                 if (region.Kind == ClrIlExceptionRegionKind.Filter)
                     this.boundaries.Add(region.FilterOffset);
+
+                this.handlerOffsets.Add(region.TryOffset);
+                this.handlerOffsets.Add(region.TryEnd);
+                this.handlerOffsets.Add(region.HandlerOffset);
+                this.handlerOffsets.Add(region.HandlerEnd);
+                this.handlerOffsets.Add(region.FilterOffset);
             }
         }
 
@@ -437,7 +532,12 @@ namespace ClrSpector
             {
                 this.openRegions.Pop();
                 this.indent--;
-                this.body.Add(this.Scaffold(this.indent, Punctuation("}")));
+
+                var close = this.Scaffold(this.indent, Punctuation("}"));
+                close.Kind = CSharpNodeKind.Close;
+                close.IsFixed = true;
+
+                this.body.Add(close);
             }
         }
 
@@ -502,7 +602,7 @@ namespace ClrSpector
                     {
                         ControlKeyword("catch"),
                         Punctuation(" ("),
-                        Type(CSharpNames.Shorten(region.CatchTypeName) ?? "object"),
+                        Type(CSharpNames.ShortenAll(region.CatchTypeName) ?? "object"),
                         Punctuation(" "),
                         Identifier(exception),
                         Punctuation(")")
@@ -534,8 +634,16 @@ namespace ClrSpector
 
         private void OpenRegion(int end, params ClrCSharpToken[] header)
         {
-            this.body.Add(this.Scaffold(this.indent, header));
-            this.body.Add(this.Scaffold(this.indent, Punctuation("{")));
+            var opening = this.Scaffold(this.indent, header);
+            opening.Kind = CSharpNodeKind.Open;
+            opening.IsFixed = true;
+
+            var brace = this.Scaffold(this.indent, Punctuation("{"));
+            brace.Kind = CSharpNodeKind.Open;
+            brace.IsFixed = true;
+
+            this.body.Add(opening);
+            this.body.Add(brace);
 
             this.openRegions.Push(end);
             this.indent++;
@@ -571,7 +679,10 @@ namespace ClrSpector
                 {
                     var value = this.Pop();
 
-                    this.Statement(value.Source.Append(instruction), Discard(value));
+                    var discard = this.Statement(value.Source.Append(instruction), Discard(value));
+
+                    discard.AssignedName = "_";
+                    discard.Value = value.Tokens;
 
                     return;
                 }
@@ -605,9 +716,11 @@ namespace ClrSpector
                 {
                     var value = this.Pop();
 
-                    this.Statement(
+                    var thrown = this.Statement(
                         value.Source.Append(instruction),
                         Join(new[] { ControlKeyword("throw"), Punctuation(" ") }, value.Tokens, Punctuation(";")));
+
+                    thrown.Control = CSharpControl.Throw;
 
                     this.stack.Clear();
 
@@ -615,13 +728,14 @@ namespace ClrSpector
                 }
 
                 case "rethrow":
-                    this.Statement(new[] { instruction }, ControlKeyword("throw"), Punctuation(";"));
+                    this.Statement(new[] { instruction }, ControlKeyword("throw"), Punctuation(";")).Control =
+                        CSharpControl.Throw;
 
                     return;
 
                 case "endfinally":
                 case "endfilter":
-                    this.Statement(new[] { instruction }, Comment($"/* {name} */"));
+                    this.Statement(new[] { instruction }, Comment($"/* {name} */")).IsFixed = true;
                     this.stack.Clear();
 
                     return;
@@ -894,7 +1008,10 @@ namespace ClrSpector
 
             if (condition == null)
             {
-                this.Statement(source, GotoTokens(branch.Target));
+                var jump = this.Statement(source, GotoTokens(branch.Target));
+
+                jump.Control = CSharpControl.Goto;
+                jump.Target = branch.Target;
 
                 if (core == "br")
                     this.stack.Clear();
@@ -902,7 +1019,7 @@ namespace ClrSpector
                 return true;
             }
 
-            this.Statement(
+            var conditional = this.Statement(
                 source,
                 Join(
                     new[] { ControlKeyword("if"), Punctuation(" (") },
@@ -910,6 +1027,10 @@ namespace ClrSpector
                     Punctuation(") "))
                     .Concat(GotoTokens(branch.Target))
                     .ToArray());
+
+            conditional.Control = CSharpControl.ConditionalGoto;
+            conditional.Target = branch.Target;
+            conditional.Condition = condition;
 
             return true;
         }
@@ -922,22 +1043,31 @@ namespace ClrSpector
             foreach (var target in targets)
                 this.SpillStackToSlots(target);
 
-            this.Statement(
+            var head = this.Statement(
                 value.Source.Append(instruction),
                 Join(new[] { ControlKeyword("switch"), Punctuation(" (") }, value.Tokens, Punctuation(")")));
 
-            this.body.Add(this.Scaffold(this.indent, Punctuation("{")));
+            head.IsFixed = true;
+
+            this.body.Add(this.Fixed(this.Scaffold(this.indent, Punctuation("{"))));
 
             for (var i = 0; i < targets.Length; i++)
             {
-                this.body.Add(this.Scaffold(
+                var line = this.Fixed(this.Scaffold(
                     this.indent + 1,
                     Join(
                         new[] { ControlKeyword("case"), Punctuation(" "), Number(i.ToString(CultureInfo.InvariantCulture)), Punctuation(": ") },
                         GotoTokens(targets[i]))));
+
+                // The case's jump is not rewritten, but it is still a jump: a pass that did not
+                // count it could delete the only label a case lands on.
+                line.Control = CSharpControl.Goto;
+                line.Target = targets[i];
+
+                this.body.Add(line);
             }
 
-            this.body.Add(this.Scaffold(this.indent, Punctuation("}")));
+            this.body.Add(this.Fixed(this.Scaffold(this.indent, Punctuation("}"))));
         }
 
         private bool TranslateCall(ClrIlInstruction instruction, string name)
@@ -995,6 +1125,12 @@ namespace ClrSpector
             var instance = target.HasThis && name != "newobj" ? this.Pop() : null;
             var operands = instance == null ? arguments : new[] { instance }.Concat(arguments).ToList();
 
+            if (name == "call" && this.TryConcatenation(instruction, target, arguments, instance))
+                return true;
+
+            if (this.TryProperty(instruction, target, arguments, instance))
+                return true;
+
             var call = this.Build(instruction, Primary, operands.ToArray());
             call.HasSideEffects = true;
             call.Flavour = name == "newobj" ? Flavour.Reference : target.Returns;
@@ -1005,7 +1141,7 @@ namespace ClrSpector
             }
             else if (instance != null)
             {
-                call.Tokens.AddRange(Wrap(instance, Primary));
+                call.Tokens.AddRange(Receiver(instance));
                 call.Tokens.Add(Punctuation("."));
                 call.Tokens.Add(CallName(target.Name));
             }
@@ -1148,6 +1284,113 @@ namespace ClrSpector
             var fourth = blob[position++];
 
             return ((first & 0x1F) << 24) | (third << 16) | (fourth << 8) | blob[position++];
+        }
+
+        /// <summary>
+        /// A call's receiver. The address of a local is spelled as the local: calling a value
+        /// type's method needs its address, and <c>(&amp;loc0).ToString()</c> is that ceremony
+        /// rather than anything the source said.
+        /// </summary>
+        private static List<ClrCSharpToken> Receiver(Slot instance)
+        {
+            if (instance.Tokens.Count == 2
+                && instance.Tokens[0].Text == "&"
+                && instance.Tokens[1].Kind == ClrCSharpTokenKind.Identifier)
+            {
+                return new List<ClrCSharpToken> { instance.Tokens[1] };
+            }
+
+            return Wrap(instance, Primary);
+        }
+
+        /// <summary>
+        /// A property's accessor written back as the property.
+        /// </summary>
+        /// <remarks>
+        /// A property is a pair of methods with a naming convention, and the convention is all
+        /// there is to go on here: a MethodDesc-sourced call has no metadata flag to check
+        /// without walking the Property table. The convention is the compiler's own, so
+        /// <c>get_Current()</c> with no arguments is a property read and nothing else.
+        /// </remarks>
+        private bool TryProperty(
+            ClrIlInstruction instruction, CallTarget target, List<Slot> arguments, Slot instance)
+        {
+            if (this.form != ClrCSharpForm.Structured)
+                return false;
+
+            var getter = target.Name.StartsWith("get_", StringComparison.Ordinal) && arguments.Count == 0;
+            var setter = target.Name.StartsWith("set_", StringComparison.Ordinal) && arguments.Count == 1;
+
+            if (!getter && !setter)
+                return false;
+
+            var property = target.Name.Substring(4);
+
+            if (property.Length == 0)
+                return false;
+
+            var operands = instance == null ? arguments : new[] { instance }.Concat(arguments).ToList();
+            var access = this.Build(instruction, Primary, operands.ToArray());
+
+            access.Tokens.AddRange(instance == null
+                ? new[] { Type(target.Owner) }
+                : Receiver(instance));
+
+            access.Tokens.Add(Punctuation("."));
+            access.Tokens.Add(MemberToken(property));
+            access.HasSideEffects = true;
+            access.Flavour = target.Returns;
+
+            if (getter)
+            {
+                this.Push(access);
+
+                return true;
+            }
+
+            var node = this.Statement(
+                access.Source, Join(access.Tokens, Punctuation(" = "), arguments[0].Tokens, Punctuation(";")));
+
+            node.Value = arguments[0].Tokens;
+
+            return true;
+        }
+
+        /// <summary>
+        /// The concatenation a <c>+</c> on strings compiles to, written back as a <c>+</c>.
+        /// </summary>
+        /// <remarks>
+        /// Only in the structured form, and only for the overloads that take their arguments
+        /// directly: <c>Concat</c> of an array or a span is a call the source made, not an
+        /// operator the compiler turned into one.
+        /// </remarks>
+        private bool TryConcatenation(
+            ClrIlInstruction instruction, CallTarget target, List<Slot> arguments, Slot instance)
+        {
+            if (this.form != ClrCSharpForm.Structured || instance != null)
+                return false;
+
+            if (target.Name != "Concat" || target.Owner != "string" && target.Owner != "String")
+                return false;
+
+            if (arguments.Count < 2 || arguments.Count > 4)
+                return false;
+
+            var sum = this.Build(instruction, Additive, arguments.ToArray());
+
+            for (var i = 0; i < arguments.Count; i++)
+            {
+                if (i > 0)
+                    sum.Tokens.Add(Punctuation(" + "));
+
+                sum.Tokens.AddRange(Wrap(arguments[i], i == 0 ? Additive : Additive + 1));
+            }
+
+            sum.Flavour = Flavour.Reference;
+
+            this.Push(sum);
+
+            return true;
         }
 
         private bool TranslateMemory(ClrIlInstruction instruction, string name)
@@ -1423,16 +1666,20 @@ namespace ClrSpector
         {
             if (this.stack.Count == 0)
             {
-                this.Statement(new[] { instruction }, ControlKeyword("return"), Punctuation(";"));
+                var bare = this.Statement(new[] { instruction }, ControlKeyword("return"), Punctuation(";"));
+                bare.Control = CSharpControl.Return;
 
                 return;
             }
 
             var value = this.Pop();
 
-            this.Statement(
+            var returned = this.Statement(
                 value.Source.Append(instruction),
                 Join(new[] { ControlKeyword("return"), Punctuation(" ") }, value.Tokens, Punctuation(";")));
+
+            returned.Control = CSharpControl.Return;
+            returned.Value = value.Tokens;
 
             this.stack.Clear();
         }
@@ -1540,12 +1787,15 @@ namespace ClrSpector
         {
             var name = $"t{this.temporaries++}";
 
-            this.Statement(
+            var node = this.Statement(
                 cause == null ? value.Source : value.Source.Append(cause),
                 Join(
                     new[] { Type("var"), Punctuation(" "), Identifier(name), Punctuation(" = ") },
                     value.Tokens,
                     Punctuation(";")));
+
+            node.AssignedName = name;
+            node.Value = value.Tokens;
 
             var spilled = new Slot { Flavour = value.Flavour };
             spilled.Tokens.Add(Identifier(name));
@@ -1569,12 +1819,15 @@ namespace ClrSpector
                 if (slot.Tokens.Count == 1 && slot.Tokens[0].Text == $"st{i}")
                     continue;
 
-                this.Statement(
+                var spill = this.Statement(
                     slot.Source,
                     Join(
                         new[] { Identifier($"st{i}"), Punctuation(" = ") },
                         slot.Tokens,
                         Punctuation(";")));
+
+                spill.AssignedName = $"st{i}";
+                spill.Value = slot.Tokens;
 
                 this.stack[i] = this.SpillSlotValue(i);
             }
@@ -1618,10 +1871,17 @@ namespace ClrSpector
                 .OrderBy(item => item.Offset)
                 .ToList();
 
-            this.Statement(source, Join(target, Punctuation(" = "), value.Tokens, Punctuation(";")));
+            var node = this.Statement(source, Join(target, Punctuation(" = "), value.Tokens, Punctuation(";")));
+
+            node.Value = value.Tokens;
+
+            // Only an assignment to a plain name can be moved or folded; a field or an element
+            // depends on whatever its receiver was at the time.
+            if (target.Length == 1 && target[0].Kind == ClrCSharpTokenKind.Identifier)
+                node.AssignedName = target[0].Text;
         }
 
-        private void Statement(IEnumerable<ClrIlInstruction> source, params ClrCSharpToken[] tokens)
+        private CSharpNode Statement(IEnumerable<ClrIlInstruction> source, params ClrCSharpToken[] tokens)
         {
             // The prefixes are part of the statement's IL, so they count towards its label as
             // well: a nop at a branch target is where the branch actually goes.
@@ -1629,16 +1889,22 @@ namespace ClrSpector
 
             this.prefixes.Clear();
 
-            this.body.Add(new ClrCSharpLine(
-                this.LabelFor(instructions),
-                this.indent,
-                tokens,
-                string.Join("; ", instructions.Select(IlTextOf))));
+            var node = new CSharpNode
+            {
+                Offset = this.LabelFor(instructions),
+                Depth = this.indent,
+                Tokens = tokens.ToList(),
+                Comment = string.Join("; ", instructions.Select(IlTextOf))
+            };
+
+            this.body.Add(node);
+
+            return node;
         }
 
-        private void Statement(IEnumerable<ClrIlInstruction> source, IEnumerable<ClrCSharpToken> tokens)
+        private CSharpNode Statement(IEnumerable<ClrIlInstruction> source, IEnumerable<ClrCSharpToken> tokens)
         {
-            this.Statement(source, tokens.ToArray());
+            return this.Statement(source, tokens.ToArray());
         }
 
         /// <summary>
@@ -1685,14 +1951,27 @@ namespace ClrSpector
             return operand.Length <= 60 ? operand : operand.Substring(0, 57) + "...";
         }
 
-        private ClrCSharpLine Scaffold(int indent, params ClrCSharpToken[] tokens)
+        /// <summary>Marks a node no pass may touch, and hands it back.</summary>
+        private CSharpNode Fixed(CSharpNode node)
         {
-            return new ClrCSharpLine(null, indent, tokens, null);
+            node.IsFixed = true;
+
+            return node;
         }
 
-        private ClrCSharpLine Scaffold(int indent, IEnumerable<ClrCSharpToken> tokens)
+        private CSharpNode Scaffold(int indent, params ClrCSharpToken[] tokens)
         {
-            return new ClrCSharpLine(null, indent, tokens.ToArray(), null);
+            return this.Scaffold(indent, (IEnumerable<ClrCSharpToken>)tokens);
+        }
+
+        private CSharpNode Scaffold(int indent, IEnumerable<ClrCSharpToken> tokens)
+        {
+            return new CSharpNode
+            {
+                Kind = CSharpNodeKind.Blank,
+                Depth = indent,
+                Tokens = tokens.ToList()
+            };
         }
 
         // ---------- expression building ----------
@@ -1902,9 +2181,26 @@ namespace ClrSpector
         /// <summary>What the local in <paramref name="index"/> holds, when that is known.</summary>
         private Flavour LocalFlavour(int index)
         {
-            return index >= 0 && index < this.il.Locals.Count
-                ? FlavourOf(this.il.Locals[index].LocalType)
-                : Flavour.Unknown;
+            if (index < 0 || index >= this.il.LocalVariables.Count)
+                return Flavour.Unknown;
+
+            var local = this.il.LocalVariables[index];
+
+            if (local.IsByRef)
+                return Flavour.Unknown;
+
+            return local.Type != null ? FlavourOf(local.Type) : FlavourOf(local.SignatureType);
+        }
+
+        /// <summary>
+        /// A local's type, from whichever source described it - a reflection type, or a decoded
+        /// signature.
+        /// </summary>
+        private static string LocalTypeText(ClrIlLocal local)
+        {
+            var name = local.Type != null ? CSharpNames.Of(local.Type) : CSharpNames.Of(local.SignatureType);
+
+            return local.IsByRef && !name.StartsWith("ref ", StringComparison.Ordinal) ? "ref " + name : name;
         }
 
         private Flavour ArgumentFlavour(int index)
@@ -2063,7 +2359,7 @@ namespace ClrSpector
                     return "?";
 
                 default:
-                    return CSharpNames.Shorten(operand.ToString());
+                    return CSharpNames.ShortenAll(operand.ToString());
             }
         }
 
@@ -2256,7 +2552,9 @@ namespace ClrSpector
             if (type == null)
                 return "var";
 
-            return type.KeywordName ?? Shorten(type.ToString());
+            // The signature reader qualifies every name it renders, including the ones inside a
+            // generic argument list, so the whole rendering is shortened rather than its head.
+            return type.KeywordName ?? ShortenAll(type.ToString());
         }
 
         /// <summary>A method's name, with its generic arguments when it has any.</summary>
@@ -2285,6 +2583,66 @@ namespace ClrSpector
             return (cut < 0 ? head : head.Substring(cut + 1)) + tail;
         }
 
+        /// <summary>
+        /// Shortens every qualified name in <paramref name="text"/>, not just the first, so
+        /// <c>Dictionary&lt;string, System.Collections.Generic.List&lt;int&gt;&gt;</c> comes out
+        /// the way source would have written it.
+        /// </summary>
+        /// <remarks>
+        /// Only runs that begin with a letter are treated as names: a version number is dots and
+        /// digits too, and shortening <c>11.0.0.0</c> to <c>0</c> would be worse than leaving a
+        /// namespace in. A generic type's arity suffix goes with the namespace - what source
+        /// wrote was <c>List</c>, never <c>List`1</c>.
+        /// </remarks>
+        public static string ShortenAll(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return text;
+
+            var result = new StringBuilder(text.Length);
+            var run = new StringBuilder();
+
+            void Flush()
+            {
+                if (run.Length == 0)
+                    return;
+
+                var name = run.ToString();
+                run.Clear();
+
+                if (!char.IsLetter(name[0]) && name[0] != '_')
+                {
+                    result.Append(name);
+
+                    return;
+                }
+
+                var cut = name.LastIndexOfAny(new[] { '.', '+' });
+                var shortened = cut < 0 ? name : name.Substring(cut + 1);
+                var arity = shortened.IndexOf('`');
+
+                result.Append(arity < 0 ? shortened : shortened.Substring(0, arity));
+            }
+
+            foreach (var character in text)
+            {
+                if (char.IsLetterOrDigit(character) || character == '_'
+                    || character == '.' || character == '+' || character == '`')
+                {
+                    run.Append(character);
+
+                    continue;
+                }
+
+                Flush();
+                result.Append(character);
+            }
+
+            Flush();
+
+            return result.ToString();
+        }
+
         /// <summary>Splits a metadata name of the form <c>Type::Member</c>.</summary>
         public static (string Owner, string Name) Split(string name)
         {
@@ -2295,7 +2653,7 @@ namespace ClrSpector
 
             return separator < 0
                 ? ("?", Shorten(name))
-                : (Shorten(name.Substring(0, separator)), name.Substring(separator + 2));
+                : (ShortenAll(name.Substring(0, separator)), name.Substring(separator + 2));
         }
     }
 }

@@ -69,6 +69,21 @@ namespace ClrSpectorTests
 
         public bool Nullable(string text) => text == null || text.Length == 0;
 
+        /// <summary>
+        /// Locals of every shape a signature can wrap: a pointer, a pinned array, a by-ref, a
+        /// generic whose argument is itself generic.
+        /// </summary>
+        public unsafe int Awkward(int[] values, Dictionary<string, List<int>> map)
+        {
+            fixed (int* first = values)
+            {
+                var span = new Span<int>(values);
+                ref var head = ref span[0];
+
+                return *first + head + map.Count;
+            }
+        }
+
         /// <summary>A filtered catch, a second typed catch and a finally over all of it.</summary>
         public int Filtered(int n)
         {
@@ -318,15 +333,99 @@ namespace ClrSpectorTests
             await Assert.That(dump).Contains("String.Concat(");
             await Assert.That(dump).Contains("this.Quantity");
 
-            // No local signature is decoded on this path, so the locals are declared untyped
-            // rather than guessed at.
-            await Assert.That(dump).Contains("types unknown");
+            // The locals are typed from the body's own local signature, decoded from the
+            // module's metadata.
+            await Assert.That(dump).Contains("int loc0;");
+            await Assert.That(dump).Contains("bool loc2;");
+            await Assert.That(dump).Contains("string loc3;");
+            await Assert.That(dump).DoesNotContain("types unknown");
 
             // The handler table is read out of the body's own sections, so the blocks are
             // there without reflection having been asked anything.
             await Assert.That(dump).Contains("catch (InvalidOperationException");
             await Assert.That(dump).Contains("finally");
             await Assert.That(projection.IsExact).IsTrue();
+        }
+
+        /// <summary>
+        /// Every shape a local signature can wrap has to survive the decode, from either source:
+        /// a pointer, a pinned slot, a by-ref and a generic argument that is itself generic.
+        /// </summary>
+        [Test]
+        public async Task DeclaresPointersPinnedSlotsAndByRefsAsSourceSpellsThem()
+        {
+            var table = ClrObject.From<ProjectionSample>().MethodTable;
+
+            foreach (var projection in new[]
+                     {
+                         Project(nameof(ProjectionSample.Awkward)),
+                         ClrMethodCSharp.Of(table.FindMethod(nameof(ProjectionSample.Awkward)))
+                     })
+            {
+                var dump = projection.Dump();
+
+                await Assert.That(dump).Contains("int* loc0;");
+
+                // A pinned slot is a pointer the GC was told to leave alone, which is what
+                // fixed means in source.
+                await Assert.That(dump).Contains("fixed int[] loc1;");
+                await Assert.That(dump).Contains("Span<int> loc2;");
+                await Assert.That(dump).Contains("ref int loc3;");
+            }
+
+            // Only a decoded signature spells the nested generic - reflection's own name for it
+            // is assembly qualified, and the signature path is the one being checked here.
+            var memory = ClrMethodCSharp.Of(table.FindMethod(nameof(ProjectionSample.Awkward))).Dump();
+
+            await Assert.That(memory).Contains("Dictionary<string, List<int>> map");
+        }
+
+        /// <summary>
+        /// The local signature is decoded from the blob by hand, so it is checked the same way
+        /// the exception table is: against reflection, over everything to hand. Only the shape
+        /// is compared - the two readers spell a type differently on purpose.
+        /// </summary>
+        [Test]
+        public async Task LocalSignaturesReadFromMemoryMatchReflections()
+        {
+            var mismatches = new List<string>();
+            var withLocals = 0;
+            var pinned = 0;
+
+            foreach (var (method, fromReflection, fromMemory) in BothSources())
+            {
+                if (fromReflection.LocalVariables.Count > 0)
+                    withLocals++;
+
+                pinned += fromReflection.LocalVariables.Count(local => local.IsPinned);
+
+                var expected = Describe(fromReflection.LocalVariables);
+                var read = Describe(fromMemory.LocalVariables);
+
+                if (expected != read)
+                    mismatches.Add($"{method.DeclaringType?.Name}.{method.Name}: {expected} != {read}");
+            }
+
+            // Guards on the walk: locals are common, pinned slots are not, and a filter that
+            // stopped matching would leave this comparing nothing.
+            await Assert.That(withLocals).IsGreaterThan(100);
+            await Assert.That(pinned).IsGreaterThan(0);
+            await Assert.That(mismatches).IsEmpty();
+        }
+
+        /// <summary>
+        /// The IL listing gets the locals too, which is what it could not name before: a
+        /// <c>.locals</c> block for IL that never went through reflection.
+        /// </summary>
+        [Test]
+        public async Task TheIlDumpOfMemoryReadIlNamesItsLocals()
+        {
+            var dump = ClrMethodIl.Of(ClrObject.From<ProjectionSample>().MethodTable
+                .FindMethod(nameof(ProjectionSample.Branchy))).Dump();
+
+            await Assert.That(dump).Contains(".locals init (");
+            await Assert.That(dump).Contains("[0] int");
+            await Assert.That(dump).Contains("[3] string");
         }
 
         /// <summary>
@@ -340,40 +439,16 @@ namespace ClrSpectorTests
             var mismatches = new List<string>();
             var withRegions = 0;
 
-            foreach (var type in Framework.Concat(new[] { typeof(ProjectionSample) }))
+            foreach (var (method, fromReflection, fromMemory) in BothSources())
             {
-                var methodTable = ClrObject.From(type).MethodTable;
+                if (fromReflection.ExceptionRegions.Count > 0)
+                    withRegions++;
 
-                foreach (var method in type.GetMethods(All | BindingFlags.DeclaredOnly))
-                {
-                    var fromReflection = ClrMethodIl.Of(method);
-                    if (fromReflection == null)
-                        continue;
+                var expected = Describe(fromReflection.ExceptionRegions);
+                var read = Describe(fromMemory.ExceptionRegions);
 
-                    ClrMethodIl fromMemory;
-
-                    try
-                    {
-                        fromMemory = ClrMethodIl.Of(methodTable.FindMethod(method));
-                    }
-                    catch (Exception)
-                    {
-                        // Finding the MethodDesc is not what is under test here.
-                        continue;
-                    }
-
-                    if (fromMemory == null)
-                        continue;
-
-                    if (fromReflection.ExceptionRegions.Count > 0)
-                        withRegions++;
-
-                    var expected = Describe(fromReflection.ExceptionRegions);
-                    var read = Describe(fromMemory.ExceptionRegions);
-
-                    if (expected != read)
-                        mismatches.Add($"{type.Name}.{method.Name}: {expected} != {read}");
-                }
+                if (expected != read)
+                    mismatches.Add($"{method.DeclaringType?.Name}.{method.Name}: {expected} != {read}");
             }
 
             // A guard on the walk: handlers are rare enough that a broken filter here would
@@ -457,6 +532,54 @@ namespace ClrSpectorTests
         {
             await Assert.That(ClrMethodCSharp.Of(typeof(IDisposable).GetMethod("Dispose"))).IsNull();
             await Assert.That(ClrMethodCSharp.Of((ClrMethodIl)null)).IsNull();
+        }
+
+        /// <summary>
+        /// Every method to hand, read both ways: through reflection, and through its MethodDesc
+        /// out of the mapped image. Methods whose MethodDesc cannot be found are skipped -
+        /// finding it is not what the comparisons using this are testing.
+        /// </summary>
+        private static IEnumerable<(MethodBase Method, ClrMethodIl Reflection, ClrMethodIl Memory)> BothSources()
+        {
+            foreach (var type in Framework.Concat(new[] { typeof(ProjectionSample) }))
+            {
+                var methodTable = ClrObject.From(type).MethodTable;
+
+                foreach (var method in type.GetMethods(All | BindingFlags.DeclaredOnly))
+                {
+                    var fromReflection = ClrMethodIl.Of(method);
+                    if (fromReflection == null)
+                        continue;
+
+                    ClrMethodIl fromMemory;
+
+                    try
+                    {
+                        fromMemory = ClrMethodIl.Of(methodTable.FindMethod(method));
+                    }
+                    catch (Exception)
+                    {
+                        continue;
+                    }
+
+                    if (fromMemory != null)
+                        yield return (method, fromReflection, fromMemory);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The local slots a body carries, rendered so two readers of them can be compared.
+        /// Types are left out: reflection resolves them and the signature reader renders them,
+        /// and the two spell a generic or nested type differently on purpose.
+        /// </summary>
+        private static string Describe(IEnumerable<ClrIlLocal> locals)
+        {
+            return string.Join(
+                " | ",
+                locals.Select(local =>
+                    $"{local.Index}{(local.IsPinned ? " pinned" : string.Empty)}" +
+                    $"{(local.IsByRef ? " ref" : string.Empty)}"));
         }
 
         /// <summary>Every method of the sample and of the framework types, projected once.</summary>

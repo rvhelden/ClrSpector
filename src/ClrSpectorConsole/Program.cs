@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
@@ -33,6 +34,8 @@ namespace ClrSpectorConsole
             Section("an exception's captured frames", ExceptionFrames);
             Section("modules, assemblies, loader heaps", Modules);
             Section("assembly metadata: tables, heaps, entries", MetadataTables);
+            Section("signatures without reflection", Signatures);
+            Section("generics: what metadata cannot tell you", Generics);
             Section("one object on the heap", HeapObject);
             Section("the GC heap", Heap);
         }
@@ -146,18 +149,20 @@ namespace ClrSpectorConsole
 
         private static void CSharpProjection()
         {
-            var restock = typeof(Order).GetMethod(nameof(Order.Restock));
-            var projection = ClrMethodIl.Of(restock).ToCSharp();
-
-            Line("projection", projection.ToString());
-
-            // The handler table comes out of the body's own data sections, so the try and catch
-            // blocks below are there for IL read from memory too - and the caught type is named
-            // from the module's metadata, with no reflection anywhere in it.
+            // Read through the MethodDesc rather than reflection, to show that the projection
+            // needs nothing reflection knows: the locals are typed from the body's own local
+            // signature, the try and catch blocks come out of its data sections, and the caught
+            // type and every operand are named from the module's metadata.
             var fromMemory = ClrMethodIl.Of(
                 ClrObject.From<Order>().MethodTable.FindMethod(nameof(Order.Restock)));
 
+            var projection = fromMemory.ToCSharp();
+
+            Line("projection", projection.ToString());
             Line("body in memory", fromMemory.Description.ReadIl().ToString());
+
+            foreach (var local in fromMemory.LocalVariables)
+                Line("  local", local.ToString());
 
             foreach (var region in fromMemory.ExceptionRegions)
                 Line("  region", region.ToString());
@@ -166,10 +171,8 @@ namespace ClrSpectorConsole
             // a pipe, and the two dumps share one palette between them.
             var lines = projection.Dump(IlDumpStyle.Auto).Split(Environment.NewLine);
 
-            foreach (var line in lines.Take(18))
+            foreach (var line in lines)
                 Console.WriteLine($"  {line.TrimEnd()}");
-
-            Line("...", $"{Math.Max(0, lines.Length - 18)} more lines");
         }
 
         private static void Dispatch()
@@ -419,6 +422,132 @@ namespace ClrSpectorConsole
                 Line("  TypeDef row 2", firstType);
                 Line($"  MethodDef row {lastMethodRow}", lastMethod);
             }
+        }
+
+        /// <summary>
+        /// A method's parameters and return type, decoded from its signature blob.
+        /// </summary>
+        /// <remarks>
+        /// Nothing here creates a MethodInfo, and nothing goes through
+        /// System.Reflection.Metadata either - the blob is parsed out of the mapped image with
+        /// the CorElementType enum. The interesting cases are the ones reflection either cannot
+        /// reach or reports less precisely.
+        /// </remarks>
+        private static void Signatures()
+        {
+            var table = ClrObject.From<Order>().MethodTable;
+
+            foreach (var method in table.Methods.Take(6))
+                Line(method.Name, method.Signature?.ToString());
+
+            // out and in are Param-table attributes, not part of the blob - which only says
+            // BYREF - so a decoder reading the signature alone reports every one as "ref".
+            var direction = ClrObject.From<Dictionary<string, int>>().MethodTable
+                .FindMethod("TryGetValue");
+
+            if (direction != null)
+                Line("out parameter", direction.Signature?.ToString());
+
+            // An array's Get, Set and Address are synthesised per array type and declared
+            // nowhere, so they have no metadata row at all - their signature is on the
+            // MethodDesc itself.
+            Line(string.Empty, string.Empty);
+            foreach (var method in ClrObject.From<int[]>().MethodTable.Methods)
+            {
+                Line($"int[] accessor", $"{method.Signature}   " +
+                                        $"(stored on the MethodDesc: {method.Signature?.IsStored})");
+            }
+
+            // Same for an emitted method: no row, no string heap entry, so both its name and its
+            // signature come off the MethodDesc.
+            Line(string.Empty, string.Empty);
+            var emitted = new DynamicMethod("Emitted", typeof(int), new[] { typeof(int), typeof(string) });
+            var body = emitted.GetILGenerator();
+            body.Emit(OpCodes.Ldarg_0);
+            body.Emit(OpCodes.Ret);
+            emitted.CreateDelegate(typeof(Func<int, string, int>));
+
+            var accessor = typeof(DynamicMethod).GetMethod(
+                "GetMethodDescriptor", BindingFlags.Instance | BindingFlags.NonPublic);
+            var handle = (RuntimeMethodHandle)accessor.Invoke(emitted, null);
+            var dynamic = ClrMethodDescription.At(handle.Value);
+
+            Line("dynamic method", $"{dynamic.Name} : {dynamic.Signature}");
+            Line("its name source", "DynamicMethodDesc.MethodName - there is no string heap entry");
+        }
+
+        /// <summary>
+        /// The generic instantiations a process has actually made, which metadata does not record.
+        /// </summary>
+        /// <remarks>
+        /// Metadata holds only open definitions: there is no MethodDef row for
+        /// <c>Echo&lt;int&gt;</c> and no TypeDef row for <c>List&lt;int&gt;</c>. The runtime
+        /// builds those on demand and files them in per-module hash tables, so those tables are
+        /// the only place the real instantiations can be seen.
+        /// </remarks>
+        private static void Generics()
+        {
+            // A type's own instantiation, from its MethodTable rather than from metadata.
+            var closed = ClrObject.From<Dictionary<string, int>>().MethodTable;
+            var arguments = closed.TypeArguments.Select(NameOfHandle);
+
+            Line("Dictionary<string,int>", $"{closed.GenericTypeArgumentCount} type arguments: " +
+                                           $"{string.Join(", ", arguments)}");
+
+            var indexer = closed.Methods.FirstOrDefault(m => m.Name == "get_Item");
+            if (indexer != null)
+            {
+                // The blob says !1 (!0); closing it needs the instantiation.
+                Line("  get_Item open", indexer.Signature?.ToString());
+                Line("  closed exactly", indexer.ClosedSignatureFor(closed)?.ToString());
+                Line("  closed as compiled", indexer.ClosedSignature?.ToString());
+            }
+
+            // Force a spread of instantiations, then read them back out of the runtime.
+            Echo(1);
+            Echo(2.5);
+            Echo("text");
+            Echo((object)null);
+
+            var module = ClrModule.Of(typeof(Program));
+            var before = module.InstantiatedMethodCount;
+            var entries = module.InstantiatedMethodEntries.ToList();
+
+            Line(string.Empty, string.Empty);
+            Line("instantiated methods", $"{entries.Count} walked, table reports {before} " +
+                                         $"(a walk of the runtime's own side table)");
+
+            foreach (var (method, flags) in entries.Where(e => e.Method.Name == "Echo"))
+            {
+                var argument = NameOfHandle(method.GenericArgumentMethodTables.FirstOrDefault());
+                var note = flags == InstantiatedMethodFlags.None ? string.Empty : $"  [{flags}]";
+
+                Line($"  Echo<{argument}>", $"{method.GenericKind}{note}");
+                Line("     closed", method.ClosedSignature?.ToString());
+            }
+
+            Line(string.Empty, string.Empty);
+            Line("why three kinds", "a value type argument gets its own code; every reference " +
+                                    "argument shares one body compiled against __Canon, with a " +
+                                    "stub per concrete instantiation over it");
+
+            var coreLib = ClrModule.Of(typeof(object));
+            Line("CoreLib side tables", $"{coreLib.InstantiatedMethodCount} instantiated methods, " +
+                                        $"{coreLib.ConstructedTypeCount} constructed types");
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static T Echo<T>(T value) => value;
+
+        private static string NameOfHandle(IntPtr handle)
+        {
+            if (handle == IntPtr.Zero)
+                return "?";
+
+            // A type variable or a pointer type is a TypeDesc, not a MethodTable.
+            return ClrMethodTable.IsMethodTableHandle(handle)
+                ? ClrMethodTable.Create(new MemoryReader(handle)).MetadataName
+                : "<type variable>";
         }
 
         private static void HeapObject()
