@@ -5,6 +5,13 @@
     <TargetFramework>net11.0</TargetFramework>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Features>runtime-async=on</Features>
+
+    <!--
+      Tiered compilation rewrites the same dispatch slot a detour patches, so MethodDetour
+      refuses a method the runtime may recompile. Turning it off is what a consumer of the
+      detour API has to do, and the sample is no exception.
+    -->
+    <TieredCompilation>false</TieredCompilation>
   </PropertyGroup>
 
   <ItemGroup>

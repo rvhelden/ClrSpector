@@ -63,7 +63,14 @@ namespace ClrSpector.Detours
             this.EntryPointBytes = bytes;
         }
 
+        /// <summary>
+        /// The method this precode belongs to, when it was reached through reflection. Null when
+        /// it was reached through a MethodDesc.
+        /// </summary>
         public MethodBase Method { get; }
+
+        /// <summary>The MethodDesc this precode belongs to, when it was reached through one.</summary>
+        public ClrMethodDescription Description { get; private set; }
 
         /// <summary>The method's stable entry point - the precode, not the method body.</summary>
         public IntPtr EntryPoint { get; }
@@ -117,8 +124,31 @@ namespace ClrSpector.Detours
 
             RuntimeHelpers.PrepareMethod(method.MethodHandle);
 
-            var entryPoint = method.MethodHandle.GetFunctionPointer();
+            return At(method.MethodHandle.GetFunctionPointer(), method, null);
+        }
 
+        /// <summary>
+        /// Reads a method's precode from its MethodDesc, without reflection.
+        /// </summary>
+        /// <remarks>
+        /// A MethodDesc address is a <see cref="RuntimeMethodHandle"/>, so the entry point is
+        /// reachable without a <see cref="MethodBase"/> ever being created.
+        /// </remarks>
+        public static MethodPrecode Of(ClrMethodDescription method)
+        {
+            if (method == null) throw new ArgumentNullException(nameof(method));
+
+            return At(method.EntryPoint, null, method);
+        }
+
+        /// <summary>Decodes whatever precode sits at <paramref name="entryPoint"/>.</summary>
+        public static MethodPrecode At(IntPtr entryPoint)
+        {
+            return At(entryPoint, null, null);
+        }
+
+        private static MethodPrecode At(IntPtr entryPoint, MethodBase method, ClrMethodDescription description)
+        {
             var captureLength = PreviewLength;
             var bytes = new byte[captureLength];
             if (entryPoint != IntPtr.Zero)
@@ -128,7 +158,7 @@ namespace ClrSpector.Detours
                     bytes[i] = code[i];
             }
 
-            var precode = new MethodPrecode(method, entryPoint, bytes);
+            var precode = new MethodPrecode(method, entryPoint, bytes) { Description = description };
 
             if (precode.IsRipRelativeJump)
             {
@@ -155,11 +185,23 @@ namespace ClrSpector.Detours
 
         public string HexBytes => string.Join(" ", this.EntryPointBytes.Select(b => b.ToString("x2")));
 
+        /// <summary>Names the method from whichever route reached it.</summary>
+        private string Describe()
+        {
+            if (this.Method != null)
+                return $"{this.Method.DeclaringType?.Name}.{this.Method.Name}";
+
+            if (this.Description != null)
+                return $"{this.Description.DeclaringTypeName}.{this.Description.Name}";
+
+            return "<unnamed>";
+        }
+
         public override string ToString()
         {
             var kind = this.IsFixupPrecode ? "fixup" : this.IsStubPrecode ? "stub" : "unrecognised";
 
-            return $"{this.Method.DeclaringType?.Name}.{this.Method.Name} {kind} " +
+            return $"{this.Describe()} {kind} " +
                    $"entryPoint=0x{this.EntryPoint.ToInt64():x} [{this.HexBytes}] " +
                    $"{this.Disassembly} slot=0x{this.DispatchSlot.ToInt64():x} " +
                    $"-> 0x{this.DispatchTarget.ToInt64():x}";

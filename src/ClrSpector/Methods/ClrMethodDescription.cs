@@ -1,4 +1,6 @@
 using System;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using ClrSpector.Cdac;
 
 namespace ClrSpector
@@ -171,6 +173,61 @@ namespace ClrSpector
                     arguments[i] = arrayReader.ReadIntPtr(i * IntPtr.Size);
 
                 return arguments;
+            }
+        }
+
+        /// <summary>
+        /// This MethodDesc as a runtime handle. A MethodDesc address is exactly what a
+        /// <see cref="RuntimeMethodHandle"/> wraps, which is the bridge between this library's
+        /// view of a method and the runtime's own.
+        /// </summary>
+        public RuntimeMethodHandle Handle => RuntimeMethodHandle.FromIntPtr(this.ClrPointer);
+
+        /// <summary>
+        /// The method's stable entry point, jitting it first if need be.
+        /// </summary>
+        /// <remarks>
+        /// Goes through the handle rather than a <see cref="MethodBase"/>, so nothing here needs
+        /// reflection to have produced the method.
+        /// </remarks>
+        public IntPtr EntryPoint => this.Prepare().GetFunctionPointer();
+
+        /// <summary>
+        /// Jits the method if it has not been jitted, and hands back its handle.
+        /// </summary>
+        /// <remarks>
+        /// The MethodDesc equivalent of
+        /// <c>RuntimeHelpers.PrepareMethod(typeof(T).GetMethod(name).MethodHandle)</c>, with
+        /// neither the <see cref="Type"/> nor the <see cref="MethodBase"/> needed to reach it.
+        /// </remarks>
+        public RuntimeMethodHandle Prepare()
+        {
+            var handle = this.Handle;
+            RuntimeHelpers.PrepareMethod(handle);
+
+            return handle;
+        }
+
+        /// <summary>
+        /// The reflection method this MethodDesc is, or null when it will not resolve.
+        /// </summary>
+        /// <remarks>
+        /// The escape hatch back to reflection, for the things only a signature can answer -
+        /// comparing two methods' parameters, or emitting one shaped like this. Everything else
+        /// in this library works from the MethodDesc directly.
+        /// </remarks>
+        public MethodBase Method
+        {
+            get
+            {
+                try
+                {
+                    return MethodBase.GetMethodFromHandle(this.Handle);
+                }
+                catch (Exception)
+                {
+                    return null;
+                }
             }
         }
 

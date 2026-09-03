@@ -65,8 +65,31 @@ namespace ClrSpector.Detours
 
             var methodTable = ClrObject.From(declaringType).MethodTable;
 
-            var slot = SlotNumberOf(methodTable, method);
-            if (slot < 0 || slot >= methodTable.NumberOfVirtuals)
+            return FindSlot(methodTable, SlotNumberOf(methodTable, method));
+        }
+
+        /// <summary>
+        /// The address of a method's vtable slot, taken from its MethodDesc.
+        /// </summary>
+        /// <remarks>
+        /// Better than the reflection route as well as reflection-free: a MethodDesc records its
+        /// own slot number, so there is no need to match metadata tokens across the type's
+        /// methods to find it.
+        /// </remarks>
+        public static IntPtr FindSlot(ClrMethodDescription method)
+        {
+            if (method == null || method.MethodTablePointer == IntPtr.Zero)
+                return IntPtr.Zero;
+
+            var methodTable = ClrMethodTable.Create(new MemoryReader(method.MethodTablePointer));
+
+            return FindSlot(methodTable, method.SlotNumber);
+        }
+
+        /// <summary>The address of one numbered virtual slot in a type's vtable.</summary>
+        public static IntPtr FindSlot(ClrMethodTable methodTable, int slot)
+        {
+            if (methodTable == null || slot < 0 || slot >= methodTable.NumberOfVirtuals)
                 return IntPtr.Zero;
 
             var headerSize = methodTable.Size;

@@ -268,8 +268,8 @@ var resolved = type.Module.ResolveMethod((int)method.MetadataToken);
 
 This doubles as the strongest correctness check in the project: because the token is reassembled
 from two separate runtime fields, a listing that matches reflection is hard to produce by accident.
-`dotnet run --project src/ClrSpectorConsole` prints exactly that, and decodes **279 of `String`'s
-280 methods** with correct overload signatures, operators and `PInvoke`/`FCall` classifications.
+Decoding `String` this way yields **279 of its 280 methods** with correct overload signatures,
+operators and `PInvoke`/`FCall` classifications.
 
 ### Two traps
 
@@ -1203,7 +1203,7 @@ src/ClrSpector/                     the library
   ClrHeapObject.cs                  one object instance: its type and its size
   MemoryReader.cs                   offset-addressed reads
 
-src/ClrSpectorConsole/              prints decoded types next to the reflection view
+src/ClrSpectorConsole/              one short demonstration of each feature
 src/ClrSpectorTests/                TUnit tests
 ```
 
@@ -1399,6 +1399,74 @@ Walking a live heap from inside it is not the same as walking a suspended target
   `GCHeapFreeRegions` and swept-flag state to identify and skip.
 - **Roots.** This walks the heap by address, not by reachability. Nothing here enumerates roots or
   says whether an object is live.
+
+## Reaching a method without reflection
+
+A MethodDesc address is exactly what a `RuntimeMethodHandle` wraps. That is the bridge: anything
+the runtime can do with a handle - jit a method, take its entry point - is reachable from a
+MethodDesc with no `Type` or `MethodBase` involved.
+
+```csharp
+var table  = ClrObject.From<Order>().MethodTable;
+var method = table.FindMethod("Describe");     // by metadata name
+
+method.Handle          // RuntimeMethodHandle
+method.Prepare()       // jits it, no MethodInfo needed
+method.EntryPoint      // the prepared entry point
+method.ReadIl()        // its IL, out of the module image
+
+MethodPrecode.Of(method);        // the precode
+MethodVtable.FindSlot(method);   // the vtable slot
+ClrMethodIl.Of(method);          // disassembly
+MethodDetour.Redirect(target, proxy, standIn);
+MethodDetour.ReplaceBody(target, il => { ... });
+```
+
+Verified: the entry point from the handle is bit-identical to reflection's, and so are the
+precode and the vtable slot.
+
+The MethodDesc route to the **vtable slot is better**, not merely equivalent: a MethodDesc records
+its own slot number, so there is no need to match metadata tokens across the type's methods to
+find it. `MethodDetour` now uses that route whenever it has the MethodDesc.
+
+One thing genuinely needs reflection: comparing two methods' **signatures**, which the pairing
+check and the body emitter both do. A MethodDesc does not carry parameter types - only metadata
+does - so those paths resolve back through `ClrMethodDescription.Method` and say so.
+
+## The sample
+
+`dotnet run --project src/ClrSpectorConsole` runs one short section per feature - the entry point
+and a line of real output, nothing more. After the initial `ClrObject.From<Order>()` the sample
+uses no reflection at all: methods are found by name, jitted through their handles, and detoured
+and disassembled from their MethodDescs.
+
+```
+--- field layout --------------------------------------------------------------
+  +8   Quantity          I4 = 3
+  +16  UnitPrice         VALUETYPE = raw 0x0000000000010000
+  +0   Sku               CLASS = ref 0x1f6c7865a60
+
+--- dispatch: precode and vtable ----------------------------------------------
+  precode        Order.Describe fixup entryPoint=0x7ffa29c18e70 [ff 25 fa 3f ...] slot=0x7ffa29c1ce70
+  vtable slot    Describe=(none) (not virtual)  Ship=0x7ffa29bac160
+  non-vtable slot 0x7ffa29bac0a0 holds its entry point
+
+--- detour: a proxy object ----------------------------------------------------
+  before         short
+  redirected     proxied  (pairing=ReceiverShift, thunk=True)
+  proxy saw      A-1/9
+  restored       short
+
+--- one object on the heap ----------------------------------------------------
+  Order               48 bytes  gen 0  loh=False
+  Byte[]          100024 bytes  gen 3  loh=True
+```
+
+Each section is wrapped so that one that cannot run reports why and the rest still do - a sample
+should not hide fifteen working features behind one unsupported one. The project sets
+`<TieredCompilation>false</TieredCompilation>` for the same reason any consumer of the detour API
+must: without it the tiering guard refuses every redirect, which the sample demonstrated rather
+loudly before the setting was added.
 
 ## Building and testing
 

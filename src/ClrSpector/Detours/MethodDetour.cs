@@ -139,6 +139,12 @@ namespace ClrSpector.Detours
         public MethodInfo Thunk { get; private set; }
 
         /// <summary>
+        /// The target's MethodDesc, when this library found it. Used in preference to reflection
+        /// for locating the vtable slot.
+        /// </summary>
+        public ClrMethodDescription TargetDescription { get; private set; }
+
+        /// <summary>
         /// Redirects <paramref name="target"/> to <paramref name="replacement"/> until the
         /// returned handle is disposed.
         /// </summary>
@@ -219,7 +225,8 @@ namespace ClrSpector.Detours
                 ReplacementReceiver = replacementReceiver,
                 Thunk = thunk?.Method,
                 ThunkEntryPoint = thunk?.EntryPoint ?? IntPtr.Zero,
-                receiverSlot = thunk?.ReceiverSlot ?? -1
+                receiverSlot = thunk?.ReceiverSlot ?? -1,
+                TargetDescription = TryFindDescription(target)
             };
 
             try
@@ -318,7 +325,8 @@ namespace ClrSpector.Detours
             {
                 Pairing = MethodPairing.Direct,
                 Thunk = replacement,
-                ThunkEntryPoint = entryPoint
+                ThunkEntryPoint = entryPoint,
+                TargetDescription = TryFindDescription(target)
             };
 
             try
@@ -332,6 +340,94 @@ namespace ClrSpector.Detours
             }
 
             return detour;
+        }
+
+        /// <summary>
+        /// Redirects a method reached through its MethodDesc rather than through reflection.
+        /// </summary>
+        /// <remarks>
+        /// The whole flow works from the MethodDesc: the entry point comes from its handle and
+        /// the vtable slot from the slot number it already records. Only the compatibility check
+        /// needs the two signatures, which is the one thing a MethodDesc does not carry - so the
+        /// methods are resolved back to reflection for that comparison alone.
+        /// </remarks>
+        public static MethodDetour Redirect(
+            ClrMethodDescription target,
+            ClrMethodDescription replacement,
+            bool allowInterfaceDispatch = false,
+            bool allowTieredCompilation = false)
+        {
+            return Redirect(target, null, replacement, allowInterfaceDispatch, allowTieredCompilation);
+        }
+
+        /// <summary>
+        /// Redirects a method reached through its MethodDesc so it runs on
+        /// <paramref name="replacementReceiver"/>.
+        /// </summary>
+        public static MethodDetour Redirect(
+            ClrMethodDescription target,
+            object replacementReceiver,
+            ClrMethodDescription replacement,
+            bool allowInterfaceDispatch = false,
+            bool allowTieredCompilation = false)
+        {
+            return Redirect(
+                Resolve(target, nameof(target)),
+                replacementReceiver,
+                Resolve(replacement, nameof(replacement)),
+                allowInterfaceDispatch,
+                allowTieredCompilation);
+        }
+
+        /// <summary>Redirects a method reached through its MethodDesc to a delegate.</summary>
+        public static MethodDetour Redirect(
+            ClrMethodDescription target,
+            Delegate replacement,
+            bool allowInterfaceDispatch = false,
+            bool allowTieredCompilation = false)
+        {
+            return Redirect(
+                Resolve(target, nameof(target)), replacement, allowInterfaceDispatch, allowTieredCompilation);
+        }
+
+        /// <summary>
+        /// Replaces the body of a method reached through its MethodDesc with
+        /// <paramref name="instructions"/>.
+        /// </summary>
+        public static MethodDetour ReplaceIl(
+            ClrMethodDescription target,
+            IReadOnlyList<ClrIlInstruction> instructions,
+            IReadOnlyList<Type> locals = null,
+            bool allowTieredCompilation = false)
+        {
+            return ReplaceIl(
+                Resolve(target, nameof(target)), instructions, locals, allowTieredCompilation);
+        }
+
+        /// <summary>
+        /// Replaces the body of a method reached through its MethodDesc with one written against
+        /// an <see cref="System.Reflection.Emit.ILGenerator"/>.
+        /// </summary>
+        public static MethodDetour ReplaceBody(
+            ClrMethodDescription target,
+            Action<System.Reflection.Emit.ILGenerator> body,
+            bool allowTieredCompilation = false)
+        {
+            return ReplaceBody(Resolve(target, nameof(target)), body, allowTieredCompilation);
+        }
+
+        /// <summary>
+        /// Bridges a MethodDesc back to reflection, which the signature comparison and the
+        /// emitter both need - the parameter types are the one thing a MethodDesc does not hold.
+        /// </summary>
+        private static MethodBase Resolve(ClrMethodDescription method, string name)
+        {
+            if (method == null) throw new ArgumentNullException(name);
+
+            return method.Method ?? throw new MethodDetourException(
+                $"The MethodDesc at 0x{method.ClrPointer.ToInt64():x} " +
+                $"({method.DeclaringTypeName}::{method.Name}) does not resolve back to a method. " +
+                "A redirect needs its parameter types, which only the signature can give.");
         }
 
         /// <summary>
@@ -351,8 +447,14 @@ namespace ClrSpector.Detours
                 patched |= DetourTargets.Precode;
             }
 
-            // Virtual calls bypass the precode and read the vtable instead.
-            var vtableSlot = target.IsVirtual ? MethodVtable.FindSlot(target) : IntPtr.Zero;
+            // Virtual calls bypass the precode and read the vtable instead. The slot is found
+            // through the MethodDesc where one is available, since it records its own slot
+            // number and needs no token matching to locate it.
+            var vtableSlot = !target.IsVirtual
+                ? IntPtr.Zero
+                : this.TargetDescription != null
+                    ? MethodVtable.FindSlot(this.TargetDescription)
+                    : MethodVtable.FindSlot(target);
             if (vtableSlot != IntPtr.Zero)
             {
                 this.patches.Add(Patch.Apply(vtableSlot, to));
@@ -388,18 +490,7 @@ namespace ClrSpector.Detours
         /// </remarks>
         private static void EnsureTieringWillNotUndoIt(MethodBase target)
         {
-            ClrMethodDescription descriptor;
-
-            try
-            {
-                descriptor = ClrObject.From(target.DeclaringType).MethodTable.FindMethod(target);
-            }
-            catch (ClrSpectorUnsupportedRuntimeException)
-            {
-                // Cannot decode this runtime's method tables, so there is nothing to check
-                // against. Better an unguarded redirect than no redirect at all.
-                return;
-            }
+            var descriptor = TryFindDescription(target);
 
             if (descriptor?.IsEligibleForTieredCompilation != true)
                 return;
@@ -411,6 +502,24 @@ namespace ClrSpector.Detours
                 "<TieredCompilation>false</TieredCompilation> in the test project (or set " +
                 "DOTNET_TieredCompilation=0), or pass allowTieredCompilation: true to accept the " +
                 "risk deliberately.");
+        }
+
+        /// <summary>
+        /// The MethodDesc for a reflection method, or null when this runtime's method tables
+        /// cannot be decoded - in which case the caller carries on without it.
+        /// </summary>
+        private static ClrMethodDescription TryFindDescription(MethodBase method)
+        {
+            try
+            {
+                return method?.DeclaringType == null
+                    ? null
+                    : ClrObject.From(method.DeclaringType).MethodTable.FindMethod(method);
+            }
+            catch (ClrSpectorUnsupportedRuntimeException)
+            {
+                return null;
+            }
         }
 
         /// <summary>

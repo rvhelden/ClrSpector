@@ -338,6 +338,33 @@ namespace ClrSpector
             return method == null ? null : this.FindMethod((uint)method.MetadataToken);
         }
 
+        /// <summary>
+        /// The method this type declares with this name, or null when it declares none.
+        /// </summary>
+        /// <remarks>
+        /// The name comes from the module's metadata, so this reaches a method without a
+        /// <see cref="Type"/> or a <see cref="System.Reflection.MethodBase"/>. An overloaded
+        /// name has more than one match; this returns the first, and
+        /// <see cref="FindMethods(string)"/> returns them all.
+        /// </remarks>
+        public ClrMethodDescription FindMethod(string name)
+        {
+            return this.FindMethods(name).FirstOrDefault();
+        }
+
+        /// <summary>Every method this type declares with this name, overloads included.</summary>
+        public IEnumerable<ClrMethodDescription> FindMethods(string name)
+        {
+            if (name == null || this.Methods == null)
+                yield break;
+
+            foreach (var method in this.Methods)
+            {
+                if (method.Name == name)
+                    yield return method;
+            }
+        }
+
         /// <summary>The decoded MethodDesc with this metadata token, or null.</summary>
         public ClrMethodDescription FindMethod(uint metadataToken)
         {

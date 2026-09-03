@@ -1,506 +1,382 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
+using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
+using System.Threading;
 using ClrSpector;
 using ClrSpector.Cdac;
+using ClrSpector.Detours;
 
 namespace ClrSpectorConsole
 {
-    [StructLayout(LayoutKind.Sequential)]
-    public struct TestStruct
+    /// <summary>A small type to point everything at.</summary>
+    public class Order
     {
-        public readonly byte Test1;
-        public readonly byte Test2;
-        public readonly byte Test3;
-        public readonly byte Test4;
+        public int Quantity = 3;
+
+        public decimal UnitPrice = 2.5m;
+
+        public string Sku = "A-1";
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public decimal Total() => this.Quantity * this.UnitPrice;
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public string Describe(int wanted) => wanted > this.Quantity ? "short" : "ok";
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public virtual string Ship() => "shipped";
     }
 
-    internal static class Program
+    /// <summary>A stand-in with state of its own, for the proxy detour.</summary>
+    public class OrderProxy
     {
-        /// <summary>How many recognisable objects the heap dump allocates before walking.</summary>
-        private const int MarkerCount = 500;
+        public readonly List<string> Seen = new List<string>();
 
-        /// <summary>How many instances of each type the heap dump shows the value of.</summary>
-        private const int SampleLimit = 3;
-
-        /// <summary>How many of the heap's types the dump shows, largest first.</summary>
-        private const int TypeLimit = 5;
-
-        /// <summary>Fields and elements shown per sampled object, and the width of each value.</summary>
-        private const int MembersPerSample = 3;
-
-        private const int ValueWidth = 256;
-
-        /// <summary>
-        /// The running totals for one type on the heap, plus the first few instances of it.
-        /// </summary>
-        /// <remarks>
-        /// Only the address, size and element count are kept during the walk. Reading the values
-        /// happens afterwards, because that means resolving types and formatting strings, and
-        /// doing that inside the walk would allocate against the very no-GC budget the walk
-        /// depends on - and push the allocation buffers it is stepping around.
-        /// </remarks>
-        private sealed class TypeSummary
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public string Describe(Order order, int wanted)
         {
-            public int Count { get; private set; }
+            this.Seen.Add($"{order.Sku}/{wanted}");
 
-            public long Bytes { get; private set; }
-
-            public List<(IntPtr Address, long Size, uint ComponentCount)> Samples { get; } =
-                new List<(IntPtr, long, uint)>(SampleLimit);
-
-            public void Add(ClrHeapObject instance)
-            {
-                this.Count++;
-                this.Bytes += instance.Size;
-
-                if (this.Samples.Count < SampleLimit)
-                    this.Samples.Add((instance.Address, instance.Size, instance.ComponentCount));
-            }
+            return "proxied";
         }
+    }
 
+    /// <summary>
+    /// One short demonstration of each thing this library can do. Every section is deliberately
+    /// small - the point is to show the entry point and one line of real output, not to be a
+    /// tool.
+    /// </summary>
+    internal static unsafe class Program
+    {
         private static void Main()
         {
-            PrintRuntime();
-            
-            foreach (var type in new[]
-                     {
-                         typeof(SampleClass),
-                         typeof(TestStruct),
-                         typeof(string),
-                         typeof(int[]),
-                         typeof(List<int>),
-                         typeof(List<string>)
-                     })
-            {
-                Dump(type);
-            }
-
-            DumpHeap();
+            Section("runtime and contracts", Runtime);
+            Section("type layout", TypeLayout);
+            Section("field layout", Fields);
+            Section("methods", Methods);
+            Section("names and IL straight from memory", FromMemory);
+            Section("IL disassembly", Disassembly);
+            Section("dispatch: precode and vtable", Dispatch);
+            Section("an address back to its method", CodeMap);
+            Section("tiering", Tiering);
+            Section("detour: a proxy object", ProxyDetour);
+            Section("detour: a new method body", ReplaceBody);
+            Section("async continuations", Continuations);
+            Section("threads", Threads);
+            Section("an exception's captured frames", ExceptionFrames);
+            Section("modules, assemblies, loader heaps", Modules);
+            Section("one object on the heap", HeapObject);
+            Section("the GC heap", Heap);
         }
 
-        /// <summary>
-        /// Prints the generation and segment structure, then a by-type summary of the objects the
-        /// walk finds - the eeheap and dumpheap views.
-        /// </summary>
-        /// <remarks>
-        /// The walked byte total is printed next to what the segments themselves report, for the
-        /// same reason the type dump prints the reflection view alongside the decoded one: if the
-        /// walk were stopping early, the two numbers would visibly disagree. The count of a
-        /// population allocated here is the same idea - it is checked, not assumed.
-        /// </remarks>
-        private static void DumpHeap()
+        // ----------------------------------------------------------------------------------
+
+        private static void Runtime()
         {
-            Console.WriteLine();
-            Console.WriteLine(new string('=', 78));
+            var runtime = ContractDescriptor.Current;
 
-            // A population to look for, so the summary has something recognisable in it.
-            var markers = new List<SampleClass>();
-            for (var i = 0; i < MarkerCount; i++)
-                markers.Add(new SampleClass(i));
+            Line("runtime", System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription);
+            Line("architecture", runtime.Globals.Text("Architecture"));
+            Line("descriptor", $"v{runtime.Version}, {runtime.TypeNames.Count()} types, " +
+                               $"{runtime.Contracts.Count} contracts");
+            Line("gc", GcContractDescriptor.Identifiers);
+        }
 
-            // The scope is entered before the heap is read: establishing it collects, which moves
-            // objects and rebuilds the region lists, so an earlier snapshot would be stale.
+        private static void TypeLayout()
+        {
+            var table = ClrObject.From<Order>().MethodTable;
+
+            Line("MethodTable", table.ToString());
+            Line("token", $"0x{table.TypeDefToken:x8} -> {table.MetadataName}");
+            Line("flags", $"class={table.IsClass} gcPointers={table.ContainsGcPointers} " +
+                          $"generic={table.HasInstantiation} virtuals={table.NumberOfVirtuals}");
+            Line("parent", table.ParentMethodTable?.Name);
+        }
+
+        private static void Fields()
+        {
+            var table = ClrObject.From<Order>().MethodTable;
+            var order = new Order();
+            var data = (byte*)ClrHeapObject.AddressOf(order) + IntPtr.Size;
+
+            // The runtime lays fields out in whatever order suits it, so the offsets are read
+            // back out of a live object to show they are the real ones.
+            foreach (var field in table.Fields)
+            {
+                var name = table.Metadata.FieldName(field.MetadataToken);
+                var value = field.IsStatic ? "(static)" : ValueAt(data + field.Offset, field.ElementType);
+
+                Line($"+{field.Offset,-3} {name}", $"{field.ElementType} = {value}");
+            }
+        }
+
+        private static void Methods()
+        {
+            var table = ClrObject.From<Order>().MethodTable;
+
+            foreach (var method in table.Methods.Take(4))
+                Line($"slot {method.SlotNumber}", method.ToString());
+        }
+
+        private static void FromMemory()
+        {
+            var table = ClrObject.From<Order>().MethodTable;
+            var describe = table.FindMethod("Describe");
+
+            // Nothing here creates a Type or a MethodBase: the names come from the module's
+            // string heap and the IL from the mapped image.
+            Line("type", table.MetadataName);
+            Line("method", $"{describe.DeclaringTypeName}::{describe.Name}");
+            Line("body", describe.ReadIl().ToString());
+        }
+
+        private static void Disassembly()
+        {
+            var describe = ClrObject.From<Order>().MethodTable.FindMethod("Describe");
+            var il = ClrMethodIl.Of(describe);
+
+            // Auto colours only when the output looks like a terminal that wants it.
+            foreach (var line in il.Dump(IlDumpStyle.Auto).Split('\n').Take(8))
+                Console.WriteLine($"  {line.TrimEnd()}");
+        }
+
+        private static void Dispatch()
+        {
+            var table = ClrObject.From<Order>().MethodTable;
+            var describe = table.FindMethod("Describe");
+            var ship = table.FindMethod("Ship");
+
+            var precode = MethodPrecode.Of(describe);
+
+            Line("precode", precode.ToString());
+            Line("kind", $"fixup={precode.IsFixupPrecode} (matched against the runtime's own template)");
+
+            // Only a virtual method has a vtable slot; a non-virtual one dispatches through a
+            // slot packed in after its own MethodDesc instead. Both come from the MethodDesc's
+            // own slot number, so nothing has to match metadata tokens to find them.
+            Line("vtable slot", $"Describe={Slot(MethodVtable.FindSlot(describe))} (not virtual)  " +
+                                $"Ship={Slot(MethodVtable.FindSlot(ship))}");
+            Line("non-vtable slot", $"{Slot(describe.NonVtableSlotAddress)} holds its entry point");
+        }
+
+        private static void CodeMap()
+        {
+            var total = ClrObject.From<Order>().MethodTable.FindMethod("Total");
+
+            // The MethodDesc address is a RuntimeMethodHandle, so it can be jitted without a
+            // MethodInfo anywhere in sight.
+            total.Prepare();
+
+            var precode = MethodPrecode.Of(total);
+            var code = precode.DispatchTarget;
+
+            Line("entry point", ClrCodeMap.Current.Find(precode.EntryPoint)?.ToString());
+            Line("its code", ClrCodeMap.Current.Find(code)?.ToString());
+            Line("four bytes in", ClrCodeMap.Current.Find(code + 4)?.ToString());
+            Line("not code", ClrCodeMap.Current.Find(ClrHeapObject.AddressOf("a string"))?.ToString() ?? "(nothing)");
+        }
+
+        private static void Tiering()
+        {
+            var total = ClrObject.From<Order>().MethodTable.FindMethod("Total");
+
+            Line("eligible", total.IsEligibleForTieredCompilation.ToString());
+            Line("versions", total.CodeVersions?.ToString());
+            Line("why it matters", "a redirect is refused on an eligible method - promotion " +
+                                   "rewrites the same slot the detour patches");
+        }
+
+        private static void ProxyDetour()
+        {
+            var order = new Order();
+            var proxy = new OrderProxy();
+
+            Line("before", order.Describe(9));
+
+            var target = ClrObject.From<Order>().MethodTable.FindMethod("Describe");
+            var standIn = ClrObject.From<OrderProxy>().MethodTable.FindMethod("Describe");
+
+            using (var detour = MethodDetour.Redirect(target, proxy, standIn))
+            {
+                Line("redirected", $"{order.Describe(9)}  (pairing={detour.Pairing}, thunk={detour.UsesThunk})");
+            }
+
+            Line("proxy saw", string.Join(", ", proxy.Seen));
+            Line("restored", order.Describe(9));
+        }
+
+        private static void ReplaceBody()
+        {
+            var order = new Order();
+            var total = ClrObject.From<Order>().MethodTable.FindMethod("Total");
+
+            Line("before", order.Total().ToString());
+
+            // decimal is returned through a hidden buffer, so the replacement has to be emitted
+            // as an instance method or the return value lands in the object instead.
+            using (MethodDetour.ReplaceBody(total, il =>
+                   {
+                       il.Emit(OpCodes.Ldc_I4, 99);
+                       il.Emit(OpCodes.Newobj, typeof(decimal).GetConstructor(new[] { typeof(int) }));
+                       il.Emit(OpCodes.Ret);
+                   }))
+            {
+                Line("replaced", $"{order.Total()}  (Quantity still {order.Quantity})");
+            }
+
+            Line("restored", order.Total().ToString());
+        }
+
+        private static void Continuations()
+        {
+            // .NET 11 runtime async replaces the compiler's state machine with a heap object per
+            // suspension, so a suspended await chain becomes a linked list this can walk.
+            var contract = GcContractDescriptor.Current.TryGetDataType("ContinuationObject", out _)
+                           || ContractDescriptor.Current.TryGetDataType("ContinuationObject", out _);
+
+            Line("contract", contract ? "ContinuationObject is published" : "not published");
+
+            var type = typeof(object).Assembly.GetType("System.Runtime.CompilerServices.Continuation");
+            Line("managed type", type == null ? "absent" : type.FullName);
+
+            // Reaching one needs a method the runtime actually compiled as async; on this preview
+            // the compiler still emits state machines, so there is nothing to decode.
+            Line("live instance", "none on this runtime - ClrContinuation.Of(obj) decodes one " +
+                                  "when a Continuation exists");
+        }
+
+        private static void Threads()
+        {
+            using var gate = new ManualResetEventSlim();
+            var worker = new Thread(() => gate.Wait()) { IsBackground = true };
+            worker.Start();
+            Thread.Sleep(50);
+
+            var store = ClrThreadStore.Read();
+            Line("store", store.ToString());
+
+            foreach (var thread in store.Threads.Take(3))
+                Line($"  thread {thread.ManagedThreadId}", thread.ToString());
+
+            gate.Set();
+            worker.Join();
+        }
+
+        private static void ExceptionFrames()
+        {
+            try
+            {
+                Throwing();
+            }
+            catch (Exception caught)
+            {
+                // The frames are read off the exception object, not parsed out of its string.
+                foreach (var frame in ClrExceptionTrace.Of(caught).Take(3))
+                    Line("frame", ClrCodeMap.Current.Find(frame.InstructionPointer)?.ToString() ?? frame.ToString());
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void Throwing() => throw new InvalidOperationException("sample");
+
+        private static void Modules()
+        {
+            // The MethodTable records its module, so everything else follows from there.
+            var table = ClrObject.From<Order>().MethodTable;
+            var module = ClrModule.At(table.Module);
+
+            Line("module", module.ToString());
+            Line("assembly", ClrAssembly.At(module.Assembly).ToString());
+            Line("loader heaps", ClrLoaderAllocator.At(module.LoaderAllocator).ToString());
+
+            // A token reaches a MethodTable with no Type involved.
+            var token = table.TypeDefToken;
+            Line("token lookup", $"0x{token:x8} -> 0x{module.TypeDefToMethodTable(token).ToInt64():x}");
+        }
+
+        private static void HeapObject()
+        {
             using var scope = GcWalkScope.Enter();
             var heap = ClrGcHeap.Refresh();
-            var gc = heap.Layouts.Gc;
 
-            Console.WriteLine($"GC           : {heap.Identifiers}");
-            Console.WriteLine($"Descriptor   : GC contract v{gc.Contracts["GC"]}, {gc.TypeNames.Count()} types, " +
-                              $"{gc.Globals.Names.Count()} globals (found by scanning - it is not exported)");
-            Console.WriteLine($"Address range: 0x{heap.Layouts.LowestAddress:x} - 0x{heap.Layouts.HighestAddress:x}");
-            Console.WriteLine($"Collection   : held off = {scope.IsProtected}");
-
-            Console.WriteLine();
-            Console.WriteLine("Generations and segments");
-
-            long reported = 0;
-            foreach (var generation in heap.Generations)
+            foreach (var instance in new object[] { new Order(), "text", new byte[100_000] })
             {
-                Console.WriteLine($"  {generation}");
-                foreach (var segment in generation.Segments)
-                {
-                    reported += segment.LiveBytes;
-                    var kind = segment.IsReadOnly ? " frozen"
-                        : segment.IsEphemeral ? " ephemeral"
-                        : string.Empty;
+                var entry = ClrHeapObject.Of(instance, scope);
 
-                    Console.WriteLine($"     0x{segment.Mem.ToInt64():x}  live {segment.LiveBytes,9}  " +
-                                      $"committed {segment.CommittedBytes,9}  reserved {segment.ReservedBytes,10}  " +
-                                      $"flags 0x{segment.Flags:x}{kind}");
-                }
+                Line(entry.MethodTable.Name?.Split('.').Last(),
+                    $"{entry.Size,7} bytes  gen {entry.GenerationIn(heap)}  " +
+                    $"loh={entry.SegmentIn(heap)?.IsLargeObjectHeap}");
             }
+        }
 
-            var byType = new Dictionary<IntPtr, TypeSummary>();
+        private static void Heap()
+        {
+            using var scope = GcWalkScope.Enter();
+            var heap = ClrGcHeap.Refresh();
+
+            Line("heap", heap.ToString());
+            Line("protected", $"collection held off = {scope.IsProtected}");
+
             var walked = 0;
-            long walkedBytes = 0;
+            long bytes = 0;
             var free = 0;
-            long freeBytes = 0;
-            var declined = 0;
 
-            foreach (var segment in heap.Segments)
+            foreach (var instance in heap.EnumerateObjects(scope))
             {
-                // A segment the walk will not decode raises rather than guessing. Counted and
-                // reported here rather than abandoning the whole dump.
-                try
-                {
-                    foreach (var instance in heap.EnumerateObjects(segment, scope))
-                    {
-                        walked++;
-                        walkedBytes += instance.Size;
-
-                        if (instance.IsFree)
-                        {
-                            free++;
-                            freeBytes += instance.Size;
-                            continue;
-                        }
-
-                        if (!byType.TryGetValue(instance.MethodTablePointer, out var summary))
-                        {
-                            summary = new TypeSummary();
-                            byType.Add(instance.MethodTablePointer, summary);
-                        }
-
-                        summary.Add(instance);
-                    }
-                }
-                catch (ClrSpectorUnsupportedRuntimeException)
-                {
-                    declined++;
-                }
+                walked++;
+                bytes += instance.Size;
+                if (instance.IsFree) free++;
             }
 
-            var coverage = reported > 0 ? walkedBytes * 100 / reported : 0;
-
-            Console.WriteLine();
-            Console.WriteLine($"Objects      : {walked} in {walkedBytes} bytes - {coverage}% of the " +
-                              $"{reported} the segments report");
-            Console.WriteLine($"Free space   : {free} fillers in {freeBytes} bytes");
-            Console.WriteLine($"Declined     : {declined} segment(s) the walk would not decode");
-            Console.WriteLine(
-                $"Collected    : {scope.CollectionOccurred} - a walk a collection ran through is unreliable");
-
-            Console.WriteLine();
-            Console.WriteLine($"Largest {TypeLimit} of the {byType.Count} types on the heap, " +
-                              $"with up to {SampleLimit} instances each");
-            Console.WriteLine();
-
-            // Rendered while the scope is still open, so nothing has moved since the addresses
-            // were read. If a collection has slipped through, the addresses are stale and the
-            // values would be nonsense, so only the counts are printed.
-            var stale = scope.CollectionOccurred;
-
-            foreach (var entry in byType.OrderByDescending(e => e.Value.Bytes).Take(TypeLimit))
-            {
-                Console.WriteLine($"  {entry.Value.Count,7} objects  {entry.Value.Bytes,10} bytes  " +
-                                  $"{NameOf(entry.Key)}");
-
-                foreach (var sample in entry.Value.Samples)
-                {
-                    var shape = sample.ComponentCount > 0 ? $" count={sample.ComponentCount}" : string.Empty;
-                    var value = stale ? "<a collection intervened>" : Render(sample.Address);
-
-                    Console.WriteLine($"            0x{sample.Address.ToInt64():x}  {sample.Size,6} bytes{shape}" +
-                                      $"  {value}");
-                }
-            }
-
-            // The independent check: a known number was allocated above, so that many must be
-            // found. A walk that stops early reports a plausible number here instead.
-            byType.TryGetValue(typeof(SampleClass).TypeHandle.Value, out var markerTotals);
-
-            Console.WriteLine();
-            Console.WriteLine($"SampleClass  : allocated {MarkerCount}, walk found {markerTotals.Count} " +
-                              $"in {markerTotals.Bytes} bytes");
-
-            GC.KeepAlive(markers);
+            Line("walked", $"{walked} objects, {bytes} bytes, {free} free fillers");
+            Line("trustworthy", $"collection during walk = {scope.CollectionOccurred}");
         }
 
-        /// <summary>
-        /// A readable name for a MethodTable found on the heap, falling back to its address when
-        /// the type cannot be resolved - the runtime's Free type has no metadata to resolve.
-        /// </summary>
-        private static string NameOf(IntPtr methodTable)
+        // ----------------------------------------------------------------------------------
+
+        private static string ValueAt(byte* at, CorElementType type)
         {
-            try
+            switch (type)
             {
-                var type = Type.GetTypeFromHandle(RuntimeTypeHandle.FromIntPtr(methodTable));
-                return type == null ? $"0x{methodTable.ToInt64():x}" : FriendlyName(type);
-            }
-            catch (Exception)
-            {
-                return $"0x{methodTable.ToInt64():x} <unresolved>";
+                case CorElementType.I4:
+                    return (*(int*)at).ToString();
+
+                case CorElementType.CLASS:
+                    return $"ref 0x{(*(IntPtr*)at).ToInt64():x}";
+
+                default:
+                    // A struct field: show its first bytes rather than guess at a format.
+                    return $"raw 0x{*(long*)at:x16}";
             }
         }
 
-        /// <summary>
-        /// The value of the object at <paramref name="address"/>, as one short readable line.
-        /// </summary>
-        /// <remarks>
-        /// The walk yields addresses, not references, so reading a value means turning one back
-        /// into a reference. A reference *is* an address - reinterpreting the bytes is exactly
-        /// what the runtime holds in a local - so once that is done it is an ordinary reference
-        /// and reflection can read the fields, with no offset decoding at all.
-        ///
-        /// That is only sound because the walk has already established this is an object start
-        /// whose MethodTable is mapped. Handing the GC a reference to something that is not an
-        /// object corrupts the heap at the next collection, so free-space fillers - which have
-        /// no type to resolve - are never passed here, and neither should anything unvalidated
-        /// be. It is also why this is done inside the walk's scope, while nothing is moving.
-        /// </remarks>
-        private static string Render(IntPtr address)
+        private static void Section(string title, Action body)
         {
+            Console.WriteLine();
+            Console.WriteLine($"--- {title} " + new string('-', Math.Max(0, 74 - title.Length)));
+
             try
             {
-                var instance = ReferenceAt(address);
-
-                return instance switch
-                {
-                    null => "null",
-                    string text => Quote(text),
-                    Array array => RenderArray(array),
-                    _ => RenderFields(instance)
-                };
+                body();
             }
             catch (Exception error)
             {
-                return $"<{error.GetType().Name}>";
+                // A section that cannot run says why and the rest still does - this is a sample,
+                // not a test, and one unsupported feature should not hide the others.
+                Console.WriteLine($"  ! {error.GetType().Name}: {error.Message.Split('\n')[0]}");
             }
         }
 
-        /// <summary>Reinterprets a heap address as the object reference it is.</summary>
-        private static unsafe object ReferenceAt(IntPtr address)
+        private static string Slot(IntPtr address)
         {
-            return Unsafe.Read<object>(&address);
+            return address == IntPtr.Zero ? "(none)" : $"0x{address.ToInt64():x}";
         }
 
-        private static string RenderArray(Array array)
+        private static void Line(string label, string value)
         {
-            if (array.Rank != 1)
-                return $"rank {array.Rank}, {array.Length} elements";
-
-            if (array.Length == 0)
-                return "[]";
-
-            var shown = Math.Min(array.Length, MembersPerSample);
-            var elements = new List<string>(shown);
-
-            for (var i = 0; i < shown; i++)
-            {
-                try
-                {
-                    elements.Add(Scalar(array.GetValue(i)));
-                }
-                catch (Exception)
-                {
-                    elements.Add("?");
-                }
-            }
-
-            var ellipsis = array.Length > shown ? ", …" : string.Empty;
-            return $"[{string.Join(", ", elements)}{ellipsis}]";
-        }
-
-        /// <summary>
-        /// The first few instance fields of an object, as name=value pairs.
-        /// </summary>
-        /// <remarks>
-        /// Reflection reads the fields rather than the field offsets being decoded from the
-        /// EEClass, which the inspector does not walk. The point here is to show that the object
-        /// the walk found really is the object it claims to be.
-        /// </remarks>
-        private static string RenderFields(object instance)
-        {
-            var type = instance.GetType();
-            var fields = type
-                .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                .Take(MembersPerSample)
-                .ToList();
-
-            if (fields.Count == 0)
-                return "{}";
-
-            var rendered = new List<string>(fields.Count);
-            foreach (var field in fields)
-            {
-                try
-                {
-                    rendered.Add($"{field.Name}={Scalar(field.GetValue(instance))}");
-                }
-                catch (Exception)
-                {
-                    rendered.Add($"{field.Name}=?");
-                }
-            }
-
-            return "{ " + string.Join(", ", rendered) + " }";
-        }
-
-        /// <summary>
-        /// One field or element value.
-        /// </summary>
-        /// <remarks>
-        /// Only types whose ToString is known to be cheap and total are formatted. Anything else
-        /// gets its type name: calling an arbitrary ToString here could allocate heavily, throw,
-        /// or recurse, and this runs while collection is being held off.
-        /// </remarks>
-        private static string Scalar(object value)
-        {
-            switch (value)
-            {
-                case null:
-                    return "null";
-
-                case string text:
-                    return Quote(text);
-
-                case decimal or DateTime or DateTimeOffset or TimeSpan or Guid:
-                    return value.ToString();
-            }
-
-            var type = value.GetType();
-            if (type.IsPrimitive || type.IsEnum)
-                return value.ToString();
-
-            return "{" + FriendlyName(type) + "}";
-        }
-
-        /// <summary>A string value, quoted, with control characters and length made visible.</summary>
-        private static string Quote(string text)
-        {
-            var length = text.Length;
-            var body = length > ValueWidth ? text.Substring(0, ValueWidth) : text;
-
-            body = body
-                .Replace("\\", "\\\\")
-                .Replace("\"", "\\\"")
-                .Replace("\r", "\\r")
-                .Replace("\n", "\\n")
-                .Replace("\t", "\\t");
-
-            var ellipsis = length > ValueWidth ? "…" : string.Empty;
-            return $"\"{body}{ellipsis}\" ({length} chars)";
-        }
-
-        private static void PrintRuntime()
-        {
-            var descriptor = ClrObject.Descriptor;
-
-            Console.WriteLine(
-                $"Runtime      : {RuntimeInformation.FrameworkDescription} ({RuntimeInformation.RuntimeIdentifier})");
-            Console.WriteLine($"CoreLib      : {typeof(object).Assembly.Location}");
-            Console.WriteLine($"Descriptor   : version {descriptor.Version}, baseline '{descriptor.Baseline}', " +
-                              $"{descriptor.TypeNames.Count()} types, {descriptor.Globals.Names.Count()} globals");
-            Console.WriteLine($"Architecture : {descriptor.Globals.Text("Architecture")}");
-        }
-
-        /// <summary>
-        /// Prints the decoded runtime view of a type next to the reflection view of the same
-        /// type, so a decoding mistake shows up as a visible disagreement.
-        /// </summary>
-        private static void Dump(Type type)
-        {
-            Console.WriteLine();
-            Console.WriteLine(new string('-', 78));
-            Console.WriteLine(type.FullName);
-
-            var methodTable = ClrObject.From(type).MethodTable;
-            var eeClass = methodTable.EEClass;
-
-            Console.WriteLine($"  MethodTable   0x{methodTable.Address.ToInt64():x}");
-            Console.WriteLine($"  baseSize      {methodTable.BaseSize}");
-            Console.WriteLine($"  virtuals      {methodTable.NumberOfVirtuals}");
-            Console.WriteLine($"  interfaces    {methodTable.NumberOfInterfaces}");
-            Console.WriteLine($"  category      class={methodTable.IsClass} valueType={methodTable.IsValueType} " +
-                              $"interface={methodTable.IsInterface} array={methodTable.IsArray}");
-
-            if (methodTable.HasComponentSize)
-                Console.WriteLine($"  componentSize {methodTable.ComponentSize}");
-
-            Console.WriteLine(
-                $"  union         {methodTable.UnionKind} (canonical={methodTable.IsCanonicalMethodTable})");
-            Console.WriteLine($"  parent        0x{methodTable.ParentMethodTablePointer.ToInt64():x}" +
-                              $"{(type.BaseType != null ? $"  [{type.BaseType.Name}]" : "  [none]")}");
-
-            if (eeClass != null)
-            {
-                Console.WriteLine($"  EEClass       0x{eeClass.Address.ToInt64():x}");
-                Console.WriteLine($"    normType    {eeClass.NormType}");
-                Console.WriteLine($"    fields      instance={eeClass.NumberOfInstanceFields} " +
-                                  $"static={eeClass.NumberOfStaticFields} " +
-                                  $"threadStatic={eeClass.NumberOfThreadStaticFields}");
-                Console.WriteLine(
-                    $"    methods     {eeClass.NumberOfMethods}   (EEClass.NumMethods; not the same tally as declared methods)");
-            }
-
-            PrintMethods(type, methodTable);
-        }
-
-        /// <summary>
-        /// Lists each decoded MethodDesc with the name, arguments and generic type arguments
-        /// recovered by resolving its reconstructed metadata token.
-        /// </summary>
-        private static void PrintMethods(Type type, ClrMethodTable methodTable)
-        {
-            Console.WriteLine($"  methods       {methodTable.Methods.Count} decoded from the MethodDescChunk list:");
-
-            var module = type.IsConstructedGenericType
-                ? type.GetGenericTypeDefinition().Module
-                : type.Module;
-
-            foreach (var method in methodTable.Methods)
-            {
-                MethodBase resolved;
-                try
-                {
-                    resolved = module.ResolveMethod((int)method.MetadataToken);
-                }
-                catch (ArgumentException)
-                {
-                    Console.WriteLine(
-                        $"    slot {method.SlotNumber,-5} 0x{method.MetadataToken:x8}  <token did not resolve>");
-                    continue;
-                }
-
-                var generics = GenericArguments(resolved);
-                var arguments = string.Join(", ", resolved.GetParameters()
-                    .Select(p => $"{FriendlyName(p.ParameterType)} {p.Name}"));
-
-                Console.WriteLine($"    slot {method.SlotNumber,-5} 0x{method.MetadataToken:x8}  " +
-                                  $"{FriendlyName(resolved.DeclaringType)}.{resolved.Name}{generics}({arguments})" +
-                                  $"   [{method.Classification}]");
-            }
-        }
-
-        private static string GenericArguments(MethodBase method)
-        {
-            if (!method.IsGenericMethod && !method.IsGenericMethodDefinition)
-                return string.Empty;
-
-            return "<" + string.Join(", ", method.GetGenericArguments().Select(FriendlyName)) + ">";
-        }
-
-        private static string FriendlyName(Type type)
-        {
-            if (type == null)
-                return "?";
-
-            if (type.IsArray)
-                return FriendlyName(type.GetElementType()) + "[]";
-
-            if (!type.IsGenericType)
-                return type.Name;
-
-            var name = type.Name;
-            var tick = name.IndexOf('`');
-            if (tick >= 0)
-                name = name.Substring(0, tick);
-
-            return name + "<" + string.Join(", ", type.GetGenericArguments().Select(FriendlyName)) + ">";
+            Console.WriteLine($"  {label,-22} {value}");
         }
     }
 }

@@ -354,13 +354,20 @@ namespace ClrSpectorTests
         [Test]
         public async Task WalkedBytesAccountForMostOfTheReportedLiveBytes()
         {
-            using var scope = GcWalkScope.Enter();
+            // This is the only test that walks the whole heap, so it is the one whose budget the
+            // rest of the suite eats into - emitting a thunk or a replacement body allocates, and
+            // by the time this runs there is more live heap to cover than the default allows for.
+            // A collection part-way through invalidates the walk, so the budget is raised rather
+            // than the assertion loosened.
+            using var scope = GcWalkScope.Enter(512 * 1024 * 1024);
             var heap = ClrGcHeap.Refresh();
 
             long reported = 0;
             long walked = 0;
+            var segments = 0;
             foreach (var segment in heap.Segments)
             {
+                segments++;
                 reported += segment.LiveBytes;
                 try
                 {
@@ -376,7 +383,15 @@ namespace ClrSpectorTests
             scope.ThrowIfInvalidated();
 
             await Assert.That(reported).IsGreaterThan(0L);
-            await Assert.That(walked).IsLessThanOrEqualTo(reported);
+
+            // The walk deliberately yields a final object that runs slightly past a segment's
+            // recorded end - Mem, Allocated and Committed are all read from a live heap, so the
+            // last object is exactly where a small discrepancy surfaces. That tolerance is
+            // bounded at one minimum object per segment, so the total can exceed the reported
+            // bytes by at most that much.
+            var tail = (long)segments * heap.Layouts.MinimumObjectSize;
+
+            await Assert.That(walked).IsLessThanOrEqualTo(reported + tail);
 
             // Anything much below this means the walk is stopping early rather than skipping
             // buffer gaps, which is the failure this whole file exists to catch.
