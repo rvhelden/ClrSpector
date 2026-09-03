@@ -202,6 +202,14 @@ namespace ClrSpector
                     }
 
                     case HandleKind.TypeSpecification:
+                    {
+                        // A constructed generic has no name of its own - only an encoded
+                        // signature, which has to be decoded to say anything useful about it.
+                        var specification = this.Reader.GetTypeSpecification((TypeSpecificationHandle)handle);
+
+                        return specification.DecodeSignature(new SignatureNames(this), null);
+                    }
+
                     case HandleKind.MethodSpecification:
                         return $"{handle.Kind} 0x{token:x8}";
 

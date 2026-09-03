@@ -158,7 +158,9 @@ namespace ClrSpectorTests
 
             var markerMethodTable = typeof(HeapMarker).TypeHandle.Value;
 
-            using var scope = GcWalkScope.Enter();
+            // The suite has grown the heap by the time this runs, so the default budget no longer
+            // covers a walk of all of it - see the note on the whole-heap walk below.
+            using var scope = GcWalkScope.Enter(512 * 1024 * 1024);
             var heap = ClrGcHeap.Refresh();
 
             var found = 0;

@@ -10,8 +10,17 @@ using ClrSpector.Detours;
 
 namespace ClrSpectorConsole
 {
+    /// <summary>An interface with one abstract member and one default implementation.</summary>
+    public interface IPriced
+    {
+        decimal Total();
+
+        /// <summary>A default implementation - a body on the interface itself.</summary>
+        string Summary() => $"total {this.Total()}";
+    }
+
     /// <summary>A small type to point everything at.</summary>
-    public class Order
+    public class Order : IPriced, IComparable<Order>
     {
         public int Quantity = 3;
 
@@ -27,6 +36,8 @@ namespace ClrSpectorConsole
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         public virtual string Ship() => "shipped";
+
+        public int CompareTo(Order other) => 0;
     }
 
     /// <summary>A stand-in with state of its own, for the proxy detour.</summary>
@@ -56,6 +67,7 @@ namespace ClrSpectorConsole
             Section("type layout", TypeLayout);
             Section("field layout", Fields);
             Section("methods", Methods);
+            Section("interfaces", Interfaces);
             Section("names and IL straight from memory", FromMemory);
             Section("IL disassembly", Disassembly);
             Section("dispatch: precode and vtable", Dispatch);
@@ -118,6 +130,42 @@ namespace ClrSpectorConsole
 
             foreach (var method in table.Methods.Take(4))
                 Line($"slot {method.SlotNumber}", method.ToString());
+        }
+
+        private static void Interfaces()
+        {
+            var table = ClrObject.From<Order>().MethodTable;
+
+            // Metadata lists what the type declares; the MethodTable's count is the runtime's
+            // closure over everything inherited too, and the contract publishes no map for it.
+            Line("declared", $"{table.DeclaredInterfaces.Count} of the runtime's " +
+                             $"{table.NumberOfInterfaces} implemented");
+
+            foreach (var implemented in table.DeclaredInterfaces)
+            {
+                Line("  interface", implemented.ToString());
+
+                var iface = implemented.Interface;
+                if (iface == null)
+                    continue;
+
+                foreach (var method in iface.Methods)
+                {
+                    // An interface method with a body is a default implementation.
+                    Line($"    {method.Name}", method.HasBody ? "default implementation" : "abstract");
+
+                    if (!method.HasBody)
+                        continue;
+
+                    foreach (var line in ClrMethodIl.Of(method).Dump()
+                                 .Split(Environment.NewLine).Skip(2).Take(4))
+                        Console.WriteLine($"        {line.TrimEnd()}");
+                }
+
+                foreach (var field in iface.Fields)
+                    Line($"    field {iface.Metadata.FieldName(field.MetadataToken)}",
+                         $"static={field.IsStatic} {field.ElementType}");
+            }
         }
 
         private static void FromMemory()

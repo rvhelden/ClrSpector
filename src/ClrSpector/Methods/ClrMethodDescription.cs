@@ -310,6 +310,26 @@ namespace ClrSpector
         }
 
         /// <summary>
+        /// Whether the method has a body at all.
+        /// </summary>
+        /// <remarks>
+        /// On an interface method this is the question "does it have a default implementation?" -
+        /// an interface method with a body is one. Answered from the metadata's RVA, so it costs
+        /// nothing to ask and does not read the IL.
+        /// </remarks>
+        public bool HasBody
+        {
+            get
+            {
+                var methodTable = this.DeclaringMethodTable;
+                if (methodTable == null || methodTable.Module == IntPtr.Zero)
+                    return false;
+
+                return (this.Metadata?.MethodBodyRva(this.MetadataToken) ?? 0) != 0;
+            }
+        }
+
+        /// <summary>
         /// This method's IL, read out of the module image, or null when it has no body.
         /// </summary>
         /// <remarks>

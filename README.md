@@ -977,6 +977,63 @@ what they *do* rather than by opcode, since control flow, calls and the loads th
 outside the method are the parts worth finding by eye. A test asserts that stripping the escapes
 from a coloured dump gives back the plain one exactly, so the two renderings cannot drift apart.
 
+### Interfaces, and default implementations
+
+The runtime builds a full interface map on every MethodTable, but the contract publishes only
+`NumInterfaces` — the count — and **no pointer to the map**. The runtime's own cdac reader has the
+same limitation. So the interfaces come from metadata, and each one is then resolved back to its
+own MethodTable through the module's lookup maps — at which point everything else in the library
+applies to it unchanged:
+
+```csharp
+foreach (var implemented in ClrObject.From<Order>().MethodTable.DeclaredInterfaces)
+{
+    var iface = implemented.Interface;          // its own MethodTable
+
+    foreach (var method in iface.Methods)
+        Console.WriteLine($"{method.Name}: {(method.HasBody ? "default impl" : "abstract")}");
+
+    foreach (var field in iface.Fields)
+        Console.WriteLine(iface.Metadata.FieldName(field.MetadataToken));
+}
+```
+
+```
+AbiProbe.ILocal @0x7ffa29a94198
+    Required       abstract
+    Defaulted      default impl
+        IL_0000:  ldarg.1
+        IL_0001:  ldc.i4.2
+        IL_0002:  mul
+        IL_0003:  ret
+    .cctor         default impl
+    field Shared     static=True type=I4
+System.IDisposable @0x7ffa29a33f60
+    Dispose        abstract
+System.IComparable<AbiProbe.Thing> (constructed generic - no MethodTable here)
+```
+
+**A default implementation is just a body on an interface method**, so `HasBody` answers it — from
+the metadata RVA, without reading the IL. Its IL then dumps like any other method's.
+
+Three resolution outcomes, and each is reported rather than glossed:
+
+| Declared as | Resolved through | Result |
+|---|---|---|
+| TypeDef (same module) | `TypeDefToMethodTableMap` | full MethodTable |
+| TypeRef (another module) | `TypeRefToMethodTableMap` | full MethodTable |
+| TypeSpec (constructed generic) | — | named from its signature, no MethodTable |
+
+A constructed generic has a MethodTable per instantiation which is in neither map. It is still
+*named*, by decoding the TypeSpec signature blob — `System.IComparable<AbiProbe.Thing>` rather
+than a bare token.
+
+`DeclaredInterfaces` is what the type's own metadata row declares, which is not always
+`NumberOfInterfaces`. For a class the C# compiler already writes the closure of its own interfaces
+into metadata, so the two usually agree — but a class inheriting an interface from its **base
+class** declares nothing itself. Measured: a derived class declared 0 where the runtime counted 1.
+Both numbers are right about different questions.
+
 ### Names without reflection
 
 A MethodTable stores a TypeDef token and a MethodDesc a MethodDef token. Neither stores a name -

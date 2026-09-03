@@ -94,6 +94,8 @@ namespace ClrSpector
 
         private List<ClrFieldDescription> fields;
 
+        private List<ClrInterfaceImplementation> declaredInterfaces;
+
         public void* BasePointer { get; private set; }
 
         public uint Size { get; private set; }
@@ -288,6 +290,19 @@ namespace ClrSpector
         /// look at fields.
         /// </remarks>
         public List<ClrFieldDescription> Fields => this.fields ??= this.ReadFields();
+
+        /// <summary>
+        /// The interfaces this type declares it implements, from metadata.
+        /// </summary>
+        /// <remarks>
+        /// Declared, not inherited. <see cref="NumberOfInterfaces"/> is the runtime's closure over
+        /// everything a type implements, base classes included, and the contract publishes no
+        /// pointer to that map - only the count. The C# compiler already writes a class's own
+        /// closure into metadata, so the two usually agree; a class that inherits an interface
+        /// from its base class declares none of its own and the counts diverge.
+        /// </remarks>
+        public IReadOnlyList<ClrInterfaceImplementation> DeclaredInterfaces =>
+            this.declaredInterfaces ??= ClrInterfaceImplementation.Read(this);
 
         /// <summary>
         /// How many instance fields this type adds on top of its parent's - which is what the
