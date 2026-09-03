@@ -64,6 +64,9 @@ Console.WriteLine(MethodPrecode.Of(typeof(PriceService).GetMethod("GetPrice")));
   - [The gaps that make a naive walk lie](#the-gaps-that-make-a-naive-walk-lie)
   - [Reading a heap that is moving](#reading-a-heap-that-is-moving)
   - [What is not covered](#what-is-not-covered)
+- [Reading attributes without constructing them](#reading-attributes-without-constructing-them)
+  - [What the blob does not tell you](#what-the-blob-does-not-tell-you)
+  - [The attributes that are not there](#the-attributes-that-are-not-there)
 - [Building and testing](#building-and-testing)
 - [Platform support](#platform-support)
 
@@ -1490,6 +1493,85 @@ One thing genuinely needs reflection: comparing two methods' **signatures**, whi
 check and the body emitter both do. A MethodDesc does not carry parameter types - only metadata
 does - so those paths resolve back through `ClrMethodDescription.Method` and say so.
 
+## Reading attributes without constructing them
+
+`GetCustomAttributes` is not a read. It reads the metadata row, then **constructs the attribute**
+- running that attribute's constructor, in your process - and hands you the instance. So it needs
+the attribute's type to load, and it needs its constructor to be willing to run.
+
+What the assembly actually holds is a `CustomAttribute` row: who it was applied to, which
+constructor was named, and a blob of the arguments. Reading the row runs nothing.
+
+```csharp
+var table = ClrObject.From<Order>().MethodTable;
+
+foreach (var attribute in table.CustomAttributes)
+    Console.WriteLine(attribute);       // [Audited("regulated", AuditLevel.Full, ...)]
+
+table.Fields.First(f => f.Name == "Quantity").CustomAttributes;
+table.FindMethod("Describe").CustomAttributes;
+ClrAssembly.Of(typeof(object)).CustomAttributes;          // [assembly: ...]
+ClrModuleMetadata.Of(module).ModuleAttributes;            // [module: ...]
+ClrModuleMetadata.Of(module).AllCustomAttributes;         // every row in the module
+```
+
+Any token the `HasCustomAttribute` coded index can carry works - a type, a method, a field, a
+parameter, a generic parameter, the module row, the assembly row - so there is one method rather
+than one per kind of member. Each argument reports more than its value: its position and parameter
+name, or the field or property it named, how it is stored, and the address and length of the blob
+it came out of.
+
+Verified against `GetCustomAttributesData` - which reports the same as-written view rather than a
+constructed instance - on a type exercising every encoding, and on a spread of CoreLib members: no
+mismatches. All 30,034 `CustomAttribute` rows in CoreLib decode.
+
+### What the blob does not tell you
+
+The encoding (ECMA-335 II.23.3) is small and mostly obvious, with three places where the obvious
+reading is wrong.
+
+**Positional arguments carry no types.** The blob is bare values in their natural widths, little
+-endian and unaligned. Their types come from the constructor's signature, so decoding an attribute
+means decoding a `MethodDefSig` or `MemberRefSig` first. Read one value at the wrong width and
+every value after it is read from the wrong offset.
+
+**An enum is a bare number, and the blob will not say how wide.** `[Audited(AuditLevel.Full)]`
+stores one byte if `AuditLevel : byte` and eight if it is `: long`, and the blob says only
+"value type" and which type. Assuming `int` gets the common case right and silently desynchronises
+the rest. The width has to come from the enum's own definition - its single instance field, whose
+signature *is* the underlying type - which usually lives in **another assembly**, reached by
+following the TypeRef through the loader's AssemblyRef map. Because the whole blob is required to
+be consumed exactly, a wrong assumption is reported rather than returned: leftover bytes become a
+`DecodeError`.
+
+Going one step further recovers the member name too, from the enum's literal fields and their
+`Constant` rows - so `Parts = 5` reads back as `AuditParts.Inputs | AuditParts.Timing`.
+
+**A `typeof()` argument is a string, not a type.** It is the name the compiler wrote, which
+references the assemblies it compiled *against*:
+
+```
+typeof(Dictionary<string, int>)
+  -> "System.Collections.Generic.Dictionary`2[[System.String, System.Runtime, ...]], System.Collections, ..."
+```
+
+Reflection resolves that and re-renders it under the runtime's own identities
+(`System.Private.CoreLib`), so the two strings differ for the same argument. The literal string is
+what was written; it resolves to the same type.
+
+### The attributes that are not there
+
+`[Serializable]`, `[StructLayout]`, `[DllImport]`, `[MethodImpl]`, `[NonSerialized]`,
+`[MarshalAs]`, `[In]`, `[Out]` and the rest of ECMA-335 II.21 are **pseudo-custom attributes**.
+The compiler turns them into bits in the defining table - `tdSerializable` in `TypeDef.Flags`,
+`MethodDef.ImplFlags` for `[MethodImpl]` - and writes no row. Reflection synthesises them back on
+the way out, which is why `GetCustomAttributesData()` reports them.
+
+There is nothing in the `CustomAttribute` table to find, so they are absent here rather than
+faked, and a test asserts that difference so it stays a documented gap rather than a surprise.
+`[MethodImpl(MethodImplOptions.NoInlining)]` on `Order.Describe` is the case to look at in the
+sample.
+
 ## The sample
 
 `dotnet run --project src/ClrSpectorConsole` runs one short section per feature - the entry point
@@ -1517,6 +1599,17 @@ and disassembled from their MethodDescs.
 --- one object on the heap ----------------------------------------------------
   Order               48 bytes  gen 0  loh=False
   Byte[]          100024 bytes  gen 3  loh=True
+
+--- attributes without constructing them --------------------------------------
+  on the type            [Audited("regulated", AuditLevel.Full, Owner = "finance", ...)]
+  its constructor        void (string arg0, ClrSpectorConsole.AuditLevel arg1)
+  its blob               132 bytes at 0x17aa5e8a81a
+    arg 1                AuditLevel.Full         ClrSpectorConsole.AuditLevel stored as U1
+    property Parts       AuditParts.Inputs | AuditParts.Timing   ...AuditParts stored as I4
+    property Reviewer    typeof(ClrSpectorConsole.OrderProxy)    System.Type
+  not in the table       [MethodImpl] is on Describe in source but is a bit in
+                         MethodDef.ImplFlags, so no row carries it
+  CoreLib as a whole     30034 attribute rows, 0 that would not decode
 ```
 
 Each section is wrapped so that one that cannot run reports why and the rest still do - a sample

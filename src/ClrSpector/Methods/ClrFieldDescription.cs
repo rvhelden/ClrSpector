@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using ClrSpector.Cdac;
 
 namespace ClrSpector
@@ -112,6 +113,29 @@ namespace ClrSpector
 
             return field;
         }
+
+        /// <summary>The type that declares this field.</summary>
+        public ClrMethodTable EnclosingMethodTable =>
+            this.MethodTableOfEnclosingClass == IntPtr.Zero
+                ? null
+                : ClrMethodTable.Create(new MemoryReader(this.MethodTableOfEnclosingClass));
+
+        /// <summary>The metadata of the module that declares this field.</summary>
+        public ClrModuleMetadata Metadata => this.EnclosingMethodTable?.Metadata;
+
+        /// <summary>The field's name, from the module's string heap.</summary>
+        public string Name => this.Metadata?.FieldName(this.MetadataToken);
+
+        /// <summary>
+        /// The custom attributes applied to this field, decoded from metadata.
+        /// </summary>
+        /// <remarks>
+        /// A FieldDesc records its own FieldDef token, so this needs nothing from the enclosing
+        /// type beyond which module to look in.
+        /// </remarks>
+        public IReadOnlyList<ClrCustomAttribute> CustomAttributes =>
+            this.Metadata?.CustomAttributes((int)this.MetadataToken)
+            ?? (IReadOnlyList<ClrCustomAttribute>)new ClrCustomAttribute[0];
 
         public override string ToString()
         {

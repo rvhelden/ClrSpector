@@ -159,12 +159,18 @@ namespace ClrSpector
     /// </summary>
     /// <remarks>
     /// <para>
-    /// This is a transliteration, not a decompiler. Control flow is left exactly as the IL has
-    /// it - branches become <c>goto</c>, and every statement is labelled with the IL offset it
-    /// starts at - because reconstructing loops and conditionals means guessing at what the
-    /// compiler did, and the point here is to show what the method actually contains. What it
-    /// does do is undo the stack machine: <c>ldloc.0; ldc.i4.1; add; stloc.0</c> reads as
-    /// <c>loc0 = loc0 + 1;</c>, which is the part of IL that is genuinely hard to read by eye.
+    /// What it always does is undo the stack machine: <c>ldloc.0; ldc.i4.1; add; stloc.0</c>
+    /// reads as <c>loc0 = loc0 + 1;</c>, which is the part of IL that is genuinely hard to read
+    /// by eye. How much further it goes is <see cref="ClrCSharpForm"/>.
+    /// </para>
+    /// <para>
+    /// <see cref="ClrCSharpForm.Faithful"/>, the default, stops there: control flow is left
+    /// exactly as the IL has it, branches become <c>goto</c>, and every statement is labelled
+    /// with the offset it starts at. <see cref="ClrCSharpForm.Structured"/> goes on to undo the
+    /// compiler's scaffolding - its temporaries, its conditional jumps, its bottom-tested loops -
+    /// but only where it can prove the shape it is rewriting, so a method it cannot prove keeps
+    /// its gotos rather than being guessed at. Neither form invents names: a local is
+    /// <c>loc0</c>, because names live in the PDB and nothing here reads one.
     /// </para>
     /// <para>
     /// The output is a reading aid and will not compile. Both sources of IL project the same

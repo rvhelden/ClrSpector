@@ -1,3 +1,5 @@
+using System;
+using System.Text;
 using ClrSpector.Cdac;
 
 namespace ClrSpector
@@ -118,6 +120,55 @@ namespace ClrSpector
             var negative = (value & signBit) != 0;
 
             return negative ? (int)(rotated - (1u << (bits - 1))) : (int)rotated;
+        }
+
+        /// <summary>The blob's total length, independent of how much has been read.</summary>
+        public int Length => this.length;
+
+        /// <summary>How far into the blob the cursor has advanced.</summary>
+        public int Position => this.position;
+
+        /// <summary>The address of the blob's first byte, for reporting where a value came from.</summary>
+        public IntPtr Address => (IntPtr)this.start;
+
+        /// <summary>
+        /// The next <paramref name="count"/> bytes as a fixed-width little-endian value.
+        /// </summary>
+        /// <remarks>
+        /// Signatures use the compressed encodings above, but a custom attribute's argument values
+        /// do not: ECMA-335 II.23.3 stores those in their natural width, little-endian, unaligned.
+        /// The bytes are read one at a time rather than cast, because a blob is only
+        /// byte-aligned in the heap and an unaligned wide load is not portable.
+        /// </remarks>
+        public ulong ReadFixed(int count)
+        {
+            if (count < 0 || count > 8 || this.Remaining < count)
+                throw new ClrSpectorUnsupportedRuntimeException(
+                    $"A blob of {this.length} bytes cannot yield a {count}-byte value at offset " +
+                    $"{this.position}.");
+
+            var value = 0UL;
+
+            for (var i = 0; i < count; i++)
+                value |= (ulong)this.start[this.position + i] << (8 * i);
+
+            this.position += count;
+
+            return value;
+        }
+
+        /// <summary>The next <paramref name="count"/> bytes decoded as UTF-8.</summary>
+        public string ReadUtf8(int count)
+        {
+            if (count < 0 || this.Remaining < count)
+                throw new ClrSpectorUnsupportedRuntimeException(
+                    $"A blob of {this.length} bytes cannot yield {count} string bytes at offset " +
+                    $"{this.position}.");
+
+            var text = Encoding.UTF8.GetString(this.start + this.position, count);
+            this.position += count;
+
+            return text;
         }
 
         /// <summary>

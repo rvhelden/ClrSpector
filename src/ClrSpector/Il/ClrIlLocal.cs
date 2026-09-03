@@ -52,6 +52,16 @@ namespace ClrSpector
         /// <summary>The type's name from whichever source described it, or null when neither did.</summary>
         public string TypeName { get; private set; }
 
+        /// <summary>
+        /// The name the source gave this slot, when a PDB was found to read it from; null
+        /// otherwise. Nothing in the runtime or the metadata has it - see
+        /// <see cref="ClrModuleSymbols"/>.
+        /// </summary>
+        public string Name { get; internal set; }
+
+        /// <summary>The name to show: the source's if it is known, the slot number otherwise.</summary>
+        public string DisplayName => this.Name ?? $"loc{this.Index}";
+
         /// <summary>Reflection's view of a local.</summary>
         internal static ClrIlLocal Of(LocalVariableInfo local)
         {
@@ -104,8 +114,9 @@ namespace ClrSpector
         {
             var pinned = this.IsPinned ? " pinned" : string.Empty;
             var reference = this.IsByRef && this.SignatureType != null ? "ref " : string.Empty;
+            var named = this.Name == null ? string.Empty : " " + this.Name;
 
-            return $"[{this.Index}] {reference}{this.TypeName ?? "?"}{pinned}";
+            return $"[{this.Index}] {reference}{this.TypeName ?? "?"}{named}{pinned}";
         }
     }
 }

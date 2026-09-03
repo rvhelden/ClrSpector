@@ -43,7 +43,13 @@ namespace ClrSpector
         Implementation,
         CustomAttributeType,
         ResolutionScope,
-        TypeOrMethodDef
+        TypeOrMethodDef,
+
+        /// <summary>
+        /// What a portable PDB's CustomDebugInformation can hang off, which is nearly every
+        /// table there is - the type system's and the PDB's own alike.
+        /// </summary>
+        HasCustomDebugInformation
     }
 
     internal readonly struct Column
@@ -106,7 +112,8 @@ namespace ClrSpector
             2, // Implementation
             3, // CustomAttributeType
             2, // ResolutionScope
-            1  // TypeOrMethodDef
+            1, // TypeOrMethodDef
+            5  // HasCustomDebugInformation
         };
 
         private static readonly Column[][] Tables = BuildTables();
@@ -115,13 +122,24 @@ namespace ClrSpector
 
         public static Column[] Of(MetadataTable table)
         {
+            var columns = TryOf(table);
+
+            if (columns == null)
+                throw new ClrSpectorUnsupportedRuntimeException(
+                    $"Metadata table {table} (0x{(int)table:x2}) has no known column layout.");
+
+            return columns;
+        }
+
+        /// <summary>
+        /// The columns of <paramref name="table"/>, or null where ECMA-335 defines no table at
+        /// that number - the gap between the type system's tables and a PDB's.
+        /// </summary>
+        public static Column[] TryOf(MetadataTable table)
+        {
             var index = (int)table;
 
-            if (index >= Tables.Length || Tables[index] == null)
-                throw new ClrSpectorUnsupportedRuntimeException(
-                    $"Metadata table {table} (0x{index:x2}) has no known column layout.");
-
-            return Tables[index];
+            return index >= Tables.Length ? null : Tables[index];
         }
 
         public static int[] TablesOf(CodedIndex coded) => CodedTables[(int)coded];
@@ -130,7 +148,7 @@ namespace ClrSpector
 
         private static Column[][] BuildTables()
         {
-            var tables = new Column[(int)MetadataTable.GenericParamConstraint + 1][];
+            var tables = new Column[(int)MetadataTable.CustomDebugInformation + 1][];
 
             tables[(int)MetadataTable.Module] = new[]
             {
@@ -317,6 +335,53 @@ namespace ClrSpector
                 Column.Tbl(MetadataTable.GenericParam), Column.Cod(CodedIndex.TypeDefOrRef)
             };
 
+            // A portable PDB's own tables. They live in the same stream, measured the same way,
+            // which is why reading one needs no separate reader.
+            tables[(int)MetadataTable.Document] = new[]
+            {
+                Column.Blb(), Column.Gid(), Column.Blb(), Column.Gid()
+            };
+
+            tables[(int)MetadataTable.MethodDebugInformation] = new[]
+            {
+                Column.Tbl(MetadataTable.Document), Column.Blb()
+            };
+
+            // Method, ImportScope, VariableList, ConstantList, StartOffset, Length. The two list
+            // columns are the start of a run that ends where the next scope's begins, which is
+            // how ECMA-335 stores every one-to-many relationship.
+            tables[(int)MetadataTable.LocalScope] = new[]
+            {
+                Column.Tbl(MetadataTable.MethodDef), Column.Tbl(MetadataTable.ImportScope),
+                Column.Tbl(MetadataTable.LocalVariable), Column.Tbl(MetadataTable.LocalConstant),
+                Column.U4(), Column.U4()
+            };
+
+            tables[(int)MetadataTable.LocalVariable] = new[]
+            {
+                Column.U2(), Column.U2(), Column.Str()
+            };
+
+            tables[(int)MetadataTable.LocalConstant] = new[]
+            {
+                Column.Str(), Column.Blb()
+            };
+
+            tables[(int)MetadataTable.ImportScope] = new[]
+            {
+                Column.Tbl(MetadataTable.ImportScope), Column.Blb()
+            };
+
+            tables[(int)MetadataTable.StateMachineMethod] = new[]
+            {
+                Column.Tbl(MetadataTable.MethodDef), Column.Tbl(MetadataTable.MethodDef)
+            };
+
+            tables[(int)MetadataTable.CustomDebugInformation] = new[]
+            {
+                Column.Cod(CodedIndex.HasCustomDebugInformation), Column.Gid(), Column.Blb()
+            };
+
             return tables;
         }
 
@@ -398,6 +463,23 @@ namespace ClrSpector
             {
                 (int)MetadataTable.Module, (int)MetadataTable.ModuleRef,
                 (int)MetadataTable.AssemblyRef, (int)MetadataTable.TypeRef
+            };
+
+            coded[(int)CodedIndex.HasCustomDebugInformation] = new[]
+            {
+                (int)MetadataTable.MethodDef, (int)MetadataTable.Field, (int)MetadataTable.TypeRef,
+                (int)MetadataTable.TypeDef, (int)MetadataTable.Param, (int)MetadataTable.InterfaceImpl,
+                (int)MetadataTable.MemberRef, (int)MetadataTable.Module,
+                (int)MetadataTable.DeclSecurity, (int)MetadataTable.Property,
+                (int)MetadataTable.Event, (int)MetadataTable.StandAloneSig,
+                (int)MetadataTable.ModuleRef, (int)MetadataTable.TypeSpec,
+                (int)MetadataTable.Assembly, (int)MetadataTable.AssemblyRef,
+                (int)MetadataTable.File, (int)MetadataTable.ExportedType,
+                (int)MetadataTable.ManifestResource, (int)MetadataTable.GenericParam,
+                (int)MetadataTable.GenericParamConstraint, (int)MetadataTable.MethodSpec,
+                (int)MetadataTable.Document, (int)MetadataTable.LocalScope,
+                (int)MetadataTable.LocalVariable, (int)MetadataTable.LocalConstant,
+                (int)MetadataTable.ImportScope
             };
 
             coded[(int)CodedIndex.TypeOrMethodDef] = new[]

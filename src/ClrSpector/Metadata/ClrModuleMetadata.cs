@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Collections.Generic;
 using ClrSpector.Cdac;
 
@@ -52,6 +53,22 @@ namespace ClrSpector
         /// <summary>A token's low three bytes are its row id; the high byte is its table.</summary>
         private const uint RowIdMask = 0x00FFFFFF;
 
+        /// <summary>FieldAttributes.Static.</summary>
+        private const uint FieldStatic = 0x0010;
+
+        /// <summary>FieldAttributes.Literal, which is what makes a field an enum member.</summary>
+        private const uint FieldLiteral = 0x0040;
+
+        /// <summary>The calling convention byte that starts a FieldSig.</summary>
+        private const byte FieldSignature = 0x06;
+
+        /// <summary>How many assemblies a reference may be followed through before giving up.</summary>
+        private const int MaximumResolutionHops = 8;
+
+        private static readonly ClrCustomAttribute[] NoAttributes = new ClrCustomAttribute[0];
+
+        private Dictionary<string, (MetadataTable Table, uint RowId)> typesByName;
+
         /// <summary>The table byte of a user string token, which names the <c>#US</c> heap.</summary>
         private const int UserStringTokenType = 0x70;
 
@@ -98,8 +115,25 @@ namespace ClrSpector
         {
             if (module == null) throw new ArgumentNullException(nameof(module));
 
-            return AtImageBase(module.Base);
+            var metadata = AtImageBase(module.Base);
+
+            // Kept so a TypeRef can be followed to the assembly that defines it, which needs the
+            // loader's AssemblyRef map and so cannot be done from the image alone. Assigned rather
+            // than passed to the cache because the cache is keyed on the image base, which is all
+            // the metadata itself needs.
+            metadata.Owner ??= module;
+
+            return metadata;
         }
+
+        /// <summary>
+        /// The loader's module, when this metadata was reached through one.
+        /// </summary>
+        /// <remarks>
+        /// Null when the image base was given directly. Everything except cross-assembly
+        /// reference resolution works without it.
+        /// </remarks>
+        public ClrModule Owner { get; private set; }
 
         /// <summary>The metadata of the image mapped at <paramref name="imageBase"/>.</summary>
         public static ClrModuleMetadata AtImageBase(IntPtr imageBase)
@@ -381,6 +415,563 @@ namespace ClrSpector
         }
 
         /// <summary>Splits a token, checking it names the table the caller expects.</summary>
+        /// <summary>
+        /// The custom attributes applied to whatever <paramref name="parentToken"/> names.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Any token the HasCustomAttribute coded index can carry works here: a TypeDef, a
+        /// MethodDef, a Field, a Param, a GenericParam, the Module row or the Assembly row. That
+        /// is why there is one method rather than one per kind of member.
+        /// </para>
+        /// <para>
+        /// The table is sorted by parent, so this binary-searches it. When the sorted bit is not
+        /// set - which a rewritten or generated image can leave clear - it falls back to a scan
+        /// rather than to a search that would silently miss rows.
+        /// </para>
+        /// </remarks>
+        public IReadOnlyList<ClrCustomAttribute> CustomAttributes(int parentToken)
+        {
+            var table = (MetadataTable)(uint)((parentToken >> 24) & 0xFF);
+            var rowId = (uint)parentToken & RowIdMask;
+            var rows = (uint)this.Image.RowCount(MetadataTable.CustomAttribute);
+
+            if (rows == 0 || rowId == 0)
+                return NoAttributes;
+
+            uint parent;
+
+            try
+            {
+                parent = this.Image.EncodeCoded(CodedIndex.HasCustomAttribute, table, rowId);
+            }
+            catch (ClrSpectorUnsupportedRuntimeException)
+            {
+                // Nothing of that kind can carry an attribute, so nothing does.
+                return NoAttributes;
+            }
+
+            var found = new List<ClrCustomAttribute>();
+
+            if (this.Image.IsSorted(MetadataTable.CustomAttribute))
+            {
+                var first = this.FirstAttributeRow(parent, rows);
+
+                for (var row = first; row != 0 && row <= rows; row++)
+                {
+                    if (this.Image.ReadColumn(MetadataTable.CustomAttribute, row, 0) != parent)
+                        break;
+
+                    found.Add(ClrCustomAttribute.Read(this, row));
+                }
+            }
+            else
+            {
+                for (var row = 1u; row <= rows; row++)
+                {
+                    if (this.Image.ReadColumn(MetadataTable.CustomAttribute, row, 0) == parent)
+                        found.Add(ClrCustomAttribute.Read(this, row));
+                }
+            }
+
+            return found;
+        }
+
+        /// <summary>
+        /// The assembly-level attributes - what source writes as <c>[assembly: ...]</c>.
+        /// </summary>
+        /// <remarks>
+        /// These hang off the single Assembly row, which only a module that carries the manifest
+        /// has. A module without one returns nothing rather than throwing.
+        /// </remarks>
+        public IReadOnlyList<ClrCustomAttribute> AssemblyAttributes =>
+            this.Image.RowCount(MetadataTable.Assembly) == 0
+                ? NoAttributes
+                : this.CustomAttributes(((int)MetadataTable.Assembly << 24) | 1);
+
+        /// <summary>The module-level attributes - <c>[module: ...]</c>.</summary>
+        public IReadOnlyList<ClrCustomAttribute> ModuleAttributes =>
+            this.CustomAttributes(((int)MetadataTable.Module << 24) | 1);
+
+        /// <summary>
+        /// Every custom attribute in the module, whatever it is applied to.
+        /// </summary>
+        /// <remarks>
+        /// Lazy, because a large assembly has tens of thousands of these and decoding a blob is
+        /// not free. Use <see cref="ClrCustomAttribute.ParentToken"/> to see what each was
+        /// applied to.
+        /// </remarks>
+        public IEnumerable<ClrCustomAttribute> AllCustomAttributes
+        {
+            get
+            {
+                var rows = (uint)this.Image.RowCount(MetadataTable.CustomAttribute);
+
+                for (var row = 1u; row <= rows; row++)
+                    yield return ClrCustomAttribute.Read(this, row);
+            }
+        }
+
+        /// <summary>
+        /// The full name of the type that declares whatever member a token names.
+        /// </summary>
+        /// <remarks>
+        /// Works for a MethodDef or Field in this module, where the owner is found by searching
+        /// the TypeDef table's member lists, and for a MemberRef, where the owner is the row the
+        /// reference points at. This is how an attribute's type name is recovered from the
+        /// constructor its row names, since the row never names the type directly.
+        /// </remarks>
+        public string DeclaringTypeName(int memberToken)
+        {
+            try
+            {
+                var table = (MetadataTable)(uint)((memberToken >> 24) & 0xFF);
+                var rowId = (uint)memberToken & RowIdMask;
+
+                switch (table)
+                {
+                    case MetadataTable.MethodDef:
+                        return this.FullTypeNameOfRow(
+                            this.DeclaringTypeOf(MetadataTable.MethodDef, rowId, 5));
+
+                    case MetadataTable.Field:
+                        return this.FullTypeNameOfRow(
+                            this.DeclaringTypeOf(MetadataTable.Field, rowId, 4));
+
+                    case MetadataTable.MemberRef:
+                    {
+                        var parent = this.Image.DecodeCoded(
+                            CodedIndex.MemberRefParent,
+                            this.Image.ReadColumn(MetadataTable.MemberRef, rowId, 0));
+
+                        switch (parent.Table)
+                        {
+                            case MetadataTable.TypeRef:
+                                return this.TypeRefName(parent.RowId);
+
+                            case MetadataTable.TypeDef:
+                                return this.FullTypeNameOfRow(parent.RowId);
+
+                            case MetadataTable.TypeSpec:
+                            {
+                                var blob = this.Image.Blob(
+                                    this.Image.ReadColumn(MetadataTable.TypeSpec, parent.RowId, 0));
+
+                                return SignatureTypeReader.ReadType(ref blob, this.Image).ToString();
+                            }
+
+                            default:
+                                return null;
+                        }
+                    }
+
+                    default:
+                        return null;
+                }
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Finds a type by its full metadata name, as a TypeDef here or a TypeRef to elsewhere.
+        /// </summary>
+        /// <remarks>
+        /// The TypeDef table is searched first, so a type defined here is found as a definition
+        /// rather than as a reference to itself. Names are matched exactly, including the
+        /// namespace, and a nested type is spelled with <c>+</c> as
+        /// <see cref="FullTypeName"/> spells it.
+        /// </remarks>
+        public bool TryFindType(string fullName, out (MetadataTable Table, uint RowId) found)
+        {
+            found = default;
+
+            if (string.IsNullOrEmpty(fullName))
+                return false;
+
+            this.typesByName ??= this.BuildTypeIndex();
+
+            return this.typesByName.TryGetValue(fullName, out found);
+        }
+
+        /// <summary>
+        /// Finds a TypeDef in this module by its full metadata name.
+        /// </summary>
+        public uint FindTypeDef(string fullName)
+        {
+            return this.TryFindType(fullName, out var found) && found.Table == MetadataTable.TypeDef
+                ? ((uint)MetadataTable.TypeDef << 24) | found.RowId
+                : 0;
+        }
+
+        /// <summary>
+        /// The integer type an enum is stored as, or <see cref="CorElementType.END"/> when the
+        /// enum's definition could not be reached.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// An enum has no field saying what it is backed by. What it has is one instance field -
+        /// conventionally called <c>value__</c> - whose own signature is the underlying type, so
+        /// that field's signature is the answer.
+        /// </para>
+        /// <para>
+        /// A TypeRef is followed to the assembly that defines it, through the loader's AssemblyRef
+        /// map rather than by name matching, so this works for an enum in another assembly -
+        /// which most enums used in attributes are. That needs <see cref="Owner"/>, and returns
+        /// unknown without it.
+        /// </para>
+        /// </remarks>
+        public CorElementType EnumUnderlyingType(MetadataTable table, uint rowId)
+        {
+            return this.EnumUnderlyingType(table, rowId, 0);
+        }
+
+        /// <summary>
+        /// The name of the enum member equal to <paramref name="value"/>, or null when the enum
+        /// cannot be reached or has no member with that value.
+        /// </summary>
+        /// <remarks>
+        /// An enum's members are static literal fields, and their values are Constant rows. A
+        /// value that matches no single member is decomposed into the flags that make it up, so a
+        /// combination reads as <c>A | B</c> rather than as a number. A leftover that no member
+        /// accounts for means the whole thing is reported as unknown rather than as a partial
+        /// answer.
+        /// </remarks>
+        public string EnumMemberName(MetadataTable table, uint rowId, object value)
+        {
+            try
+            {
+                var members = this.EnumMembers(table, rowId, 0);
+
+                if (members == null || members.Count == 0)
+                    return null;
+
+                var name = this.TypeNameOf(table, rowId);
+                var numeric = Convert.ToInt64(value, CultureInfo.InvariantCulture);
+
+                foreach (var member in members)
+                {
+                    if (member.Value == numeric)
+                        return name == null ? member.Name : $"{name}.{member.Name}";
+                }
+
+                // No single member matches, so this is either a flags combination or a value the
+                // enum does not name.
+                if (numeric == 0)
+                    return null;
+
+                var remaining = numeric;
+                var parts = new List<string>();
+
+                foreach (var member in members)
+                {
+                    if (member.Value != 0 && (remaining & member.Value) == member.Value)
+                    {
+                        parts.Add(name == null ? member.Name : $"{name}.{member.Name}");
+                        remaining &= ~member.Value;
+                    }
+                }
+
+                return remaining == 0 && parts.Count > 1 ? string.Join(" | ", parts) : null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// The first row of the CustomAttribute table whose parent is <paramref name="parent"/>.
+        /// </summary>
+        /// <remarks>
+        /// A plain binary search finds some matching row, not the first of a run, so this keeps
+        /// narrowing after a hit instead of stopping at one.
+        /// </remarks>
+        private uint FirstAttributeRow(uint parent, uint rows)
+        {
+            uint low = 1;
+            var high = rows;
+            uint first = 0;
+
+            while (low <= high)
+            {
+                var middle = low + ((high - low) / 2);
+                var value = this.Image.ReadColumn(MetadataTable.CustomAttribute, middle, 0);
+
+                if (value >= parent)
+                {
+                    if (value == parent)
+                        first = middle;
+
+                    if (middle == 1)
+                        break;
+
+                    high = middle - 1;
+                }
+                else
+                {
+                    low = middle + 1;
+                }
+            }
+
+            return first;
+        }
+
+        /// <summary>
+        /// Every full type name in the module, mapped to the row that carries it.
+        /// </summary>
+        /// <remarks>
+        /// Built once rather than scanned per lookup, because resolving the enums in an
+        /// assembly's attributes asks the same question repeatedly. TypeRefs are added only where
+        /// no TypeDef claims the name, so a definition always wins over a reference.
+        /// </remarks>
+        private Dictionary<string, (MetadataTable Table, uint RowId)> BuildTypeIndex()
+        {
+            var index = new Dictionary<string, (MetadataTable, uint)>(StringComparer.Ordinal);
+
+            for (var row = 1u; row <= (uint)this.Image.RowCount(MetadataTable.TypeDef); row++)
+            {
+                var name = this.FullTypeNameOfRow(row);
+
+                if (name != null)
+                    index[name] = (MetadataTable.TypeDef, row);
+            }
+
+            for (var row = 1u; row <= (uint)this.Image.RowCount(MetadataTable.TypeRef); row++)
+            {
+                var name = this.TypeRefName(row);
+
+                if (name != null && !index.ContainsKey(name))
+                    index[name] = (MetadataTable.TypeRef, row);
+            }
+
+            return index;
+        }
+
+        /// <summary>
+        /// <see cref="EnumUnderlyingType(MetadataTable, uint)"/>, counting the assembly hops taken
+        /// so a chain of forwarding references cannot loop.
+        /// </summary>
+        private CorElementType EnumUnderlyingType(MetadataTable table, uint rowId, int depth)
+        {
+            if (rowId == 0 || depth > MaximumResolutionHops)
+                return CorElementType.END;
+
+            try
+            {
+                if (table == MetadataTable.TypeRef)
+                {
+                    var target = this.FollowTypeRef(rowId);
+
+                    return target == null
+                        ? CorElementType.END
+                        : target.Value.Metadata.EnumUnderlyingType(
+                            MetadataTable.TypeDef, target.Value.RowId, depth + 1);
+                }
+
+                if (table != MetadataTable.TypeDef
+                    || rowId > (uint)this.Image.RowCount(MetadataTable.TypeDef))
+                {
+                    return CorElementType.END;
+                }
+
+                foreach (var field in this.FieldRowsOf(rowId))
+                {
+                    // Field: Flags, Name, Signature. The one instance field is the backing value.
+                    if ((this.Image.ReadColumn(MetadataTable.Field, field, 0) & FieldStatic) != 0)
+                        continue;
+
+                    var blob = this.Image.Blob(
+                        this.Image.ReadColumn(MetadataTable.Field, field, 2));
+
+                    // A FieldSig is the calling convention byte 0x06, then the type.
+                    if (blob.ReadByte() != FieldSignature)
+                        return CorElementType.END;
+
+                    return SignatureTypeReader.ReadType(ref blob, this.Image).ElementType;
+                }
+
+                return CorElementType.END;
+            }
+            catch (Exception)
+            {
+                return CorElementType.END;
+            }
+        }
+
+        /// <summary>
+        /// The named members of an enum, as name and value pairs.
+        /// </summary>
+        private List<(string Name, long Value)> EnumMembers(
+            MetadataTable table, uint rowId, int depth)
+        {
+            if (rowId == 0 || depth > MaximumResolutionHops)
+                return null;
+
+            if (table == MetadataTable.TypeRef)
+            {
+                var target = this.FollowTypeRef(rowId);
+
+                return target?.Metadata.EnumMembers(
+                    MetadataTable.TypeDef, target.Value.RowId, depth + 1);
+            }
+
+            if (table != MetadataTable.TypeDef
+                || rowId > (uint)this.Image.RowCount(MetadataTable.TypeDef))
+            {
+                return null;
+            }
+
+            var members = new List<(string, long)>();
+
+            foreach (var field in this.FieldRowsOf(rowId))
+            {
+                var flags = this.Image.ReadColumn(MetadataTable.Field, field, 0);
+
+                // Only the static literal fields are members; the instance one is the storage.
+                if ((flags & FieldStatic) == 0 || (flags & FieldLiteral) == 0)
+                    continue;
+
+                if (!this.TryConstantOf(MetadataTable.Field, field, out var value))
+                    continue;
+
+                members.Add((this.Image.String(
+                    this.Image.ReadColumn(MetadataTable.Field, field, 1)), value));
+            }
+
+            return members;
+        }
+
+        /// <summary>
+        /// The value of a Constant row attached to a field, as a 64-bit integer.
+        /// </summary>
+        /// <remarks>
+        /// Only the integral element types are read: an enum member is always one of those, and a
+        /// string or floating-point constant is not something a member name can be recovered from.
+        /// </remarks>
+        private bool TryConstantOf(MetadataTable table, uint rowId, out long value)
+        {
+            value = 0;
+
+            var rows = (uint)this.Image.RowCount(MetadataTable.Constant);
+
+            if (rows == 0)
+                return false;
+
+            var parent = this.Image.EncodeCoded(CodedIndex.HasConstant, table, rowId);
+
+            // Constant: Type, Padding, Parent, Value. Sorted by parent.
+            for (var row = 1u; row <= rows; row++)
+            {
+                if (this.Image.ReadColumn(MetadataTable.Constant, row, 2) != parent)
+                    continue;
+
+                var element = (CorElementType)this.Image.ReadColumn(MetadataTable.Constant, row, 0);
+                var blob = this.Image.Blob(this.Image.ReadColumn(MetadataTable.Constant, row, 3));
+
+                switch (element)
+                {
+                    case CorElementType.BOOLEAN:
+                    case CorElementType.U1: value = (long)blob.ReadFixed(1); return true;
+                    case CorElementType.I1: value = (sbyte)blob.ReadFixed(1); return true;
+                    case CorElementType.CHAR:
+                    case CorElementType.U2: value = (long)blob.ReadFixed(2); return true;
+                    case CorElementType.I2: value = (short)blob.ReadFixed(2); return true;
+                    case CorElementType.U4: value = (long)(uint)blob.ReadFixed(4); return true;
+                    case CorElementType.I4: value = (int)blob.ReadFixed(4); return true;
+                    case CorElementType.U8:
+                    case CorElementType.I8: value = (long)blob.ReadFixed(8); return true;
+                    default: return false;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// The Field rows a TypeDef owns, from its FieldList and the next type's.
+        /// </summary>
+        /// <remarks>
+        /// A type's members are a run in the member table rather than a list, so the run ends
+        /// where the next type's begins - and for the last type, at the end of the table.
+        /// </remarks>
+        private IEnumerable<uint> FieldRowsOf(uint typeRow)
+        {
+            var types = (uint)this.Image.RowCount(MetadataTable.TypeDef);
+            var fields = (uint)this.Image.RowCount(MetadataTable.Field);
+
+            var first = this.Image.ReadColumn(MetadataTable.TypeDef, typeRow, 4);
+            var last = typeRow < types
+                ? this.Image.ReadColumn(MetadataTable.TypeDef, typeRow + 1, 4)
+                : fields + 1;
+
+            for (var field = first; field < last && field <= fields; field++)
+                yield return field;
+        }
+
+        /// <summary>
+        /// Follows a TypeRef to the TypeDef that defines it, in whichever assembly that is.
+        /// </summary>
+        /// <remarks>
+        /// The resolution scope names an AssemblyRef, and the loader keeps a map from that row to
+        /// the assembly it bound to - so this is a lookup rather than a name search, and gives
+        /// the assembly actually loaded rather than one that merely matches the name. A nested
+        /// type's scope is another TypeRef, and is followed by name once the outer one resolves.
+        /// </remarks>
+        private (ClrModuleMetadata Metadata, uint RowId)? FollowTypeRef(uint rowId)
+        {
+            if (rowId == 0 || rowId > (uint)this.Image.RowCount(MetadataTable.TypeRef))
+                return null;
+
+            var name = this.TypeRefName(rowId);
+
+            if (name == null)
+                return null;
+
+            // A TypeRef can name a type this very module defines, in which case no hop is needed.
+            if (this.TryFindType(name, out var here) && here.Table == MetadataTable.TypeDef)
+                return (this, here.RowId);
+
+            if (this.Owner == null)
+                return null;
+
+            var scope = this.Image.DecodeCoded(
+                CodedIndex.ResolutionScope,
+                this.Image.ReadColumn(MetadataTable.TypeRef, rowId, 0));
+
+            if (scope.Table != MetadataTable.AssemblyRef)
+                return null;
+
+            var assemblyRefToken = ((uint)MetadataTable.AssemblyRef << 24) | scope.RowId;
+            var assembly = this.Owner.AssemblyRefToAssembly(assemblyRefToken);
+
+            if (assembly == IntPtr.Zero)
+                return null;
+
+            var manifest = ClrAssembly.At(assembly)?.ManifestModule;
+
+            if (manifest == null || manifest.Base == IntPtr.Zero)
+                return null;
+
+            var metadata = Of(manifest);
+            var token = metadata.FindTypeDef(name);
+
+            return token == 0 ? null : (metadata, token & RowIdMask);
+        }
+
+        /// <summary>A readable name for a type named by a TypeDef or TypeRef row.</summary>
+        private string TypeNameOf(MetadataTable table, uint rowId)
+        {
+            switch (table)
+            {
+                case MetadataTable.TypeDef: return this.FullTypeNameOfRow(rowId);
+                case MetadataTable.TypeRef: return this.TypeRefName(rowId);
+                default: return null;
+            }
+        }
+
         private bool TryRow(uint token, MetadataTable expected, out uint rowId)
         {
             rowId = token & RowIdMask;
@@ -490,6 +1081,39 @@ namespace ClrSpector
             }
 
             return owner;
+        }
+
+        /// <summary>
+        /// One of a mapped image's PE data directories, as a relative virtual address and a
+        /// size, or (0, 0) when the image does not have it.
+        /// </summary>
+        /// <remarks>
+        /// The metadata reader needs the CLI directory and the symbol reader needs the debug
+        /// one, and both are the same walk: the DOS stub points at the PE signature, the COFF
+        /// header follows, and the optional header after it holds the directories - at one of
+        /// two offsets, depending on whether the image is 32- or 64-bit.
+        /// </remarks>
+        internal static (uint Rva, uint Size) DataDirectory(IntPtr imageBase, int index)
+        {
+            if (imageBase == IntPtr.Zero)
+                return (0, 0);
+
+            var image = (byte*)imageBase;
+
+            var peOffset = *(int*)(image + 0x3C);
+            var optionalHeader = image + peOffset + 4 + 20;
+
+            var magic = *(ushort*)optionalHeader;
+            var directories = optionalHeader
+                              + (magic == Pe32PlusMagic ? DataDirectoriesOffsetPe32Plus : DataDirectoriesOffsetPe32);
+
+            // The count is in the optional header too, so a directory beyond it is not there.
+            var count = *(uint*)(directories - 4);
+
+            if (index >= (int)count)
+                return (0, 0);
+
+            return (*(uint*)(directories + index * 8), *(uint*)(directories + index * 8 + 4));
         }
 
         private static ClrModuleMetadata Read(IntPtr imageBase)

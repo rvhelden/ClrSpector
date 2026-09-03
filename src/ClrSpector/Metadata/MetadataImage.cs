@@ -41,8 +41,14 @@ namespace ClrSpector
         /// <summary>HeapSizes bit 6: an extra four bytes follow the row counts.</summary>
         private const byte HasExtraData = 0x40;
 
-        /// <summary>The highest table ECMA-335 defines.</summary>
-        private const int TableCount = (int)MetadataTable.GenericParamConstraint + 1;
+        /// <summary>
+        /// One past the highest table there is, counting a portable PDB's own - which are
+        /// numbered above the type system's, in the same stream, and measured the same way.
+        /// </summary>
+        private const int TableCount = (int)MetadataTable.CustomDebugInformation + 1;
+
+        /// <summary>The size of a portable PDB's id: a GUID and the stamp that goes with it.</summary>
+        private const int PdbIdSize = 20;
 
         private readonly byte* metadata;
         private readonly int metadataSize;
@@ -55,6 +61,13 @@ namespace ClrSpector
         private readonly int userStringHeapSize;
 
         private readonly int[] rowCounts = new int[TableCount];
+
+        /// <summary>
+        /// The row counts that decide how wide an index into a table is, which are not always
+        /// the rows present here: a standalone PDB indexes into its module's tables and restates
+        /// their counts for exactly this purpose, while holding none of their rows.
+        /// </summary>
+        private readonly int[] indexRowCounts = new int[TableCount];
         private readonly int[] rowSizes = new int[TableCount];
         private readonly long[] tableOffsets = new long[TableCount];
         private readonly int[][] columnOffsets = new int[TableCount][];
@@ -85,6 +98,7 @@ namespace ClrSpector
             var streamCount = reader.ReadUShort(afterVersion + 2);
 
             byte* tables = null;
+            byte* pdb = null;
             var tablesSize = 0;
             var cursor = afterVersion + 4;
 
@@ -120,6 +134,10 @@ namespace ClrSpector
                     case "#US":
                         this.userStringHeap = start;
                         this.userStringHeapSize = streamSize;
+                        break;
+
+                    case "#Pdb":
+                        pdb = start;
                         break;
                 }
 
@@ -158,6 +176,12 @@ namespace ClrSpector
             if ((heapSizes & HasExtraData) != 0)
                 countCursor += 4;
 
+            // Indexes are as wide as the rows they can name, which starts as the rows here.
+            Array.Copy(this.rowCounts, this.indexRowCounts, TableCount);
+
+            if (pdb != null)
+                this.ReadPdbStream(pdb);
+
             this.MeasureTables();
 
             var rowsStart = countCursor;
@@ -181,6 +205,22 @@ namespace ClrSpector
         /// <summary>The metadata version string from the root, e.g. "v4.0.30319".</summary>
         public string Version { get; }
 
+        /// <summary>
+        /// True when this is a standalone portable PDB rather than a module's own metadata.
+        /// </summary>
+        public bool IsPortablePdb => this.PdbId != null;
+
+        /// <summary>
+        /// A portable PDB's own id - the twenty bytes a module's CodeView debug entry has to
+        /// match for the PDB to belong to it - or null for a module's metadata.
+        /// </summary>
+        public byte[] PdbId { get; private set; }
+
+        /// <summary>
+        /// The MethodDef token of the entry point a portable PDB records, or zero.
+        /// </summary>
+        public uint PdbEntryPoint { get; private set; }
+
         /// <summary>The start of the table stream; row offsets are relative to this.</summary>
         private byte* TableStream { get; }
 
@@ -199,6 +239,46 @@ namespace ClrSpector
                     $"There is no metadata at 0x{metadataAddress.ToInt64():x} with size {size}.");
 
             return new MetadataImage(metadataAddress, size);
+        }
+
+        /// <summary>
+        /// Reads the <c>#Pdb</c> stream, which is what makes a standalone portable PDB readable
+        /// at all.
+        /// </summary>
+        /// <remarks>
+        /// A PDB's table stream carries row counts only for the PDB's own tables, yet its rows
+        /// still hold indexes into the module's tables - and how wide those indexes are depends
+        /// on how many rows those tables have. So the PDB restates them: a mask of the tables it
+        /// references, then a row count for each. Without applying those first, every column
+        /// after an index would be measured at the wrong offset.
+        /// </remarks>
+        private void ReadPdbStream(byte* stream)
+        {
+            var reader = new MemoryReader((IntPtr)stream);
+
+            var id = new byte[PdbIdSize];
+            for (var i = 0; i < PdbIdSize; i++)
+                id[i] = reader.ReadByte(i);
+
+            this.PdbId = id;
+            this.PdbEntryPoint = reader.ReadUInt(PdbIdSize);
+
+            var referenced = reader.ReadULong(PdbIdSize + 4);
+            var cursor = PdbIdSize + 12;
+
+            for (var table = 0; table < 64; table++)
+            {
+                if ((referenced & (1UL << table)) == 0)
+                    continue;
+
+                var count = reader.ReadInt(cursor);
+                cursor += 4;
+
+                // These are the module's tables, not this stream's: they widen an index and
+                // contribute no rows, which is why only the index counts are touched.
+                if (table < TableCount && this.rowCounts[table] == 0)
+                    this.indexRowCounts[table] = count;
+            }
         }
 
         /// <summary>The size of the whole metadata region, in bytes.</summary>
@@ -352,7 +432,7 @@ namespace ClrSpector
         {
             for (var table = 0; table < TableCount; table++)
             {
-                var columns = MetadataSchema.Of((MetadataTable)table);
+                var columns = MetadataSchema.TryOf((MetadataTable)table) ?? Array.Empty<Column>();
                 var offsets = new int[columns.Length + 1];
                 var offset = 0;
 
@@ -392,7 +472,7 @@ namespace ClrSpector
                     return this.blobIndexSize;
 
                 case ColumnKind.Table:
-                    return this.rowCounts[(int)column.Table] < 65536 ? 2 : 4;
+                    return this.indexRowCounts[(int)column.Table] < 65536 ? 2 : 4;
 
                 case ColumnKind.Coded:
                     return this.CodedWidth(column.Coded);
@@ -418,11 +498,35 @@ namespace ClrSpector
                 if (table < 0)
                     continue;
 
-                if (this.rowCounts[table] > largest)
-                    largest = this.rowCounts[table];
+                if (this.indexRowCounts[table] > largest)
+                    largest = this.indexRowCounts[table];
             }
 
             return largest < 1 << (16 - tagBits) ? 2 : 4;
+        }
+
+        /// <summary>
+        /// The coded-index value that names <paramref name="rowId"/> of
+        /// <paramref name="table"/> - the inverse of <see cref="DecodeCoded"/>.
+        /// </summary>
+        /// <remarks>
+        /// Needed to search a table by an owner column: the CustomAttribute table is sorted by its
+        /// Parent coded index, so finding one owner's attributes means encoding the owner and
+        /// binary-searching for that encoded value, not decoding every row.
+        /// </remarks>
+        public uint EncodeCoded(CodedIndex coded, MetadataTable table, uint rowId)
+        {
+            var tagBits = MetadataSchema.TagBitsOf(coded);
+            var tables = MetadataSchema.TablesOf(coded);
+
+            for (var tag = 0; tag < tables.Length; tag++)
+            {
+                if (tables[tag] == (int)table)
+                    return (rowId << tagBits) | (uint)tag;
+            }
+
+            throw new ClrSpectorUnsupportedRuntimeException(
+                $"Coded index {coded} cannot name the {table} table.");
         }
 
         /// <summary>Decodes a coded index into the table it names and the row within it.</summary>

@@ -331,6 +331,8 @@ namespace ClrSpector
             il.ExceptionRegions = il.ExceptionHandlers.Select(RegionOf).ToArray();
             il.LocalVariables = il.Locals.Select(ClrIlLocal.Of).ToArray();
 
+            NameLocals(il.LocalVariables, ImageBaseOf(method), (uint)method.MetadataToken);
+
             return il;
         }
 
@@ -367,6 +369,9 @@ namespace ClrSpector
             };
 
             il.Instructions = Decode(body.Il, (operandType, token) => NameToken(metadata, operandType, token));
+
+            NameLocals(
+                il.LocalVariables, metadata?.ImageBase ?? IntPtr.Zero, method.MetadataToken);
 
             return il;
         }
@@ -415,6 +420,52 @@ namespace ClrSpector
             }
 
             return regions;
+        }
+
+        /// <summary>
+        /// Gives the local slots the names the module's PDB has for them, when there is one.
+        /// </summary>
+        /// <remarks>
+        /// Nothing else in a method's own data has them, so this is the only step in reading IL
+        /// that looks outside the mapped image - and the only one that may find nothing, which
+        /// is why every local keeps a slot-numbered name to fall back on.
+        /// </remarks>
+        private static void NameLocals(
+            IReadOnlyList<ClrIlLocal> locals, IntPtr imageBase, uint methodDefToken)
+        {
+            if (locals.Count == 0)
+                return;
+
+            var names = ClrModuleSymbols.AtImageBase(imageBase)?.LocalNames(methodDefToken);
+
+            if (names == null || names.Count == 0)
+                return;
+
+            foreach (var local in locals)
+            {
+                if (names.TryGetValue(local.Index, out var name))
+                    local.Name = name;
+            }
+        }
+
+        /// <summary>
+        /// Where <paramref name="method"/>'s module is mapped, or zero for a module with no
+        /// image - one built at runtime.
+        /// </summary>
+        private static IntPtr ImageBaseOf(MethodBase method)
+        {
+            try
+            {
+                var module = method.Module;
+
+                return module == null || module.Assembly.IsDynamic
+                    ? IntPtr.Zero
+                    : System.Runtime.InteropServices.Marshal.GetHINSTANCE(module);
+            }
+            catch (Exception)
+            {
+                return IntPtr.Zero;
+            }
         }
 
         private static object NameToken(ClrModuleMetadata metadata, OperandType operandType, int token)
@@ -691,8 +742,13 @@ namespace ClrSpector
                     var pinned = local.IsPinned ? " pinned" : string.Empty;
                     var comma = i == this.LocalVariables.Count - 1 ? string.Empty : ",";
 
+                    var named = local.Name == null
+                        ? string.Empty
+                        : " " + IlPalette.Paint(local.Name, IlPalette.Opcode, colouring);
+
                     text.AppendLine($"    {IlPalette.Paint($"[{local.Index}]", IlPalette.Number, colouring)} " +
-                                    $"{IlPalette.Paint(local.TypeName ?? "?", IlPalette.Member, colouring)}{pinned}{comma}");
+                                    $"{IlPalette.Paint(local.TypeName ?? "?", IlPalette.Member, colouring)}" +
+                                    $"{named}{pinned}{comma}");
                 }
 
                 text.AppendLine(IlPalette.Paint(")", IlPalette.Directive, colouring));

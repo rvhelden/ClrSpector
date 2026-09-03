@@ -349,7 +349,7 @@ namespace ClrSpector
             {
                 foreach (var local in this.il.LocalVariables)
                 {
-                    if (!this.IsUsed($"loc{local.Index}"))
+                    if (!this.IsUsed(local.DisplayName))
                         continue;
 
                     any = true;
@@ -364,7 +364,7 @@ namespace ClrSpector
                                 : Array.Empty<ClrCSharpToken>(),
                             Type(LocalTypeText(local)),
                             Punctuation(" "),
-                            Identifier($"loc{local.Index}"),
+                            Identifier(local.DisplayName),
                             Punctuation(";")));
                 }
             }
@@ -417,7 +417,7 @@ namespace ClrSpector
         {
             for (var i = 0; i < this.il.LocalVariables.Count; i++)
             {
-                if (name != $"loc{this.il.LocalVariables[i].Index}")
+                if (name != this.il.LocalVariables[i].DisplayName)
                     continue;
 
                 var local = this.il.LocalVariables[i];
@@ -2171,11 +2171,17 @@ namespace ClrSpector
             return index >= 0 && index < this.argumentNames.Length ? this.argumentNames[index] : $"arg{index}";
         }
 
+        /// <summary>
+        /// What to call the local in slot <paramref name="index"/>: the name the source gave it
+        /// when the module's PDB could be read, and the slot number otherwise.
+        /// </summary>
         private string LocalName(int index)
         {
             this.highestLocal = Math.Max(this.highestLocal, index);
 
-            return $"loc{index}";
+            return index >= 0 && index < this.il.LocalVariables.Count
+                ? this.il.LocalVariables[index].DisplayName
+                : $"loc{index}";
         }
 
         /// <summary>What the local in <paramref name="index"/> holds, when that is known.</summary>

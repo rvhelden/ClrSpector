@@ -425,10 +425,28 @@ namespace ClrSpector
         public string MetadataNamespace => this.Metadata?.TypeName(this.TypeDefToken).Namespace;
 
         /// <summary>The metadata of the module that declares this type.</summary>
+        /// <remarks>
+        /// Reached through <see cref="ClrModuleMetadata.Of(ClrModule)"/> rather than through the
+        /// image base alone, so the metadata keeps a link back to the loader's module - which is
+        /// what lets a reference to another assembly be followed.
+        /// </remarks>
         public ClrModuleMetadata Metadata =>
             this.Module == IntPtr.Zero
                 ? null
-                : ClrModuleMetadata.AtImageBase(ClrModule.At(this.Module).Base);
+                : ClrModuleMetadata.Of(ClrModule.At(this.Module));
+
+        /// <summary>
+        /// The custom attributes applied to this type, decoded from metadata.
+        /// </summary>
+        /// <remarks>
+        /// Nothing is instantiated: the values come out of the CustomAttribute blob, so no
+        /// attribute constructor runs and an attribute whose type will not load still reports its
+        /// name and arguments. A constructed generic reports the attributes of its definition,
+        /// which is where they were written.
+        /// </remarks>
+        public IReadOnlyList<ClrCustomAttribute> CustomAttributes =>
+            this.Metadata?.CustomAttributes((int)this.TypeDefToken)
+            ?? (IReadOnlyList<ClrCustomAttribute>)new ClrCustomAttribute[0];
 
         /// <summary>The methods this type declares, in MethodDescChunk order.</summary>
         public List<ClrMethodDescription> Methods { get; private set; }

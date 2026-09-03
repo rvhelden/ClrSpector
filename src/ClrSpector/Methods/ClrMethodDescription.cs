@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using ClrSpector.Cdac;
@@ -290,6 +291,19 @@ namespace ClrSpector
         /// has no mapped image, as a runtime-generated one does not.
         /// </remarks>
         public string Name => this.Metadata?.MethodName(this.MetadataToken) ?? this.StoredName;
+
+        /// <summary>
+        /// The custom attributes applied to this method, decoded from metadata.
+        /// </summary>
+        /// <remarks>
+        /// Empty for a method with no metadata row of its own - an array accessor or an emitted
+        /// method - since there is nowhere for an attribute to have been recorded. An
+        /// instantiation reports what was written on the open definition, which is the only place
+        /// an attribute can be written.
+        /// </remarks>
+        public IReadOnlyList<ClrCustomAttribute> CustomAttributes =>
+            this.Metadata?.CustomAttributes((int)this.MetadataToken)
+            ?? (IReadOnlyList<ClrCustomAttribute>)new ClrCustomAttribute[0];
 
         /// <summary>
         /// True when this MethodDesc carries its own signature instead of pointing at a metadata
@@ -608,7 +622,7 @@ namespace ClrSpector
                 if (methodTable == null || methodTable.Module == IntPtr.Zero)
                     return null;
 
-                return ClrModuleMetadata.AtImageBase(ClrModule.At(methodTable.Module).Base);
+                return ClrModuleMetadata.Of(ClrModule.At(methodTable.Module));
             }
         }
 

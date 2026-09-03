@@ -23,7 +23,7 @@ namespace ClrSpectorConsole
             Section("interfaces", Interfaces);
             Section("names and IL straight from memory", FromMemory);
             Section("IL disassembly", Disassembly);
-            Section("the same IL as low-level C#", CSharpProjection);
+            Section("one method as IL, as C#, and as structured C#", CSharpProjection);
             Section("dispatch: precode and vtable", Dispatch);
             Section("an address back to its method", CodeMap);
             Section("tiering", Tiering);
@@ -36,6 +36,7 @@ namespace ClrSpectorConsole
             Section("assembly metadata: tables, heaps, entries", MetadataTables);
             Section("signatures without reflection", Signatures);
             Section("generics: what metadata cannot tell you", Generics);
+            Section("attributes without constructing them", Attributes);
             Section("one object on the heap", HeapObject);
             Section("the GC heap", Heap);
         }
@@ -147,18 +148,25 @@ namespace ClrSpectorConsole
                 Console.WriteLine($"  {line.TrimEnd()}");
         }
 
+        /// <summary>
+        /// One method rendered three ways, so the difference between them is visible rather than
+        /// described: the IL as it is, the same IL as C# with nothing inferred, and the same IL
+        /// again with the compiler's scaffolding undone.
+        /// </summary>
         private static void CSharpProjection()
         {
-            // Read through the MethodDesc rather than reflection, to show that the projection
-            // needs nothing reflection knows: the locals are typed from the body's own local
+            // Read through the MethodDesc rather than reflection, to show that none of this
+            // needs anything reflection knows: the locals are typed from the body's own local
             // signature, the try and catch blocks come out of its data sections, and the caught
             // type and every operand are named from the module's metadata.
             var fromMemory = ClrMethodIl.Of(
                 ClrObject.From<Order>().MethodTable.FindMethod(nameof(Order.Restock)));
 
-            var projection = fromMemory.ToCSharp();
+            var faithful = fromMemory.ToCSharp();
+            var structured = fromMemory.ToCSharp(ClrCSharpForm.Structured);
 
-            Line("projection", projection.ToString());
+            Line("method", $"{fromMemory.Description.DeclaringTypeName}::{fromMemory.Description.Name}");
+            Line("its source", "ClrSpectorConsole/Order.cs, to read the three views against");
             Line("body in memory", fromMemory.Description.ReadIl().ToString());
 
             foreach (var local in fromMemory.LocalVariables)
@@ -167,11 +175,23 @@ namespace ClrSpectorConsole
             foreach (var region in fromMemory.ExceptionRegions)
                 Line("  region", region.ToString());
 
-            // The same IlDumpStyle as the IL listing, so Auto colours in a terminal and not in
-            // a pipe, and the two dumps share one palette between them.
-            var lines = projection.Dump(IlDumpStyle.Auto).Split(Environment.NewLine);
+            Line("sizes", $"{fromMemory.Instructions.Count} instructions -> " +
+                          $"{faithful.Lines.Count} faithful lines -> {structured.Lines.Count} structured");
 
-            foreach (var line in lines)
+            // All three take the same IlDumpStyle, so Auto colours in a terminal and not in a
+            // pipe, and one palette covers the lot.
+            View("the IL", fromMemory.Dump(IlDumpStyle.Auto));
+            View("as C#, faithful: the stack undone, the control flow as it is", faithful.Dump(IlDumpStyle.Auto));
+            View("as C#, structured: the compiler's scaffolding undone too", structured.Dump(IlDumpStyle.Auto));
+        }
+
+        /// <summary>One rendering of a method, under a heading of its own.</summary>
+        private static void View(string title, string text)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"  -- {title} " + new string('-', Math.Max(0, 71 - title.Length)));
+
+            foreach (var line in text.Split(Environment.NewLine))
                 Console.WriteLine($"  {line.TrimEnd()}");
         }
 
@@ -548,6 +568,88 @@ namespace ClrSpectorConsole
             return ClrMethodTable.IsMethodTableHandle(handle)
                 ? ClrMethodTable.Create(new MemoryReader(handle)).MetadataName
                 : "<type variable>";
+        }
+
+        /// <summary>
+        /// The custom attributes applied to a type, a field, a method and the assembly, with the
+        /// values the source wrote.
+        /// </summary>
+        /// <remarks>
+        /// Reflection can do this, but not without cost: <c>GetCustomAttributes</c> constructs
+        /// each attribute, which runs its constructor in this process, and needs the attribute's
+        /// type to load. Reading the CustomAttribute row instead runs nothing - what comes back
+        /// is the blob the compiler wrote, decoded.
+        /// </remarks>
+        private static void Attributes()
+        {
+            var table = ClrObject.From<Order>().MethodTable;
+
+            foreach (var attribute in table.CustomAttributes)
+                Line("on the type", attribute.ToString());
+
+            // Each argument knows more than the rendering shows: where it came from, how it is
+            // stored, and - for an enum - what its underlying type turned out to be.
+            var detailed = table.CustomAttributes
+                .OrderByDescending(a => a.ConstructorArguments.Count + a.NamedArguments.Count)
+                .First();
+
+            Line(string.Empty, string.Empty);
+            Line("its constructor", detailed.Constructor?.ToString());
+            Line("its blob", $"{detailed.ValueLength} bytes at " +
+                             $"0x{detailed.ValueAddress.ToInt64():x}");
+
+            foreach (var argument in detailed.ConstructorArguments)
+                Line($"  arg {argument.Position} {argument.ParameterName}", Describe(argument));
+
+            foreach (var argument in detailed.NamedArguments)
+                Line($"  {argument.Kind.ToString().ToLowerInvariant()} {argument.Name}", Describe(argument));
+
+            Line(string.Empty, string.Empty);
+
+            var field = table.Fields.FirstOrDefault(f => f.Name == "Quantity");
+            foreach (var attribute in field?.CustomAttributes ?? new ClrCustomAttribute[0])
+                Line("on a field", attribute.ToString());
+
+            var method = table.FindMethod("Describe");
+            foreach (var attribute in method?.CustomAttributes ?? new ClrCustomAttribute[0])
+                Line("on a method", attribute.ToString());
+
+            // The one systematic gap, said out loud rather than papered over: ECMA-335 II.21
+            // attributes are compiled into bits in the defining table, not into rows, so there is
+            // nothing in the CustomAttribute table to find. Reflection synthesises them back.
+            Line(string.Empty, string.Empty);
+            Line("not in the table", "[MethodImpl] is on Describe in source but is a bit in " +
+                                     "MethodDef.ImplFlags, so no row carries it");
+
+            Line(string.Empty, string.Empty);
+            foreach (var attribute in ClrAssembly.Of(typeof(object)).CustomAttributes.Take(4))
+                Line("[assembly:] in CoreLib", attribute.ToString());
+
+            var metadata = ClrModuleMetadata.Of(ClrModule.Of(typeof(object)));
+            var total = 0;
+            var failed = 0;
+
+            foreach (var attribute in metadata.AllCustomAttributes)
+            {
+                total++;
+
+                if (!attribute.IsDecoded)
+                    failed++;
+            }
+
+            Line(string.Empty, string.Empty);
+            Line("CoreLib as a whole", $"{total} attribute rows, {failed} that would not decode");
+        }
+
+        /// <summary>One argument with everything known about it, not just its value.</summary>
+        private static string Describe(ClrAttributeArgument argument)
+        {
+            var stored = argument.Type.IsEnum
+                ? $"{argument.Type.TypeName} stored as {argument.Type.Underlying}" +
+                  (argument.Type.UnderlyingResolved ? string.Empty : " (assumed)")
+                : argument.Type.ToString();
+
+            return $"{argument.Literal(),-40} {stored}";
         }
 
         private static void HeapObject()

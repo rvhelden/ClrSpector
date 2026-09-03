@@ -54,6 +54,31 @@ namespace ClrSpector
         NestedClass = 0x29,
         GenericParam = 0x2A,
         MethodSpec = 0x2B,
-        GenericParamConstraint = 0x2C
+        GenericParamConstraint = 0x2C,
+
+        // ---------- the tables only a portable PDB has ----------
+
+        /// <summary>A source file a method's sequence points refer to.</summary>
+        Document = 0x30,
+
+        /// <summary>A method's sequence points, and the document they are in.</summary>
+        MethodDebugInformation = 0x31,
+
+        /// <summary>
+        /// A lexical scope over a run of IL, holding the locals declared in it - which is where
+        /// a local's name is, since the method body itself records only its type.
+        /// </summary>
+        LocalScope = 0x32,
+
+        /// <summary>One named local variable slot.</summary>
+        LocalVariable = 0x33,
+
+        LocalConstant = 0x34,
+
+        ImportScope = 0x35,
+
+        StateMachineMethod = 0x36,
+
+        CustomDebugInformation = 0x37
     }
 }

@@ -135,6 +135,25 @@ namespace ClrSpector
         }
 
         /// <summary>Reads the runtime's Assembly for the assembly declaring this type.</summary>
+        /// <summary>
+        /// The assembly-level attributes - what source writes as <c>[assembly: ...]</c>.
+        /// </summary>
+        /// <remarks>
+        /// These live on the manifest module's single Assembly row rather than on any type, which
+        /// is why they are reached from here and not from a MethodTable.
+        /// </remarks>
+        public IReadOnlyList<ClrCustomAttribute> CustomAttributes
+        {
+            get
+            {
+                var manifest = this.ManifestModule;
+
+                return manifest == null || manifest.Base == IntPtr.Zero
+                    ? new ClrCustomAttribute[0]
+                    : ClrModuleMetadata.Of(manifest).AssemblyAttributes;
+            }
+        }
+
         public static ClrAssembly Of(Type typeInAssembly)
         {
             if (typeInAssembly == null) throw new ArgumentNullException(nameof(typeInAssembly));
