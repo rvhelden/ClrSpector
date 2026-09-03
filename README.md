@@ -57,6 +57,13 @@ Console.WriteLine(MethodPrecode.Of(typeof(PriceService).GetMethod("GetPrice")));
   - [Writing a proxy](#writing-a-proxy)
   - [Inspecting a precode yourself](#inspecting-a-precode-yourself)
 - [Project layout](#project-layout)
+- [Walking the GC heap](#walking-the-gc-heap)
+  - [The GC has its own, unexported descriptor](#the-gc-has-its-own-unexported-descriptor)
+  - [Generations, segments and regions](#generations-segments-and-regions)
+  - [Sizing an object](#sizing-an-object)
+  - [The gaps that make a naive walk lie](#the-gaps-that-make-a-naive-walk-lie)
+  - [Reading a heap that is moving](#reading-a-heap-that-is-moving)
+  - [What is not covered](#what-is-not-covered)
 - [Building and testing](#building-and-testing)
 - [Platform support](#platform-support)
 
@@ -588,23 +595,64 @@ an interface, mocking through the interface is the better tool.
 A mismatched replacement would corrupt the stack, so pairings are validated up front and refused
 with `MethodDetourException` rather than producing undefined behaviour at the call. Return types
 must match, and so must the **effective** parameter lists — where "effective" accounts for an
-instance method receiving its declaring type as a leading `this`:
-
-```csharp
-private static IEnumerable<Type> EffectiveParameters(MethodBase method)
-{
-    var parameters = new List<Type>();
-
-    if (!method.IsStatic)
-        parameters.Add(method.DeclaringType);          // the implicit 'this'
-
-    parameters.AddRange(method.GetParameters().Select(p => p.ParameterType));
-
-    return parameters;
-}
-```
+instance method receiving its declaring type as a leading `this` (by reference, when that type is
+a struct). Generic methods, methods on generic types, varargs methods and methods on value types
+are refused outright: each needs a hidden argument, or has an entry point, that a redirect cannot
+honour.
 
 A refused redirect leaves the target callable — also asserted.
+
+### The hidden return buffer
+
+Matching parameter lists are not enough, because they are not the whole frame. Arguments are
+passed in this order:
+
+```
+[this] [return buffer] [generics context | varargs cookie] [user arguments]*
+```
+
+A return value too large for a register is written through a hidden pointer the caller supplies,
+and on x64 that pointer is an ordinary argument sitting **after** `this`. So an instance method
+returning a `decimal` receives `(this, returnBuffer, sku)`, while a static stand-in taking the
+instance first receives `(returnBuffer, instance, sku)`. Everything is shifted by one: the
+instance is reinterpreted as a buffer, and the return value is written over the target object.
+
+Measured, with a static stand-in patched directly into a `decimal`-returning instance method:
+
+```
+[retbuf] redirected: result=0 (want 42)                 <- caller's buffer never written
+[retbuf] marker=0x2a (want 0x1122334455667788)          <- 42 written INTO the target object
+Fatal error. Internal CLR error.                        <- next GC dies on the trampled object
+```
+
+arm64 escapes this: it has a dedicated return-buffer register (`x8`) outside the argument
+sequence, so nothing shifts.
+
+The fix is a generated **thunk**, described below.
+
+### Thunks: proxy objects, and repairing the shift
+
+Two pairings cannot occupy a dispatch slot as they are, and both are wired up through a small
+generated adapter instead:
+
+| Pairing | Why it needs an adapter |
+|---|---|
+| `AbiShim` | A static stand-in for an instance method whose return value travels in a hidden buffer — the shift above. |
+| `ReceiverShift` | An **instance** stand-in: a proxy object, whose own receiver has to come from somewhere. A slot holds a code address and nothing else. |
+
+The adapter is emitted as **IL and compiled by the JIT**, never as hand-written machine code. The
+argument shuffle then comes from the same compiler that produced both call frames, so return
+buffers, floating-point registers, spilling to the stack and x64-versus-arm64 differences are all
+handled by something that already knows the answer.
+
+It is emitted as an **instance** method whenever the target is one, so the adapter's receiver
+occupies the same slot as the target's and nothing behind it moves. That is also why
+`DynamicMethod` cannot serve here: it is always static, which is precisely the broken shape.
+`TypeBuilder` it is — which also yields a real `MethodHandle`, so no private reflection is needed
+to find an entry point, and non-collectible code, so the adapter cannot be freed while a slot
+still points at it.
+
+`detour.Pairing`, `detour.UsesThunk` and `detour.ThunkEntryPoint` report which path was taken.
 
 ### Limits you must know
 
@@ -626,9 +674,8 @@ with two tests fighting over one slot.
 
 ### Writing a proxy
 
-Prefer a **static** replacement whose first parameter stands in for the instance. A differently
-typed *instance* replacement would receive a `this` of the wrong type — it may appear to work while
-the proxy happens not to touch any fields, and corrupt memory as soon as it does.
+A **static** replacement whose first parameter stands in for the instance is the simplest shape,
+and the only one that reaches the target's slot directly:
 
 ```csharp
 // production code: concrete, no interface, nothing virtual
@@ -667,6 +714,56 @@ public async Task UsesThePriceFromTheService()
 
 `MethodDetour.Redirect` also takes `MethodBase` overloads directly when you need to pick a specific
 overload.
+
+### Writing a proxy with state
+
+When the stand-in needs state of its own, write it as an ordinary **instance** method whose
+parameters match what the target receives, and pass the object alongside it. A generated thunk
+supplies the receiver:
+
+```csharp
+public class PriceServiceProxy
+{
+    public readonly List<string> Seen = new List<string>();
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public decimal GetPrice(PriceService instance, string sku)
+    {
+        this.Seen.Add(sku);                    // the proxy's own state
+
+        return 42m + instance.FixedPrice;      // and the real instance
+    }
+}
+
+var proxy = new PriceServiceProxy();
+
+using (MethodDetour.Redirect(
+           typeof(PriceService), nameof(PriceService.GetPrice),
+           proxy, nameof(PriceServiceProxy.GetPrice)))
+{
+    await Assert.That(new PriceService().GetPrice("abc")).IsEqualTo(142m);
+}
+
+await Assert.That(proxy.Seen).IsEquivalentTo(new[] { "abc" });
+```
+
+A delegate carries its receiver, so a method group or a closure works too — useful for a one-line
+stand-in over captured state:
+
+```csharp
+var captured = 7m;
+
+using (MethodDetour.Redirect(
+           typeof(PriceService).GetMethod(nameof(PriceService.GetPrice)),
+           (Func<PriceService, string, decimal>)((instance, sku) => captured)))
+{
+    ...
+}
+```
+
+The proxy is bound to the redirect, not baked into the adapter, so disposing releases it rather
+than leaking it for the life of the process. The adapter code itself is emitted once per distinct
+pairing and is never reclaimed.
 
 ### Inspecting a precode yourself
 
@@ -731,6 +828,8 @@ detour.IsActive         // false after Dispose
 src/ClrSpector/                     the library
   Cdac/                             the runtime's self-description
     ContractDescriptor.cs           resolve the export, validate, parse the JSON
+    GcContractDescriptor.cs         find the GC's unexported descriptor by scanning
+    ProcessMemoryRegions.cs         what is mapped, so a scan or a walk cannot fault
     DataType.cs / FieldLayout.cs    a structure layout: field → offset, plus size
     Globals.cs                      literal and pointer-data globals
   Detours/
@@ -743,11 +842,181 @@ src/ClrSpector/                     the library
   ClrEEClass.cs                     the cold half of a type
   Methods/ClrMethodTable.cs         the hot half, plus the MethodDescChunk walk
   Methods/ClrMethodDescription.cs   one method, plus token reconstruction
+  Methods/MethodDescSizes.cs        MethodDesc sizes, rebuilt from the descriptor
+  Gc/
+    ClrGcHeap.cs                    entry point, and the object walk
+    ClrGeneration.cs                the generation table
+    ClrHeapSegment.cs               one segment or region, and its bounds
+    ClrHeapLayouts.cs               offsets and rules hoisted out of the walk
+    AllocationHoles.cs              the per-thread buffers a walk must step over
+    GcWalkScope.cs                  hold off collection, and report if it happened
+  ClrHeapObject.cs                  one object instance: its type and its size
   MemoryReader.cs                   offset-addressed reads
 
 src/ClrSpectorConsole/              prints decoded types next to the reflection view
 src/ClrSpectorTests/                TUnit tests
 ```
+
+## Walking the GC heap
+
+`ClrGcHeap` reads the GC's own structures: the generations, the segments (regions, on .NET 11) that
+objects are laid out in, and the objects themselves.
+
+```csharp
+// Enter the scope FIRST - establishing it collects, which moves objects and
+// rebuilds the region lists, so a snapshot taken earlier would be stale.
+using var scope = GcWalkScope.Enter();
+var heap = ClrGcHeap.Refresh();
+
+Console.WriteLine(heap);
+// gc heap "workstation, regions, background," generations=5 segments=23 live=499000
+
+foreach (var generation in heap.Generations)
+{
+    Console.WriteLine(generation);            // gen4 (POH) segments=1 live=8184
+    foreach (var segment in generation.Segments)
+        Console.WriteLine("   " + segment);   // segment @0x… gen=4 mem=0x… live=8184 …
+}
+
+foreach (var instance in heap.EnumerateObjects(scope))
+    Console.WriteLine(instance);              // object @0x… size=40 mt=0x…
+
+scope.ThrowIfInvalidated();
+```
+
+It is read-only. Nothing here writes to a GC structure, and nothing should: mutating them from
+inside the process being collected corrupts the heap, and there is no in-process primitive that
+makes it sound. `GC.TryStartNoGCRegion` is the only supported lever over collection, and
+`GcWalkScope` uses it for exactly that.
+
+### The GC has its own, unexported descriptor
+
+The GC heap layouts are **not** in `DotNetRuntimeContractDescriptor`. The GC is pluggable, so its
+descriptor cannot be a fixed export of the runtime — and it is not reachable from any export, nor
+from any global in the runtime descriptor.
+
+What the runtime does instead is embed one descriptor per GC flavour it was built with, and leave
+them in its data section. On .NET 11 x64 there are three `DNCCDAC` headers a few kilobytes apart:
+
+| `.data` RVA | Contracts | `GCIdentifiers` |
+|---|---|---|
+| `0x45d940` | `GC: c1` (10 types, 45 globals) | `workstation, regions, background,` |
+| `0x45d968` | `GC: c1` (11 types, 29 globals) | `server, regions, background, dynamic_heap` |
+| `0x460020` | the 32 runtime contracts | — (this one is the export) |
+
+Only one of them describes the GC actually running. `GcContractDescriptor` finds them by scanning
+the runtime module's readable regions for the header magic, and picks the one whose
+`GCIdentifiers` matches `GCSettings.IsServerGC`. An ambiguous or empty result fails loudly, because
+picking the wrong one would not crash — it would report a plausible but wrong heap.
+
+The scan is driven by the operating system's own memory map rather than a fixed window around the
+export, because an access violation in a process reading its own internals cannot be caught. It
+takes the process down.
+
+**.NET 10 publishes no GC descriptor at all.** Its single descriptor blob describes no segment,
+region, generation or heap, and there is no `g_gcDacGlobals` export to fall back on. That is why
+heap walking needs .NET 11.
+
+Under a standalone GC (`DOTNET_GCName`, `clrgc.dll`) the descriptors live in that module instead —
+it carries two of its own.
+
+### Generations, segments and regions
+
+There are **five** generations, not three: gen0–gen2 are the small object heap, and the two beyond
+`MaxGeneration` are the large and pinned object heaps. The count comes from the descriptor's
+`TotalGenerationCount` rather than being assumed.
+
+Workstation GC keeps one heap, and the descriptor's globals point straight at that heap's fields,
+so the generation table is the array at `GCHeapGenerationTable`'s own address — `Globals.Address`,
+not `Dereference`. `MaxGeneration` is the opposite trap: it is an int-sized variable, so it is read
+*at* the symbol's address; dereferencing it as a pointer yields nonsense.
+
+Each generation's `StartSegment` heads a `Next` chain of `HeapSegment`. The four bounds nest —
+`Mem <= Allocated <= Committed <= Reserved` — and objects live in `[Mem, Allocated)`.
+
+Two kinds of segment break the obvious rules:
+
+- **Frozen segments** (`IsReadOnly`) hold objects baked into a ReadyToRun image, literal strings and
+  the like. They are mapped from the image, so they sit *outside*
+  `GCLowestAddress`/`GCHighestAddress` and the range check does not apply to them.
+- **The ephemeral segment** (`IsEphemeral`) reports `Allocated == Mem` on a live heap, because the
+  GC only writes that field back when it collects. Its real end is the GC's `alloc_allocated`
+  counter, so that is what bounds the walk there.
+
+### Sizing an object
+
+An object's MethodTable pointer needs the GC's mark and pin bits cleared with
+`ObjectToMethodTableUnmask` — an unmasked read gives an address that is wrong for part of every
+collection. The size is then `BaseSize`, plus `ComponentCount * ComponentSize` for an array or
+string, rounded up to pointer alignment with a three-pointer minimum.
+
+`BaseSize` is measured from the object *header*, not from the MethodTable pointer, which is why a
+class with three `long` fields comes out at 40 bytes rather than 32. The walk advances from one
+object's MethodTable pointer by exactly this size and lands on the next one's — the same arithmetic
+the GC does.
+
+Sizing reads the two MethodTable fields it needs directly rather than going through
+`ClrMethodTable.Create`. That decode also resolves the `EEClass`, which is both far more work per
+object and not reachable for every MethodTable found on the heap — the `Free` type's, for one. The
+full decode is still available lazily on `ClrHeapObject.MethodTable`.
+
+### The gaps that make a naive walk lie
+
+This is the part that matters. The GC hands **each thread** its own zeroed allocation buffer, and
+only the part a thread has used holds objects; the rest sits as a run of zeroes in the middle of
+the range the walk covers. So a bump walk hits zeroes long before the end of gen0.
+
+Both obvious responses are wrong:
+
+- **Stop at the first gap** and the walk is safe but reports about 13% of the heap.
+- **Scan forward past the zeroes** and it reports about 98% — until a thread allocates into that
+  buffer while the walk is in progress. Then the object it writes starts at the buffer's own
+  pointer, possibly behind where the scan has reached, and resuming there lands mid-object and
+  reads a field as a MethodTable.
+
+So the buffers are located up front instead, by walking the runtime's thread list:
+`ThreadStore.FirstThreadLink` is a `Thread*`, each thread's successor is at its own `LinkNext`, and
+its buffer is at `RuntimeThreadLocals.AllocContext` → `EEAllocContext.GCAllocationContext` →
+`GCAllocContext.Pointer`/`Limit`. Skipping `[Pointer, Limit)` exactly gives **98% coverage with no
+guessing**.
+
+One detail took a while to find: the unusable span runs a minimum object's worth *past* `Limit` —
+the allocator keeps that headroom so an abandoned buffer can always be filled with a free-object
+filler. Those bytes are zero too, so a skip that stops at `Limit` exactly lands back in them and
+the walk gives up 24 bytes later.
+
+`Thread` has no published size, incidentally, so the readability probe covers exactly the fields
+being read. Using the absent size makes every probe zero-length, which reads as unreadable — and
+then no buffers are collected at all, silently, and you are back to the 13% case.
+
+### Reading a heap that is moving
+
+Walking a live heap from inside it is not the same as walking a suspended target. The honest limits:
+
+- `GcWalkScope` commits enough memory up front that no collection is needed, so nothing moves. The
+  budget can still be exhausted, at which point a collection happens anyway — so the collection
+  counts are compared and `CollectionOccurred` / `ThrowIfInvalidated` say whether the results can
+  be trusted. `EnumerateObjects(scope)` also abandons the walk as soon as it notices one.
+- A region can be **decommitted** underneath the walk when a collection runs, and reading a
+  decommitted page is fatal to the process. Every page is checked before it is read, and the answer
+  memoised, so it costs one system call per four kilobytes walked rather than one per object.
+- The ephemeral segment's contents are genuinely in motion. A boundary the walk cannot make sense
+  of there ends the segment; in a settled segment the same thing is a hard error, because there it
+  really would mean the layout was misread.
+- Don't allocate heavily while enumerating. The walk is a snapshot read, and a consumer that
+  allocates per object both eats the no-GC budget and pushes the buffers the walk steps around.
+
+### What is not covered
+
+- **Server GC.** Its descriptor is found and selected correctly, but reading the per-core heaps
+  needs the `Heaps`/`NumHeaps` globals and the `GCHeap` type. `ClrGeneration` fails loudly rather
+  than pretending; workstation GC only for now.
+- **Some regions do not decode.** After repeated forced collections a minority of regions hold data
+  the bump walk cannot follow, and the walk raises rather than fabricating objects. What is in them
+  is not yet understood — most likely regions on a free list or not yet swept, which would need the
+  `GCHeapFreeRegions` and swept-flag state to identify and skip.
+- **Roots.** This walks the heap by address, not by reachability. Nothing here enumerates roots or
+  says whether an object is live.
 
 ## Building and testing
 
@@ -778,14 +1047,32 @@ descriptor's own globals against `typeof(object|string|object[]).TypeHandle.Valu
 
 ## Platform support
 
-Verified on **.NET 10.0.4, linux-x64**. `Architecture` and `OperatingSystem` are descriptor
-globals, so the inspector is portable in principle, but arm64 and Windows are unverified and the
-detour is x64/POSIX-specific as noted above.
+Targets **.NET 11**. The type decoding and the GC heap walk are verified on
+**.NET 11.0.0-preview.7.26381.103, win-x64**. `Architecture` and `OperatingSystem` are descriptor
+globals, so the inspector is portable in principle, but arm64 and macOS are unverified.
+
+The GC heap walk additionally needs the process's memory map, to find the GC descriptor and to
+avoid reading a page that has been decommitted. That is implemented for Windows and Linux;
+elsewhere it fails loudly rather than guessing. Type decoding and detouring are unaffected.
 
 The contract descriptor is a diagnostics contract — deliberately versioned and far more stable than
 raw offsets, but not a public API surface, and it is intended for *out-of-process* use. Reading it
-in-process works because the target is the current process. `descriptor.version` is `0` today;
-treat a bump as a signal to re-verify, which is what the fail-loud checks exist for.
+in-process works because the target is the current process. Treat a version bump as a signal to
+re-verify, which is what the fail-loud checks exist for.
+
+.NET 11 moved the goalposts twice in ways worth recording, because both are silent traps:
+
+- **Contract versions became strings.** `"ExecutionManager": 2` is now `"ExecutionManager": "c2"`,
+  and every contract in the 11.0 descriptor uses that form. Code that called `GetInt32()` on it
+  threw. Both encodings are accepted now.
+- **`MethodDescSizeTable` was removed.** It was a byte table mapping a MethodDesc's classification
+  to its size, and stepping through a `MethodDescChunk` needs that size. It is not a loss of
+  information: the table only precomputes "sizeof the concrete MethodDesc subclass, plus the
+  optional trailing slots", and the descriptor still publishes the size of every one of those
+  types. `MethodDescSizes` reconstructs it. The chunk walk cross-checks every step against each
+  MethodDesc's own `ChunkIndex`, which is what proved the reconstruction right.
+
+Also gone in 11.0: the `ObjectHeaderSize` global and the `ArrayClass` and `GCHandle` types.
 
 ## Licence
 

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -108,12 +109,27 @@ namespace ClrSpector.Cdac
 
         private static ContractDescriptor Load()
         {
-            var header = (Header*)ResolveSymbol();
+            return FromHeader(ResolveSymbol(), $"the '{SymbolName}' export");
+        }
+
+        /// <summary>
+        /// Parses a descriptor from the address of its <c>DNCCDAC</c> header.
+        /// </summary>
+        /// <remarks>
+        /// The exported <c>DotNetRuntimeContractDescriptor</c> is not the only descriptor a
+        /// runtime publishes: the GC's own contract is a second, unexported header that has to be
+        /// found by other means (see <see cref="GcContractDescriptor"/>). Both share this header
+        /// format, so both are parsed here. <paramref name="origin"/> only names the source in
+        /// failure messages.
+        /// </remarks>
+        internal static ContractDescriptor FromHeader(IntPtr headerAddress, string origin)
+        {
+            var header = (Header*)headerAddress;
 
             var magic = new ReadOnlySpan<byte>((byte*)&header->Magic, MagicBytes.Length);
             if (!magic.SequenceEqual(MagicBytes))
                 throw new ClrSpectorUnsupportedRuntimeException(
-                    $"The '{SymbolName}' export does not begin with the expected magic value.");
+                    $"{origin} does not begin with the expected magic value.");
 
             var is64Bit = (header->Flags & Flags64Bit) != 0;
             if (is64Bit != (IntPtr.Size == 8))
@@ -130,7 +146,11 @@ namespace ClrSpector.Cdac
             return Parse(json, header->PointerData, header->PointerDataCount);
         }
 
-        private static IntPtr ResolveSymbol()
+        /// <summary>
+        /// The address of the runtime's exported descriptor header. Also the anchor
+        /// <see cref="GcContractDescriptor"/> searches around for the unexported GC header.
+        /// </summary>
+        internal static IntPtr ResolveSymbol()
         {
             var attempts = new List<string>();
 
@@ -172,7 +192,9 @@ namespace ClrSpector.Cdac
             var root = document.RootElement;
 
             var version = root.TryGetProperty("version", out var versionElement) ? versionElement.GetInt32() : 0;
-            var baseline = root.TryGetProperty("baseline", out var baselineElement) ? baselineElement.GetString() : null;
+            var baseline = root.TryGetProperty("baseline", out var baselineElement)
+                ? baselineElement.GetString()
+                : null;
 
             var types = new Dictionary<string, DataType>(StringComparer.Ordinal);
             if (root.TryGetProperty("types", out var typesElement))
@@ -192,7 +214,8 @@ namespace ClrSpector.Cdac
             if (root.TryGetProperty("contracts", out var contractsElement))
             {
                 foreach (var contractProperty in contractsElement.EnumerateObject())
-                    contracts.Add(contractProperty.Name, contractProperty.Value.GetInt32());
+                    contracts.Add(contractProperty.Name,
+                        ParseContractVersion(contractProperty.Name, contractProperty.Value));
             }
 
             return new ContractDescriptor(
@@ -201,6 +224,41 @@ namespace ClrSpector.Cdac
                 types,
                 new Globals(globalValues, pointerData, pointerDataCount),
                 contracts);
+        }
+
+        /// <summary>
+        /// A contract's version, which the descriptor encodes in one of two ways.
+        /// </summary>
+        /// <remarks>
+        /// Up to .NET 10 a version was a bare JSON number (<c>"ExecutionManager": 2</c>). From
+        /// .NET 11 it is the string <c>"c&lt;N&gt;"</c> instead (<c>"ExecutionManager": "c2"</c>),
+        /// and every contract in the 11.0 descriptor uses that form. Both are accepted so the
+        /// same build reads either runtime; anything else fails loudly rather than defaulting to
+        /// a version this code might then wrongly believe it understands.
+        /// </remarks>
+        private static int ParseContractVersion(string name, JsonElement element)
+        {
+            if (element.ValueKind == JsonValueKind.Number)
+                return element.GetInt32();
+
+            if (element.ValueKind == JsonValueKind.String)
+            {
+                var text = element.GetString();
+                if (text != null
+                    && text.Length > 1
+                    && (text[0] == 'c' || text[0] == 'C')
+                    && int.TryParse(text.Substring(1), NumberStyles.None, CultureInfo.InvariantCulture, out var parsed))
+                {
+                    return parsed;
+                }
+
+                throw new ClrSpectorUnsupportedRuntimeException(
+                    $"Contract '{name}' has version '{text}', which is neither a number nor the " +
+                    $"expected 'c<N>' form.");
+            }
+
+            throw new ClrSpectorUnsupportedRuntimeException(
+                $"Contract '{name}' has an unexpected version encoding ({element.ValueKind}).");
         }
 
         /// <summary>

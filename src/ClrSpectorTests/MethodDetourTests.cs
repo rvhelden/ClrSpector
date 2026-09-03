@@ -12,6 +12,8 @@ namespace ClrSpectorTests
     /// <summary>The concrete class under test - no interface, nothing virtual.</summary>
     public class PriceService
     {
+        public decimal FixedPrice = 100m;
+
         [MethodImpl(MethodImplOptions.NoInlining)]
         public decimal GetPrice(string sku) => 100m;
 
@@ -20,8 +22,8 @@ namespace ClrSpectorTests
     }
 
     /// <summary>
-    /// Stand-ins. Instance replacements are declared static with a leading parameter for the
-    /// instance, so the redirected call never reinterprets 'this' as the wrong type.
+    /// Stand-ins. A stand-in for an instance method is declared static with a leading parameter
+    /// for the instance, so the redirected call never reinterprets 'this' as the wrong type.
     /// </summary>
     public static class PriceServiceProxy
     {
@@ -182,28 +184,33 @@ namespace ClrSpectorTests
     /// <summary>A concrete type with virtual members, and no interface in sight.</summary>
     public class Repository
     {
-        [MethodImpl(MethodImplOptions.NoInlining)] public virtual string Load(int id) => $"real-{id}";
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public virtual string Load(int id) => $"real-{id}";
     }
 
     public class CachingRepository : Repository
     {
-        [MethodImpl(MethodImplOptions.NoInlining)] public override string Load(int id) => $"cached-{id}";
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public override string Load(int id) => $"cached-{id}";
     }
 
     public abstract class ReportBase
     {
-        [MethodImpl(MethodImplOptions.NoInlining)] public abstract string Render();
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public abstract string Render();
     }
 
     public sealed class Report : ReportBase
     {
-        [MethodImpl(MethodImplOptions.NoInlining)] public override string Render() => "real-report";
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public override string Render() => "real-report";
     }
 
     /// <summary>A method that also implements an interface member.</summary>
     public class Exporter : IExporter
     {
-        [MethodImpl(MethodImplOptions.NoInlining)] public string Export() => "real-export";
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public string Export() => "real-export";
     }
 
     public interface IExporter
@@ -213,10 +220,17 @@ namespace ClrSpectorTests
 
     public static class RepositoryProxy
     {
-        [MethodImpl(MethodImplOptions.NoInlining)] public static string Load(Repository self, int id) => $"proxy-{id}";
-        [MethodImpl(MethodImplOptions.NoInlining)] public static string LoadCaching(CachingRepository self, int id) => $"proxy-cached-{id}";
-        [MethodImpl(MethodImplOptions.NoInlining)] public static string Render(Report self) => "proxy-report";
-        [MethodImpl(MethodImplOptions.NoInlining)] public static string Export(Exporter self) => "proxy-export";
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static string Load(Repository self, int id) => $"proxy-{id}";
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static string LoadCaching(CachingRepository self, int id) => $"proxy-cached-{id}";
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static string Render(Report self) => "proxy-report";
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static string Export(Exporter self) => "proxy-export";
     }
 
     /// <summary>
@@ -227,7 +241,7 @@ namespace ClrSpectorTests
     public class VirtualMethodDetourTests
     {
         private const BindingFlags All = BindingFlags.Public | BindingFlags.NonPublic
-                                         | BindingFlags.Instance | BindingFlags.Static;
+                                                             | BindingFlags.Instance | BindingFlags.Static;
 
         [Test]
         public async Task RedirectsVirtualMethodAndRestoresOnDispose()
@@ -237,7 +251,7 @@ namespace ClrSpectorTests
             await Assert.That(repository.Load(1)).IsEqualTo("real-1");
 
             using (MethodDetour.Redirect(typeof(Repository), nameof(Repository.Load),
-                                         typeof(RepositoryProxy), nameof(RepositoryProxy.Load)))
+                       typeof(RepositoryProxy), nameof(RepositoryProxy.Load)))
             {
                 await Assert.That(repository.Load(1)).IsEqualTo("proxy-1");
             }
@@ -295,7 +309,7 @@ namespace ClrSpectorTests
             Repository overriding = new CachingRepository();
 
             using (MethodDetour.Redirect(typeof(Repository), nameof(Repository.Load),
-                                         typeof(RepositoryProxy), nameof(RepositoryProxy.Load)))
+                       typeof(RepositoryProxy), nameof(RepositoryProxy.Load)))
             {
                 await Assert.That(new Repository().Load(3)).IsEqualTo("proxy-3");
                 await Assert.That(overriding.Load(3)).IsEqualTo("cached-3");
@@ -310,7 +324,7 @@ namespace ClrSpectorTests
             await Assert.That(report.Render()).IsEqualTo("real-report");
 
             using (MethodDetour.Redirect(typeof(Report), nameof(Report.Render),
-                                         typeof(RepositoryProxy), nameof(RepositoryProxy.Render)))
+                       typeof(RepositoryProxy), nameof(RepositoryProxy.Render)))
             {
                 await Assert.That(report.Render()).IsEqualTo("proxy-report");
             }
@@ -365,5 +379,4 @@ namespace ClrSpectorTests
             await Assert.That(exporter.Export()).IsEqualTo("real-export");
         }
     }
-
 }

@@ -83,10 +83,19 @@ namespace ClrSpectorTests
             await Assert.That(globals.Text("Architecture")).IsNotEmpty();
         }
 
+        /// <summary>
+        /// A global naming an array is already at the address the pointer-data table gives, so
+        /// it is read with Address rather than Dereference.
+        /// </summary>
+        /// <remarks>
+        /// This used to assert on MethodDescSizeTable, which .NET 11 removed. ArrayBoundsZero is
+        /// the same shape - the runtime's shared all-zeroes array bounds - and is published by
+        /// both runtimes.
+        /// </remarks>
         [Test]
         public async Task TableGlobalsExposeTheirAddressWithoutDereferencing()
         {
-            await Assert.That(ContractDescriptor.Current.Globals.Address("MethodDescSizeTable"))
+            await Assert.That(ContractDescriptor.Current.Globals.Address("ArrayBoundsZero"))
                 .IsNotEqualTo(IntPtr.Zero);
         }
 

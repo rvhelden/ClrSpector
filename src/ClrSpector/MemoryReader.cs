@@ -43,6 +43,16 @@ namespace ClrSpector
 
         public int ReadInt(int offset) => *(int*)this.At(offset);
 
+        public ulong ReadULong(int offset) => *(ulong*)this.At(offset);
+
+        public long ReadLong(int offset) => *(long*)this.At(offset);
+
+        /// <summary>
+        /// A pointer-sized unsigned value, for fields the descriptor types as a target pointer
+        /// but which hold a count rather than an address - the GC's heap count, for instance.
+        /// </summary>
+        public nuint ReadNUInt(int offset) => *(nuint*)this.At(offset);
+
         public IntPtr ReadIntPtr(int offset) => *(IntPtr*)this.At(offset);
 
         /// <summary>A reader positioned at the pointer stored at <paramref name="offset"/>.</summary>
@@ -51,6 +61,16 @@ namespace ClrSpector
         /// <summary>A reader positioned <paramref name="offset"/> bytes further along.</summary>
         public MemoryReader Offset(int offset) => new MemoryReader(this.At(offset));
 
+        /// <summary>
+        /// A reader positioned <paramref name="delta"/> bytes further along.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="Offset"/> takes an int because structure offsets are small and known. A
+        /// heap walk instead advances by a computed object size and accumulates across a whole
+        /// segment, which needs the wider type.
+        /// </remarks>
+        public MemoryReader Add(long delta) => new MemoryReader((byte*)this.BasePointer + delta);
+
         public string ReadNullTerminatedString(int offset)
         {
             var start = (byte*)this.At(offset);
@@ -58,7 +78,7 @@ namespace ClrSpector
                 return null;
 
             var builder = new StringBuilder();
-            for (var i = 0; ; i++)
+            for (var i = 0;; i++)
             {
                 var value = start[i];
                 if (value == 0)

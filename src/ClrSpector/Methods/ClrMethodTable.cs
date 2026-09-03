@@ -15,7 +15,10 @@ namespace ClrSpector
     public unsafe class ClrMethodTable
     {
         /// <summary>Set when the low word of MTFlags holds a component size instead of flags.</summary>
-        private const uint HasComponentSizeFlag = 0x80000000;
+        internal const uint HasComponentSizeFlag = 0x80000000;
+
+        /// <summary>The component size, when <see cref="HasComponentSizeFlag"/> is set.</summary>
+        internal const uint ComponentSizeMask = 0x0000FFFF;
 
         /// <summary>Selects the type's category from the high word of MTFlags.</summary>
         private const uint CategoryMask = 0x000F0000;
@@ -180,10 +183,14 @@ namespace ClrSpector
         /// <remarks>
         /// A chunk stores biased values: the real method count is Count + 1 and the real chunk
         /// size is (Size + 1) * MethodDescAlignment. Each MethodDesc's own byte size varies with
-        /// its classification, so stepping through a chunk uses the runtime's classification
-        /// size table. Every step is cross-checked against the MethodDesc's own ChunkIndex,
-        /// which independently records where it sits - so a wrong step is caught rather than
-        /// silently yielding a bogus method.
+        /// its classification, but every MethodDesc *within one chunk* is the same size, so the
+        /// stride is the chunk's MethodDesc region divided by its method count.
+        ///
+        /// Up to .NET 10 the runtime published a MethodDescSizeTable global that mapped a
+        /// classification to a size, and that is used when present. .NET 11 removed the global,
+        /// so the stride is derived from the chunk instead. Either way every step is cross-checked
+        /// against the MethodDesc's own ChunkIndex, which independently records where it sits -
+        /// so a wrong step is caught rather than silently yielding a bogus method.
         /// </remarks>
         private static List<ClrMethodDescription> ReadMethods(IntPtr firstChunk, ContractDescriptor descriptor)
         {
@@ -195,7 +202,7 @@ namespace ClrSpector
             var chunkHeaderSize = (int)chunkLayout.RequiredSize;
             var alignment = (int)descriptor.Globals.Number("MethodDescAlignment");
             var tokenRemainderBits = (int)descriptor.Globals.Number("MethodDescTokenRemainderBitCount");
-            var sizeTable = (byte*)descriptor.Globals.Address("MethodDescSizeTable");
+            var sizes = new MethodDescSizes(descriptor);
 
             var nextOffset = chunkLayout["Next"];
             var countOffset = chunkLayout["Count"];
@@ -218,13 +225,11 @@ namespace ClrSpector
                         throw new ClrSpectorUnsupportedRuntimeException(
                             $"MethodDesc {i} in the chunk at 0x{chunk.ToInt64():x} reports ChunkIndex " +
                             $"{method.ChunkIndex} (offset {method.ChunkIndex * alignment}) but was read at " +
-                            $"offset {offset}. The MethodDesc size table is not being indexed correctly.");
+                            $"offset {offset}. The computed MethodDesc size is wrong.");
 
                     methods.Add(method);
 
-                    var sizeIndex = (method.Flags & ClrMethodDescription.ClassificationMask)
-                                    | (method.Flags & ClrMethodDescription.SizeAffectingFlagsMask);
-                    offset += sizeTable[sizeIndex];
+                    offset += sizes.SizeOf(method.Flags);
                 }
 
                 chunk = chunkReader.ReadIntPtr(nextOffset);
