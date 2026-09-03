@@ -79,8 +79,8 @@ namespace ClrSpectorTests
 
         /// <summary>
         /// Three cases is few enough that the compiler tests them one at a time rather than with
-        /// a switch instruction, so this is a chain of conditional jumps - a shape the
-        /// projection cannot prove into anything, and has to leave alone.
+        /// a switch instruction, so this is a chain of conditional jumps - and structures like
+        /// any other chain of them.
         /// </summary>
         public string Switchy(int n)
         {
@@ -88,6 +88,25 @@ namespace ClrSpectorTests
             {
                 case 0: return "zero";
                 case 1: return "one";
+                default: return "many";
+            }
+        }
+
+        /// <summary>
+        /// Dense enough that the compiler emits the <c>switch</c> instruction - a jump table -
+        /// rather than a chain of comparisons. The projection does not model a jump table, so
+        /// this is the shape it leaves alone.
+        /// </summary>
+        public string Dense(int n)
+        {
+            switch (n)
+            {
+                case 0: return "zero";
+                case 1: return "one";
+                case 2: return "two";
+                case 3: return "three";
+                case 4: return "four";
+                case 5: return "five";
                 default: return "many";
             }
         }
@@ -224,18 +243,38 @@ namespace ClrSpectorTests
         }
 
         /// <summary>
-        /// The refusal case, which matters as much as the rewrites: a chain of conditional jumps
-        /// is not a shape the passes model, so it stays a chain of conditional jumps.
+        /// The refusal case, which matters as much as the rewrites: a jump table is not a shape
+        /// the passes model, so a switch that compiles to one keeps its jumps.
         /// </summary>
         [Test]
         public async Task LeavesAloneAShapeItCannotProve()
         {
-            var dump = Structured(nameof(StructuringSample.Switchy));
+            var dump = Structured(nameof(StructuringSample.Dense));
 
-            await Assert.That(dump).Contains("goto IL_");
+            // The switch instruction and its cases are printed as they are, and nothing tries
+            // to lift the arms into them.
+            await Assert.That(dump).Contains("switch (");
+            await Assert.That(dump).Contains("case 0: goto IL_");
+            await Assert.That(dump).Contains("case 5: goto IL_");
 
             // The returns still collapse, because that pass can prove its own shape.
             await Assert.That(dump).Contains("return \"zero\";");
+        }
+
+        /// <summary>
+        /// A switch the compiler tests one case at a time is a chain of conditional jumps, and
+        /// each arm is reached from exactly one of them - so the arms move into the tests and
+        /// the method reads as the chain of returns it is.
+        /// </summary>
+        [Test]
+        public async Task AChainOfComparisonsStructuresIntoItsArms()
+        {
+            var dump = Structured(nameof(StructuringSample.Switchy));
+
+            await Assert.That(dump).Contains("if (loc0 == 0)");
+            await Assert.That(dump).Contains("return \"zero\";");
+            await Assert.That(dump).Contains("return \"many\";");
+            await Assert.That(dump).DoesNotContain("goto");
         }
 
         /// <summary>

@@ -64,18 +64,24 @@ namespace ClrSpectorTests
         }
 
         /// <summary>
-        /// A switch expression is a decision tree: the arms are labelled statements the tests
-        /// jump to, which is why the projection leaves them as jumps rather than inventing a
-        /// switch it cannot prove.
+        /// A switch expression is a decision tree whose arms sit after it, each reached by one
+        /// branch and each ending in a return - so every arm moves into the branch that goes to
+        /// it, and what comes back is the chain of tests the tree is, with no jumps left.
         /// </summary>
         [Test]
-        public async Task ASwitchExpressionComesBackAsItsDecisionTree()
+        public async Task ASwitchExpressionComesBackAsItsChainOfTests()
         {
             var dump = Structured(Ledger, nameof(ModernLedger<int>.Classify));
 
-            await Assert.That(dump).Contains("if (n < 0) goto");
-            await Assert.That(dump).Contains("if (n >= 10) goto");
-            await Assert.That(dump).Contains("if (n == 0) goto");
+            await Assert.That(dump).Contains("if (n < 0)");
+            await Assert.That(dump).Contains("if (n == 0)");
+
+            // The relational arm is tested the other way round, because the branch that skipped
+            // it was, and the arms it guards are nested inside it.
+            await Assert.That(dump).Contains("if (n < 10)");
+
+            // Nothing is left jumping.
+            await Assert.That(dump).DoesNotContain("goto");
 
             // Every arm's value became the return it feeds.
             foreach (var arm in new[] { "negative", "zero", "small", "large" })
@@ -144,7 +150,7 @@ namespace ClrSpectorTests
             var dump = Structured(typeof(ModernPatterns), nameof(ModernPatterns.Describe));
 
             // null, then a type test and the unboxing cast the int pattern needs.
-            await Assert.That(dump).Contains("if (value == null) goto");
+            await Assert.That(dump).Contains("if (value == null)");
             await Assert.That(dump).Contains("(int)value");
 
             // The relational pattern, and the property pattern on a string.

@@ -119,8 +119,11 @@ namespace ClrSpector
             // whose arms have not been folded is not one.
             for (var round = 0; round < budget; round++)
             {
-                if (!this.StructureLoops() && !this.StructureConditionals())
+                if (!this.StructureLoops() && !this.StructureConditionals()
+                    && !this.InlineSingleEntryTails())
+                {
                     break;
+                }
             }
 
             // Declarations move last, once the statements they would move onto have stopped
@@ -841,6 +844,146 @@ namespace ClrSpector
             }
 
             return candidates.OrderByDescending(candidate => candidate.Span).Select(candidate => candidate.Index);
+        }
+
+        /// <summary>
+        /// Moves a block that only one jump reaches to where that jump is, which turns the jump
+        /// into the block itself - or into an <c>if</c> holding it.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// This is what a switch expression needs. The compiler lays one out as a decision tree
+        /// whose arms sit after it, each reached by exactly one branch and each ending in a
+        /// return - so the arms can be lifted into the branches that go to them, and the tree
+        /// reads as the chain of tests it is.
+        /// </para>
+        /// <para>
+        /// Sound because the block has exactly one way in and one way out: nothing else jumps to
+        /// it, nothing falls into it, and it ends by leaving the method. Moving code with more
+        /// than one predecessor would mean duplicating it, which this will not do.
+        /// </para>
+        /// </remarks>
+        private bool InlineSingleEntryTails()
+        {
+            for (var i = 0; i < this.nodes.Count; i++)
+            {
+                var jump = this.nodes[i];
+
+                if (jump.IsFixed || jump.Target == null || jump.Kind != CSharpNodeKind.Statement)
+                    continue;
+
+                if (jump.Control != CSharpControl.Goto && jump.Control != CSharpControl.ConditionalGoto)
+                    continue;
+
+                var first = this.IndexOfOffset(jump.Target);
+
+                // Forwards only, and only when this jump is the one way in.
+                if (first <= i || this.JumpsTo(jump.Target) != 1)
+                    continue;
+
+                // Nothing may fall into it either, or moving it would take that path with it.
+                var before = this.PreviousStatement(first);
+
+                if (before >= 0 && before != i && !EndsControl(this.nodes[before]))
+                    continue;
+
+                var last = this.TailEnd(first, jump.Depth);
+
+                if (last < 0)
+                    continue;
+
+                this.MoveTail(i, first, last, jump);
+
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// The last statement of the run starting at <paramref name="first"/>, when that run is
+        /// a tail: statements at <paramref name="depth"/> that nothing jumps into, ending in one
+        /// that leaves the method. Otherwise -1.
+        /// </summary>
+        private int TailEnd(int first, int depth)
+        {
+            for (var i = first; i < this.nodes.Count; i++)
+            {
+                var node = this.nodes[i];
+
+                if (node.Kind != CSharpNodeKind.Statement || node.IsFixed || node.Depth != depth)
+                    return -1;
+
+                if (this.AnyPinned(i, i))
+                    return -1;
+
+                // Only the first statement may be jumped to - by the jump being rewritten.
+                if (i > first && this.JumpsTo(node.Offset) != 0)
+                    return -1;
+
+                if (node.Control == CSharpControl.Return || node.Control == CSharpControl.Throw)
+                    return i;
+
+                // A jump out of the middle of the run would leave the block by another door.
+                if (node.Target != null)
+                    return -1;
+            }
+
+            return -1;
+        }
+
+        /// <summary>
+        /// Takes the statements <paramref name="first"/>..<paramref name="last"/> out of the
+        /// list and puts them where <paramref name="jump"/> was, inside an <c>if</c> when the
+        /// jump was conditional.
+        /// </summary>
+        private void MoveTail(int at, int first, int last, CSharpNode jump)
+        {
+            var block = this.nodes.GetRange(first, last - first + 1);
+
+            this.nodes.RemoveRange(first, block.Count);
+            this.nodes.RemoveAt(at);
+
+            // The jump's IL belongs to whatever now stands in its place.
+            this.MergeComment(block[0], jump);
+
+            if (jump.Control == CSharpControl.ConditionalGoto && jump.Condition != null)
+            {
+                foreach (var node in block)
+                    node.Depth++;
+
+                var header = new CSharpNode
+                {
+                    Kind = CSharpNodeKind.Open,
+                    Depth = jump.Depth,
+                    Offset = jump.Offset,
+                    Tokens = Join(
+                        Keyword("if"), Space(), Punctuation("("), jump.Condition, Punctuation(")"))
+                };
+
+                var opening = new CSharpNode
+                {
+                    Kind = CSharpNodeKind.Open,
+                    Depth = jump.Depth,
+                    Tokens = new List<ClrCSharpToken> { Punctuation("{") }
+                };
+
+                var closing = new CSharpNode
+                {
+                    Kind = CSharpNodeKind.Close,
+                    Depth = jump.Depth,
+                    Tokens = new List<ClrCSharpToken> { Punctuation("}") }
+                };
+
+                this.nodes.InsertRange(at, new[] { header, opening }.Concat(block).Append(closing));
+
+                return;
+            }
+
+            // An unconditional jump is simply where the block goes.
+            block[0].Offset = jump.Offset ?? block[0].Offset;
+
+            this.nodes.InsertRange(at, block);
         }
 
         /// <summary>
