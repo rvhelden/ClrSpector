@@ -1,6 +1,5 @@
 using System;
 using System.Linq;
-using System.Reflection.Metadata;
 using System.Threading.Tasks;
 using ClrSpector;
 using TUnit.Assertions;
@@ -81,7 +80,7 @@ namespace ClrSpectorTests
             var local = ClrObject.From<Contracted>().MethodTable.DeclaredInterfaces
                 .Single(i => i.Name == typeof(ILocalContract).FullName);
 
-            await Assert.That(local.Kind).IsEqualTo(HandleKind.TypeDefinition);
+            await Assert.That(local.TypeTable).IsEqualTo(MetadataTable.TypeDef);
             await Assert.That(local.MethodTablePointer)
                 .IsEqualTo(ClrObject.From<ILocalContract>().MethodTable.Address);
             await Assert.That(local.Interface.IsInterface).IsTrue();
@@ -94,7 +93,7 @@ namespace ClrSpectorTests
             var disposable = ClrObject.From<Contracted>().MethodTable.DeclaredInterfaces
                 .Single(i => i.Name == "System.IDisposable");
 
-            await Assert.That(disposable.Kind).IsEqualTo(HandleKind.TypeReference);
+            await Assert.That(disposable.TypeTable).IsEqualTo(MetadataTable.TypeRef);
             await Assert.That(disposable.MethodTablePointer)
                 .IsEqualTo(ClrObject.From<IDisposable>().MethodTable.Address);
         }
@@ -109,7 +108,7 @@ namespace ClrSpectorTests
             var comparable = ClrObject.From<Contracted>().MethodTable.DeclaredInterfaces
                 .Single(i => i.IsConstructedGeneric);
 
-            await Assert.That(comparable.Kind).IsEqualTo(HandleKind.TypeSpecification);
+            await Assert.That(comparable.TypeTable).IsEqualTo(MetadataTable.TypeSpec);
             await Assert.That(comparable.Name).IsEqualTo($"System.IComparable<{typeof(Contracted).FullName}>");
             await Assert.That(comparable.MethodTablePointer).IsEqualTo(IntPtr.Zero);
             await Assert.That(comparable.Interface).IsNull();

@@ -396,9 +396,9 @@ namespace ClrSpectorTests
         // ---------- async continuations ----------
 
         /// <summary>
-        /// No live Continuation could be produced on this preview runtime, so the decoder is
-        /// checked the only way available: the contract's offsets against the managed type's own
-        /// field layout, read through <see cref="ClrMethodTable.Fields"/>.
+        /// The layout check that stands behind the decoder: the contract's offsets against the
+        /// managed type's own field layout, read through <see cref="ClrMethodTable.Fields"/>.
+        /// <see cref="ContinuationTests"/> covers the decode of a live suspended chain.
         /// </summary>
         [Test]
         public async Task ContinuationLayoutMatchesTheManagedType()

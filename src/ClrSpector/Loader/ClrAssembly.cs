@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using ClrSpector.Cdac;
 
 namespace ClrSpector
@@ -32,6 +33,88 @@ namespace ClrSpector
         public bool IsDynamic { get; private set; }
 
         public bool IsLoaded { get; private set; }
+
+        /// <summary>The manifest module - the one carrying the assembly's own metadata.</summary>
+        public ClrModule ManifestModule =>
+            this.Module == IntPtr.Zero ? null : ClrModule.At(this.Module);
+
+        /// <summary>
+        /// The assembly's simple name, from the Assembly row in its manifest module's metadata.
+        /// </summary>
+        /// <remarks>
+        /// The runtime's Assembly structure stores no name; what it has is a Module, and the name
+        /// is a row in that module's metadata - so this is the same trick as everywhere else here,
+        /// a token's worth of indirection instead of asking reflection. Null for a dynamic
+        /// assembly, which has no mapped image to read.
+        /// </remarks>
+        public string Name => this.AssemblyRow(7);
+
+        /// <summary>The assembly's culture, or null when it is culture-neutral.</summary>
+        public string Culture
+        {
+            get
+            {
+                var culture = this.AssemblyRow(8);
+
+                return string.IsNullOrEmpty(culture) ? null : culture;
+            }
+        }
+
+        /// <summary>The version from the assembly's own metadata row.</summary>
+        public Version Version
+        {
+            get
+            {
+                var metadata = this.ManifestModule == null ? null : ClrModuleMetadata.Of(this.ManifestModule);
+                var image = metadata?.Image;
+
+                if (image == null || image.RowCount(MetadataTable.Assembly) < 1)
+                    return null;
+
+                // Assembly: HashAlgId, Major, Minor, Build, Revision, Flags, PublicKey, Name, Culture.
+                return new Version(
+                    (int)image.ReadColumn(MetadataTable.Assembly, 1, 1),
+                    (int)image.ReadColumn(MetadataTable.Assembly, 1, 2),
+                    (int)image.ReadColumn(MetadataTable.Assembly, 1, 3),
+                    (int)image.ReadColumn(MetadataTable.Assembly, 1, 4));
+            }
+        }
+
+        /// <summary>
+        /// The assembly's modules.
+        /// </summary>
+        /// <remarks>
+        /// One, always, on this runtime: multi-module assemblies are a .NET Framework feature that
+        /// .NET Core never carried forward, so the runtime's Assembly holds a single Module rather
+        /// than a list. This is a list anyway because that is the shape callers expect, and
+        /// because the File table it would come from still exists in metadata.
+        /// </remarks>
+        public IReadOnlyList<ClrModule> Modules
+        {
+            get
+            {
+                var manifest = this.ManifestModule;
+
+                return manifest == null
+                    ? new ClrModule[0]
+                    : new[] { manifest };
+            }
+        }
+
+        /// <summary>A string column of the single Assembly row, or null when there is none.</summary>
+        private string AssemblyRow(int column)
+        {
+            var manifest = this.ManifestModule;
+            if (manifest == null)
+                return null;
+
+            var image = ClrModuleMetadata.Of(manifest)?.Image;
+
+            if (image == null || image.RowCount(MetadataTable.Assembly) < 1)
+                return null;
+
+            return image.String(image.ReadColumn(MetadataTable.Assembly, 1, column));
+        }
 
         /// <summary>Reads the runtime's Assembly for the assembly declaring this type.</summary>
         public static ClrAssembly Of(Type typeInAssembly)

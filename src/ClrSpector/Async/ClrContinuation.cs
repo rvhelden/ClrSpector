@@ -17,12 +17,12 @@ namespace ClrSpector
     /// something the compiler-generated state machines never made visible.
     /// </para>
     /// <para>
-    /// <b>Unverified against a live instance.</b> The layout here is taken from the runtime's
-    /// contract and cross-checked field by field against the managed
-    /// <c>System.Runtime.CompilerServices.Continuation</c> type's own field offsets, but this
-    /// preview runtime never produced a Continuation object to decode - its async methods still
-    /// compile to state machines. Treat the reads as correct in shape and unproven in practice
-    /// until a runtime that emits them is available.
+    /// Verified against live instances: with
+    /// <c>&lt;Features&gt;runtime-async=on&lt;/Features&gt;</c> the compiler emits no state
+    /// machine, and a chain parked on a pending task decodes link by link with each resume point
+    /// naming the method it will return to. The chain is only reachable while that task is
+    /// pending - completing it runs the continuations and unlinks them - and the head is the
+    /// awaited <c>Task</c>'s own continuation slot, which reaches the chain without a heap walk.
     /// </para>
     /// </remarks>
     public sealed unsafe class ClrContinuation

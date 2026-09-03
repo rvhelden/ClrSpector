@@ -210,7 +210,7 @@ namespace ClrSpectorTests
 
                 await Assert.That(metadata).IsNotNull();
                 await Assert.That(metadata.MetadataSize).IsGreaterThan(0);
-                await Assert.That(metadata.Reader.MetadataVersion).StartsWith("v");
+                await Assert.That(metadata.Image.Version).StartsWith("v");
             }
         }
 

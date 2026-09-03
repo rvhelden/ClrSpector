@@ -1,64 +1,16 @@
 using System;
-using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using System.Threading.Tasks;
 using ClrSpector;
 using ClrSpector.Cdac;
 using ClrSpector.Detours;
 
 namespace ClrSpectorConsole
 {
-    /// <summary>An interface with one abstract member and one default implementation.</summary>
-    public interface IPriced
-    {
-        decimal Total();
-
-        /// <summary>A default implementation - a body on the interface itself.</summary>
-        string Summary() => $"total {this.Total()}";
-    }
-
-    /// <summary>A small type to point everything at.</summary>
-    public class Order : IPriced, IComparable<Order>
-    {
-        public int Quantity = 3;
-
-        public decimal UnitPrice = 2.5m;
-
-        public string Sku = "A-1";
-
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        public decimal Total() => this.Quantity * this.UnitPrice;
-
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        public string Describe(int wanted) => wanted > this.Quantity ? "short" : "ok";
-
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        public virtual string Ship() => "shipped";
-
-        public int CompareTo(Order other) => 0;
-    }
-
-    /// <summary>A stand-in with state of its own, for the proxy detour.</summary>
-    public class OrderProxy
-    {
-        public readonly List<string> Seen = new List<string>();
-
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        public string Describe(Order order, int wanted)
-        {
-            this.Seen.Add($"{order.Sku}/{wanted}");
-
-            return "proxied";
-        }
-    }
-
-    /// <summary>
-    /// One short demonstration of each thing this library can do. Every section is deliberately
-    /// small - the point is to show the entry point and one line of real output, not to be a
-    /// tool.
-    /// </summary>
     internal static unsafe class Program
     {
         private static void Main()
@@ -164,7 +116,7 @@ namespace ClrSpectorConsole
 
                 foreach (var field in iface.Fields)
                     Line($"    field {iface.Metadata.FieldName(field.MetadataToken)}",
-                         $"static={field.IsStatic} {field.ElementType}");
+                        $"static={field.IsStatic} {field.ElementType}");
             }
         }
 
@@ -289,10 +241,36 @@ namespace ClrSpectorConsole
             var type = typeof(object).Assembly.GetType("System.Runtime.CompilerServices.Continuation");
             Line("managed type", type == null ? "absent" : type.FullName);
 
-            // Reaching one needs a method the runtime actually compiled as async; on this preview
-            // the compiler still emits state machines, so there is nothing to decode.
-            Line("live instance", "none on this runtime - ClrContinuation.Of(obj) decodes one " +
-                                  "when a Continuation exists");
+            // Two awaits deep and parked: while the gate's task is pending, the continuations
+            // that will resume these methods are still on the heap and still linked together.
+            var pending = AwaitChain.AwaitsTheInnerCall();
+
+            try
+            {
+                // A suspended method parks its continuation in the awaited task's own
+                // continuation slot, which reaches the chain without walking the heap.
+                var slot = typeof(Task).GetField(
+                    "m_continuationObject",
+                    BindingFlags.Instance | BindingFlags.NonPublic);
+
+                var head = slot?.GetValue(AwaitChain.Gate.Task);
+
+                Line("live instance", head == null ? "nothing suspended" : head.GetType().FullName);
+
+                if (head != null)
+                {
+                    var continuation = ClrContinuation.Of(head);
+
+                    Line("chain", $"{continuation.Chain().Count} links");
+                    Console.WriteLine(continuation.Dump());
+                }
+            }
+            finally
+            {
+                AwaitChain.Gate.TrySetResult(40);
+            }
+
+            Line("resumed", $"result {pending.GetAwaiter().GetResult()}");
         }
 
         private static void Threads()
@@ -334,14 +312,36 @@ namespace ClrSpectorConsole
             // The MethodTable records its module, so everything else follows from there.
             var table = ClrObject.From<Order>().MethodTable;
             var module = ClrModule.At(table.Module);
+            var assembly = ClrAssembly.At(module.Assembly);
 
             Line("module", module.ToString());
-            Line("assembly", ClrAssembly.At(module.Assembly).ToString());
+            Line("assembly", assembly.ToString());
             Line("loader heaps", ClrLoaderAllocator.At(module.LoaderAllocator).ToString());
 
             // A token reaches a MethodTable with no Type involved.
             var token = table.TypeDefToken;
             Line("token lookup", $"0x{token:x8} -> 0x{module.TypeDefToMethodTable(token).ToInt64():x}");
+
+            // The runtime's Assembly stores no name - only a Module. The name is a row in that
+            // module's metadata, read here by the same route as every other name: a token, not
+            // reflection. Every one of these strings came out of the mapped image.
+            Line(string.Empty, string.Empty);
+
+            foreach (var subject in new[] { typeof(Order), typeof(object), typeof(Uri), typeof(Enumerable) })
+            {
+                var each = ClrAssembly.Of(subject);
+                var culture = each.Culture ?? "neutral";
+
+                Line("assembly", $"{each.Name} {each.Version} ({culture})" +
+                                 $"{(each.IsCollectible ? " collectible" : string.Empty)}" +
+                                 $"{(each.IsDynamic ? " dynamic" : string.Empty)}");
+
+                foreach (var eachModule in each.Modules)
+                {
+                    Line("  module", $"{eachModule.SimpleName}  " +
+                                     $"{ClrModuleMetadata.Of(eachModule).Image}");
+                }
+            }
         }
 
         private static void HeapObject()

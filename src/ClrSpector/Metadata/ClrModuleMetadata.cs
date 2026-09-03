@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Concurrent;
-using System.Reflection.Metadata;
-using System.Reflection.Metadata.Ecma335;
+using System.Collections.Generic;
 using ClrSpector.Cdac;
 
 namespace ClrSpector
@@ -24,8 +23,15 @@ namespace ClrSpector
     /// module base, so no section translation is needed.
     /// </para>
     /// <para>
-    /// Nothing is copied. <see cref="MetadataReader"/> is pointed straight at the mapped bytes,
-    /// which are read-only for the life of the module.
+    /// The tables are then read by <see cref="MetadataImage"/> rather than by
+    /// <c>System.Reflection.Metadata</c>. That is not purity for its own sake: the point of this
+    /// project is that everything it reports is derived from the runtime's own published data, and
+    /// a managed metadata reader is another implementation of the same spec sitting in the middle
+    /// of that. Nothing here depends on any of <c>System.Reflection</c>.
+    /// </para>
+    /// <para>
+    /// Nothing is copied. Rows, names and blobs are read in place out of the mapped bytes, which
+    /// are read-only for the life of the module.
     /// </para>
     /// </remarks>
     public sealed unsafe class ClrModuleMetadata
@@ -43,15 +49,23 @@ namespace ClrSpector
         /// <summary>Offset of the metadata directory within the COR20 header.</summary>
         private const int Cor20MetadataDirectoryOffset = 8;
 
+        /// <summary>A token's low three bytes are its row id; the high byte is its table.</summary>
+        private const uint RowIdMask = 0x00FFFFFF;
+
+        /// <summary>The table byte of a user string token, which names the <c>#US</c> heap.</summary>
+        private const int UserStringTokenType = 0x70;
+
         private static readonly ConcurrentDictionary<IntPtr, ClrModuleMetadata> cache =
             new ConcurrentDictionary<IntPtr, ClrModuleMetadata>();
+
+        private Dictionary<uint, uint> enclosingTypes;
 
         private ClrModuleMetadata(IntPtr imageBase, IntPtr metadata, int size)
         {
             this.ImageBase = imageBase;
             this.MetadataAddress = metadata;
             this.MetadataSize = size;
-            this.Reader = new MetadataReader((byte*)metadata, size);
+            this.Image = MetadataImage.At(metadata, size);
         }
 
         /// <summary>The base address of the mapped image.</summary>
@@ -61,8 +75,8 @@ namespace ClrSpector
 
         public int MetadataSize { get; }
 
-        /// <summary>The metadata itself, read in place.</summary>
-        public MetadataReader Reader { get; }
+        /// <summary>The metadata's tables and heaps, read in place.</summary>
+        public MetadataImage Image { get; }
 
         /// <summary>
         /// The metadata of <paramref name="module"/>, or null when it has no mapped image - a
@@ -89,14 +103,13 @@ namespace ClrSpector
         /// </summary>
         public (string Namespace, string Name) TypeName(uint typeDefToken)
         {
-            var handle = MetadataTokens.EntityHandle((int)typeDefToken);
-
-            if (handle.Kind != HandleKind.TypeDefinition)
+            if (!this.TryRow(typeDefToken, MetadataTable.TypeDef, out var rowId))
                 return (null, null);
 
-            var definition = this.Reader.GetTypeDefinition((TypeDefinitionHandle)handle);
-
-            return (this.Reader.GetString(definition.Namespace), this.Reader.GetString(definition.Name));
+            // TypeDef: Flags, Name, Namespace, Extends, FieldList, MethodList.
+            return (
+                this.Image.String(this.Image.ReadColumn(MetadataTable.TypeDef, rowId, 2)),
+                this.Image.String(this.Image.ReadColumn(MetadataTable.TypeDef, rowId, 1)));
         }
 
         /// <summary>
@@ -105,45 +118,28 @@ namespace ClrSpector
         /// </summary>
         public string FullTypeName(uint typeDefToken)
         {
-            var handle = MetadataTokens.EntityHandle((int)typeDefToken);
-
-            if (handle.Kind != HandleKind.TypeDefinition)
+            if (!this.TryRow(typeDefToken, MetadataTable.TypeDef, out var rowId))
                 return null;
 
-            var definition = this.Reader.GetTypeDefinition((TypeDefinitionHandle)handle);
-            var name = this.Reader.GetString(definition.Name);
-
-            // A nested type's own row carries only the short name; the enclosing type is a
-            // separate row that has to be walked to.
-            var declaring = definition.GetDeclaringType();
-            if (!declaring.IsNil)
-                return $"{this.FullTypeName((uint)MetadataTokens.GetToken(declaring))}+{name}";
-
-            var space = this.Reader.GetString(definition.Namespace);
-
-            return string.IsNullOrEmpty(space) ? name : $"{space}.{name}";
+            return this.FullTypeNameOfRow(rowId);
         }
 
         /// <summary>The name of a method, from its MethodDef token.</summary>
         public string MethodName(uint methodDefToken)
         {
-            var handle = MetadataTokens.EntityHandle((int)methodDefToken);
-
-            if (handle.Kind != HandleKind.MethodDefinition)
+            if (!this.TryRow(methodDefToken, MetadataTable.MethodDef, out var rowId))
                 return null;
 
-            return this.Reader.GetString(this.Reader.GetMethodDefinition((MethodDefinitionHandle)handle).Name);
+            return this.Image.String(this.Image.ReadColumn(MetadataTable.MethodDef, rowId, 3));
         }
 
         /// <summary>The name of a field, from its FieldDef token.</summary>
         public string FieldName(uint fieldDefToken)
         {
-            var handle = MetadataTokens.EntityHandle((int)fieldDefToken);
-
-            if (handle.Kind != HandleKind.FieldDefinition)
+            if (!this.TryRow(fieldDefToken, MetadataTable.Field, out var rowId))
                 return null;
 
-            return this.Reader.GetString(this.Reader.GetFieldDefinition((FieldDefinitionHandle)handle).Name);
+            return this.Image.String(this.Image.ReadColumn(MetadataTable.Field, rowId, 1));
         }
 
         /// <summary>
@@ -158,60 +154,62 @@ namespace ClrSpector
         {
             try
             {
-                var handle = MetadataTokens.EntityHandle(token);
+                var table = (MetadataTable)(uint)((token >> 24) & 0xFF);
+                var rowId = (uint)token & RowIdMask;
 
-                switch (handle.Kind)
+                switch (table)
                 {
-                    case HandleKind.TypeDefinition:
+                    case MetadataTable.TypeDef:
                         return this.FullTypeName((uint)token);
 
-                    case HandleKind.TypeReference:
-                    {
-                        var reference = this.Reader.GetTypeReference((TypeReferenceHandle)handle);
-                        var space = this.Reader.GetString(reference.Namespace);
-                        var name = this.Reader.GetString(reference.Name);
+                    case MetadataTable.TypeRef:
+                        return this.TypeRefName(rowId);
 
-                        return string.IsNullOrEmpty(space) ? name : $"{space}.{name}";
+                    case MetadataTable.MethodDef:
+                    {
+                        var owner = this.DeclaringTypeOf(MetadataTable.MethodDef, rowId, 5);
+
+                        return $"{this.FullTypeNameOfRow(owner)}::{this.MethodName((uint)token)}";
                     }
 
-                    case HandleKind.MethodDefinition:
+                    case MetadataTable.Field:
                     {
-                        var definition = this.Reader.GetMethodDefinition((MethodDefinitionHandle)handle);
-                        var owner = (uint)MetadataTokens.GetToken(definition.GetDeclaringType());
+                        var owner = this.DeclaringTypeOf(MetadataTable.Field, rowId, 4);
 
-                        return $"{this.FullTypeName(owner)}::{this.Reader.GetString(definition.Name)}";
+                        return $"{this.FullTypeNameOfRow(owner)}::{this.FieldName((uint)token)}";
                     }
 
-                    case HandleKind.FieldDefinition:
+                    case MetadataTable.MemberRef:
                     {
-                        var definition = this.Reader.GetFieldDefinition((FieldDefinitionHandle)handle);
-                        var owner = (uint)MetadataTokens.GetToken(definition.GetDeclaringType());
+                        // MemberRef: Class (a coded index), Name, Signature.
+                        var parent = this.Image.DecodeCoded(
+                            CodedIndex.MemberRefParent,
+                            this.Image.ReadColumn(MetadataTable.MemberRef, rowId, 0));
 
-                        return $"{this.FullTypeName(owner)}::{this.Reader.GetString(definition.Name)}";
+                        var name = this.Image.String(
+                            this.Image.ReadColumn(MetadataTable.MemberRef, rowId, 1));
+
+                        var owner = parent.Table == MetadataTable.TypeRef
+                            ? this.TypeRefName(parent.RowId)
+                            : parent.Table == MetadataTable.TypeDef
+                                ? this.FullTypeNameOfRow(parent.RowId)
+                                : parent.Table.ToString();
+
+                        return $"{owner}::{name}";
                     }
 
-                    case HandleKind.MemberReference:
-                    {
-                        var reference = this.Reader.GetMemberReference((MemberReferenceHandle)handle);
-                        var parent = reference.Parent;
-                        var owner = parent.Kind == HandleKind.TypeReference
-                            ? this.TokenName(MetadataTokens.GetToken(parent))
-                            : parent.Kind.ToString();
-
-                        return $"{owner}::{this.Reader.GetString(reference.Name)}";
-                    }
-
-                    case HandleKind.TypeSpecification:
+                    case MetadataTable.TypeSpec:
                     {
                         // A constructed generic has no name of its own - only an encoded
                         // signature, which has to be decoded to say anything useful about it.
-                        var specification = this.Reader.GetTypeSpecification((TypeSpecificationHandle)handle);
+                        var blob = this.Image.Blob(
+                            this.Image.ReadColumn(MetadataTable.TypeSpec, rowId, 0));
 
-                        return specification.DecodeSignature(new SignatureNames(this), null);
+                        return SignatureTypeReader.ReadType(ref blob, this.Image).ToString();
                     }
 
-                    case HandleKind.MethodSpecification:
-                        return $"{handle.Kind} 0x{token:x8}";
+                    case MetadataTable.MethodSpec:
+                        return $"MethodSpecification 0x{token:x8}";
 
                     default:
                         return $"0x{token:x8}";
@@ -228,7 +226,10 @@ namespace ClrSpector
         {
             try
             {
-                return this.Reader.GetUserString(MetadataTokens.UserStringHandle(token));
+                if ((token >> 24) != UserStringTokenType)
+                    return null;
+
+                return this.Image.UserString((uint)token & RowIdMask);
             }
             catch (Exception)
             {
@@ -242,12 +243,123 @@ namespace ClrSpector
         /// </summary>
         public int MethodBodyRva(uint methodDefToken)
         {
-            var handle = MetadataTokens.EntityHandle((int)methodDefToken);
-
-            if (handle.Kind != HandleKind.MethodDefinition)
+            if (!this.TryRow(methodDefToken, MetadataTable.MethodDef, out var rowId))
                 return 0;
 
-            return this.Reader.GetMethodDefinition((MethodDefinitionHandle)handle).RelativeVirtualAddress;
+            // MethodDef column 0 is the RVA.
+            return (int)this.Image.ReadColumn(MetadataTable.MethodDef, rowId, 0);
+        }
+
+        /// <summary>Splits a token, checking it names the table the caller expects.</summary>
+        private bool TryRow(uint token, MetadataTable expected, out uint rowId)
+        {
+            rowId = token & RowIdMask;
+
+            if ((MetadataTable)(token >> 24) != expected)
+                return false;
+
+            return rowId != 0 && rowId <= (uint)this.Image.RowCount(expected);
+        }
+
+        private string TypeRefName(uint rowId)
+        {
+            if (rowId == 0 || rowId > (uint)this.Image.RowCount(MetadataTable.TypeRef))
+                return null;
+
+            // TypeRef: ResolutionScope, Name, Namespace.
+            var name = this.Image.String(this.Image.ReadColumn(MetadataTable.TypeRef, rowId, 1));
+            var space = this.Image.String(this.Image.ReadColumn(MetadataTable.TypeRef, rowId, 2));
+
+            return string.IsNullOrEmpty(space) ? name : $"{space}.{name}";
+        }
+
+        private string FullTypeNameOfRow(uint rowId)
+        {
+            if (rowId == 0 || rowId > (uint)this.Image.RowCount(MetadataTable.TypeDef))
+                return null;
+
+            var name = this.Image.String(this.Image.ReadColumn(MetadataTable.TypeDef, rowId, 1));
+
+            // A nested type's own row carries only the short name; the enclosing type is a
+            // separate row that has to be walked to, via the NestedClass table.
+            var enclosing = this.EnclosingTypeOf(rowId);
+            if (enclosing != 0)
+                return $"{this.FullTypeNameOfRow(enclosing)}+{name}";
+
+            var space = this.Image.String(this.Image.ReadColumn(MetadataTable.TypeDef, rowId, 2));
+
+            return string.IsNullOrEmpty(space) ? name : $"{space}.{name}";
+        }
+
+        /// <summary>
+        /// The TypeDef row that encloses <paramref name="rowId"/>, or zero when it is top level.
+        /// </summary>
+        /// <remarks>
+        /// Nesting is recorded the other way round from how it is asked about: the NestedClass
+        /// table lists nested-to-enclosing pairs, with no index from a type to its own row. The
+        /// whole table is small, so it is turned into a lookup once on first use.
+        /// </remarks>
+        private uint EnclosingTypeOf(uint rowId)
+        {
+            var map = this.enclosingTypes;
+
+            if (map == null)
+            {
+                var count = this.Image.RowCount(MetadataTable.NestedClass);
+                map = new Dictionary<uint, uint>(count);
+
+                for (var row = 1u; row <= (uint)count; row++)
+                {
+                    // NestedClass: NestedClass, EnclosingClass - both TypeDef row ids.
+                    map[this.Image.ReadColumn(MetadataTable.NestedClass, row, 0)] =
+                        this.Image.ReadColumn(MetadataTable.NestedClass, row, 1);
+                }
+
+                this.enclosingTypes = map;
+            }
+
+            return map.TryGetValue(rowId, out var enclosing) ? enclosing : 0;
+        }
+
+        /// <summary>
+        /// The TypeDef that owns a method or field row.
+        /// </summary>
+        /// <remarks>
+        /// ECMA-335 stores this the same way it stores every one-to-many relationship: each
+        /// TypeDef holds the first row of a run that ends where the next type's run begins. So
+        /// the owner of a row is the last type whose run starts at or before it - and because
+        /// those starts only ever increase, that is a binary search rather than a scan.
+        /// </remarks>
+        private uint DeclaringTypeOf(MetadataTable table, uint rowId, int listColumn)
+        {
+            var typeCount = (uint)this.Image.RowCount(MetadataTable.TypeDef);
+            if (typeCount == 0)
+                return 0;
+
+            uint low = 1;
+            var high = typeCount;
+            uint owner = 0;
+
+            while (low <= high)
+            {
+                var middle = low + ((high - low) / 2);
+                var start = this.Image.ReadColumn(MetadataTable.TypeDef, middle, listColumn);
+
+                if (start <= rowId)
+                {
+                    owner = middle;
+                    low = middle + 1;
+                }
+                else
+                {
+                    if (middle == 1)
+                        break;
+
+                    high = middle - 1;
+                }
+            }
+
+            return owner;
         }
 
         private static ClrModuleMetadata Read(IntPtr imageBase)
@@ -285,7 +397,7 @@ namespace ClrSpector
         public override string ToString()
         {
             return $"metadata @0x{this.MetadataAddress.ToInt64():x} size={this.MetadataSize} " +
-                   $"version={this.Reader.MetadataVersion}";
+                   $"version={this.Image.Version}";
         }
     }
 }

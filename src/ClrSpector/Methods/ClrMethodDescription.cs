@@ -310,6 +310,18 @@ namespace ClrSpector
         }
 
         /// <summary>
+        /// This method's return type and parameters, decoded from its signature blob.
+        /// </summary>
+        /// <remarks>
+        /// A MethodDesc stores no signature, only a token - as it stores no name. The signature
+        /// lives in the declaring module's metadata and is decoded there, so this needs no
+        /// <see cref="System.Type"/> or <see cref="System.Reflection.MethodBase"/> to exist and
+        /// works for a constructed generic that reflection would refuse to resolve. Null when the
+        /// declaring module has no mapped image, as a runtime-generated one does not.
+        /// </remarks>
+        public ClrMethodSignature Signature => ClrMethodSignature.Of(this);
+
+        /// <summary>
         /// Whether the method has a body at all.
         /// </summary>
         /// <remarks>
