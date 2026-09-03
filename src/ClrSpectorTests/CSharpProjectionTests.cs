@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using ClrSpector;
@@ -11,6 +12,40 @@ using TUnit.Core;
 
 namespace ClrSpectorTests
 {
+    /// <summary>How closely something is watched, based on a byte to catch a decoder that
+    /// assumes every enum is an int.</summary>
+    public enum ReviewLevel : byte
+    {
+        None = 0,
+        Light = 1,
+        Full = 200
+    }
+
+    [Flags]
+    public enum ReviewParts
+    {
+        None = 0,
+        Inputs = 1,
+        Outputs = 2
+    }
+
+    /// <summary>An attribute with a string, an enum and a named argument.</summary>
+    [AttributeUsage(AttributeTargets.All, AllowMultiple = true)]
+    public sealed class ReviewedAttribute : Attribute
+    {
+        public ReviewedAttribute(string reason, ReviewLevel level)
+        {
+            this.Reason = reason;
+            this.Level = level;
+        }
+
+        public string Reason { get; }
+
+        public ReviewLevel Level { get; }
+
+        public ReviewParts Parts { get; set; }
+    }
+
     /// <summary>A type whose methods cover the shapes the projection has to get right.</summary>
     public class ProjectionSample
     {
@@ -20,6 +55,8 @@ namespace ClrSpectorTests
 
         public static int Running;
 
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        [Reviewed("checked", ReviewLevel.Full, Parts = ReviewParts.Outputs)]
         public int Add(int a, int b) => a + b;
 
         /// <summary>A loop, a ternary, a try/catch/finally and a string concatenation.</summary>
@@ -158,7 +195,9 @@ namespace ClrSpectorTests
         {
             var dump = Project(nameof(ProjectionSample.Branchy)).Dump();
 
-            await Assert.That(dump).Contains("int loc0;");
+            // The names come from the PDB and the types from the signature; the slots the
+            // compiler needed for itself have no name to read, and keep their numbers.
+            await Assert.That(dump).Contains("int total;");
             await Assert.That(dump).Contains("bool loc2;");
             await Assert.That(dump).Contains("string loc3;");
         }
@@ -169,8 +208,58 @@ namespace ClrSpectorTests
         {
             var dump = Project(nameof(ProjectionSample.Arrays)).Dump();
 
-            await Assert.That(dump).Contains("int[] Arrays(int n)");
+            await Assert.That(dump).Contains("public int[] Arrays(int n)");
             await Assert.That(dump).Contains("new int[n]");
+        }
+
+        /// <summary>
+        /// The declaration is projected as source wrote it, keywords and all - which is the
+        /// MethodDef row's flags, not anything the body says.
+        /// </summary>
+        [Test]
+        [Arguments(nameof(ProjectionSample.Add), "public int Add(int a, int b)")]
+        [Arguments(nameof(ProjectionSample.Nullable), "public bool Nullable(string text)")]
+        public async Task ProjectsTheDeclarationKeywords(string method, string expected)
+        {
+            await Assert.That(Project(method).Dump()).Contains(expected);
+        }
+
+        /// <summary>
+        /// The attributes the method was declared with, from both of the places they hide: a
+        /// CustomAttribute row, and the MethodDef flags <c>[MethodImpl]</c> compiles into.
+        /// </summary>
+        [Test]
+        [Arguments(ClrCSharpForm.Faithful)]
+        [Arguments(ClrCSharpForm.Structured)]
+        public async Task ProjectsTheAttributesTheMethodWasDeclaredWith(ClrCSharpForm form)
+        {
+            var dump = ClrMethodCSharp.Of(
+                typeof(ProjectionSample).GetMethod(nameof(ProjectionSample.Add), All), form).Dump();
+
+            // A row, with a string, an enum stored as a byte, and a named argument. Getting the
+            // enum's width wrong would misread everything after it in the blob.
+            await Assert.That(dump).Contains(
+                "[Reviewed(\"checked\", ReviewLevel.Full, Parts = ReviewParts.Outputs)]");
+
+            // Not a row at all - reconstructed from the implementation flags.
+            await Assert.That(dump).Contains("[MethodImpl(MethodImplOptions.NoInlining)]");
+        }
+
+        /// <summary>
+        /// The same attributes read through the MethodDesc, where reflection is not involved in
+        /// finding them either.
+        /// </summary>
+        [Test]
+        public async Task ReadsTheAttributesWithoutReflection()
+        {
+            var description = ClrObject.From<ProjectionSample>().MethodTable
+                .FindMethod(nameof(ProjectionSample.Add));
+
+            var attributes = ClrMethodIl.Of(description).Attributes.Select(a => a.ToString()).ToList();
+
+            await Assert.That(attributes.Any(a => a.Contains("Reviewed("))).IsTrue();
+            await Assert.That(attributes.Any(a => a.Contains("MethodImpl("))).IsTrue();
+            await Assert.That(attributes.Any(a => a.Contains("ReviewLevel.Full"))).IsTrue();
         }
 
         [Test]
@@ -179,13 +268,13 @@ namespace ClrSpectorTests
             var dump = Project(nameof(ProjectionSample.Branchy)).Dump();
 
             await Assert.That(dump).Contains("this.Quantity");
-            await Assert.That(dump).Contains("ProjectionSample.Running = loc0;");
+            await Assert.That(dump).Contains("ProjectionSample.Running = total;");
             await Assert.That(dump).Contains("string.Concat(");
 
             var arrays = Project(nameof(ProjectionSample.Arrays)).Dump();
 
-            await Assert.That(arrays).Contains("loc0[loc1] = loc1 * 2;");
-            await Assert.That(arrays).Contains("loc0.Length");
+            await Assert.That(arrays).Contains("values[i] = i * 2;");
+            await Assert.That(arrays).Contains("values.Length");
         }
 
         /// <summary>
@@ -334,8 +423,8 @@ namespace ClrSpectorTests
             await Assert.That(dump).Contains("this.Quantity");
 
             // The locals are typed from the body's own local signature, decoded from the
-            // module's metadata.
-            await Assert.That(dump).Contains("int loc0;");
+            // module's metadata, and named from its PDB.
+            await Assert.That(dump).Contains("int total;");
             await Assert.That(dump).Contains("bool loc2;");
             await Assert.That(dump).Contains("string loc3;");
             await Assert.That(dump).DoesNotContain("types unknown");
@@ -364,13 +453,14 @@ namespace ClrSpectorTests
             {
                 var dump = projection.Dump();
 
-                await Assert.That(dump).Contains("int* loc0;");
+                await Assert.That(dump).Contains("int* first;");
 
                 // A pinned slot is a pointer the GC was told to leave alone, which is what
-                // fixed means in source.
+                // fixed means in source. The compiler declared this one itself, so it has no
+                // name of its own.
                 await Assert.That(dump).Contains("fixed int[] loc1;");
-                await Assert.That(dump).Contains("Span<int> loc2;");
-                await Assert.That(dump).Contains("ref int loc3;");
+                await Assert.That(dump).Contains("Span<int> span;");
+                await Assert.That(dump).Contains("ref int head;");
             }
 
             // Only a decoded signature spells the nested generic - reflection's own name for it

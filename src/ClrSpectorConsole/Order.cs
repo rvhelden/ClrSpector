@@ -1,4 +1,5 @@
 using System;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 
 namespace ClrSpectorConsole;
@@ -12,8 +13,7 @@ namespace ClrSpectorConsole;
     Tags = new[] { "pci", "sox" })]
 public class Order : IPriced, IComparable<Order>
 {
-    [Audited("money", AuditLevel.Light)]
-    public int Quantity = 3;
+    [Audited("money", AuditLevel.Light)] public int Quantity = 3;
 
     public decimal UnitPrice = 2.5m;
 
@@ -32,12 +32,16 @@ public class Order : IPriced, IComparable<Order>
     /// <summary>Enough shape to be worth projecting back to C#: a loop, a branch, a catch.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
     [Audited("reports availability", AuditLevel.Full, Parts = AuditParts.Outputs)]
-    public string Restock(int wanted)
+    public string Restock<T>(T wanted) where T : INumber<T>
     {
+        // The field is an int and the loop counts in T, so it is converted once up front -
+        // T.CreateChecked is how INumber<T> spells that, and it is what makes the comparison
+        // below legal.
+        var quantity = T.CreateChecked(this.Quantity);
         var missing = 0;
 
-        for (var i = 0; i < wanted; i++)
-            missing += i < this.Quantity ? 0 : 1;
+        for (var i = T.Zero; i < wanted; i++)
+            missing += i < quantity ? 0 : 1;
 
         try
         {

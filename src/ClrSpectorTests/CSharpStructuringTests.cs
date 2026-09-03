@@ -133,16 +133,17 @@ namespace ClrSpectorTests
             var dump = Structured(nameof(StructuringSample.Restock));
 
             // var missing = 0;
-            await Assert.That(dump).Contains("int loc0 = 0;");
+            await Assert.That(dump).Contains("int missing = 0;");
 
             // for (var i = 0; i < wanted; i++)
-            await Assert.That(dump).Contains("for (int loc1 = 0; loc1 < wanted; loc1++)");
+            await Assert.That(dump).Contains("for (int i = 0; i < wanted; i++)");
 
             // missing += i < this.Quantity ? 0 : 1;
-            await Assert.That(dump).Contains("loc0 += loc1 < this.Quantity ? 0 : 1;");
+            await Assert.That(dump).Contains("missing += i < this.Quantity ? 0 : 1;");
 
             // return missing == 0 ? "ok" : "short " + missing;
-            await Assert.That(dump).Contains("return loc0 == 0 ? \"ok\" : \"short \" + loc0.ToString();");
+            await Assert.That(dump).Contains(
+                "return missing == 0 ? \"ok\" : \"short \" + missing.ToString();");
 
             // catch (InvalidOperationException) - no variable, because the source declared none
             await Assert.That(dump).Contains("catch (InvalidOperationException)");
@@ -174,7 +175,7 @@ namespace ClrSpectorTests
         public async Task RecognisesTheLoopsAndConditionalsTheCompilerFlattened()
         {
             await Assert.That(Structured(nameof(StructuringSample.WhileLoop)))
-                .Contains("while (loc0 < n)");
+                .Contains("while (total < n)");
 
             // The test compiles to a bool temporary and a branch on it; both fold away.
             await Assert.That(Structured(nameof(StructuringSample.IfNoElse)))
@@ -182,12 +183,12 @@ namespace ClrSpectorTests
 
             var nested = Structured(nameof(StructuringSample.Nested));
 
-            await Assert.That(nested).Contains("for (int loc1 = 0; loc1 < n; loc1++)");
-            await Assert.That(nested).Contains("for (int loc2 = 0; loc2 < loc1; loc2++)");
+            await Assert.That(nested).Contains("for (int i = 0; i < n; i++)");
+            await Assert.That(nested).Contains("for (int j = 0; j < i; j++)");
 
             // The inner loop is inside the outer one, which means its lines are indented past it.
-            var inner = nested.Split('\n').First(line => line.Contains("loc2 = 0"));
-            var outer = nested.Split('\n').First(line => line.Contains("loc1 = 0"));
+            var inner = nested.Split('\n').First(line => line.Contains("int j = 0"));
+            var outer = nested.Split('\n').First(line => line.Contains("int i = 0"));
 
             await Assert.That(inner.IndexOf("for", StringComparison.Ordinal))
                 .IsGreaterThan(outer.IndexOf("for", StringComparison.Ordinal));
@@ -204,7 +205,11 @@ namespace ClrSpectorTests
 
             await Assert.That(dump).Contains(".GetEnumerator();");
             await Assert.That(dump).Contains("while (loc1.MoveNext())");
-            await Assert.That(dump).Contains("loc0 += loc1.Current;");
+
+            // The enumerator is the compiler's own local and has no name; the loop variable is
+            // the source's, so it is not folded into the statement that reads it.
+            await Assert.That(dump).Contains("value = loc1.Current;");
+            await Assert.That(dump).Contains("total += value;");
             await Assert.That(dump).Contains("finally");
             await Assert.That(dump).Contains("loc1.Dispose();");
         }
@@ -315,9 +320,15 @@ namespace ClrSpectorTests
 
             foreach (var (method, projection) in Project(form))
             {
-                var text = projection.Dump();
+                // Only the punctuation counts: a string literal is allowed to contain a brace,
+                // and a record's ToString is full of them.
+                var braces = projection.Lines
+                    .SelectMany(line => line.Tokens)
+                    .Where(token => token.Kind == ClrCSharpTokenKind.Punctuation)
+                    .SelectMany(token => token.Text)
+                    .ToList();
 
-                if (text.Count(c => c == '{') != text.Count(c => c == '}'))
+                if (braces.Count(c => c == '{') != braces.Count(c => c == '}'))
                     unbalanced.Add($"{method.DeclaringType?.Name}.{method.Name}");
             }
 

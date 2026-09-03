@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Linq;
 using System.Collections.Generic;
 using ClrSpector.Cdac;
 
@@ -68,6 +69,8 @@ namespace ClrSpector
         private static readonly ClrCustomAttribute[] NoAttributes = new ClrCustomAttribute[0];
 
         private Dictionary<string, (MetadataTable Table, uint RowId)> typesByName;
+
+        private static ClrModuleMetadata coreLib;
 
         /// <summary>The table byte of a user string token, which names the <c>#US</c> heap.</summary>
         private const int UserStringTokenType = 0x70;
@@ -147,6 +150,53 @@ namespace ClrSpector
         /// reference resolution works without it.
         /// </remarks>
         public ClrModule Owner { get; private set; }
+
+        /// <summary>
+        /// The metadata of CoreLib, reached without the loader's reference maps and without a
+        /// <see cref="Type"/>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The descriptor publishes the MethodTable of <c>System.Object</c> as a global, and a
+        /// MethodTable knows its module - so CoreLib is reachable from the contract descriptor
+        /// alone. That matters because the alternative routes to another assembly all go through
+        /// maps the runtime fills in lazily: an assembly reference that nothing has needed yet has
+        /// no entry, so resolution through it succeeds or fails depending on what the process
+        /// happens to have done first.
+        /// </para>
+        /// <para>
+        /// Almost every enum used in an attribute is defined here, which makes this the last
+        /// resort that actually resolves things - and it resolves them by finding the real TypeDef
+        /// and reading its real field, not by assuming anything.
+        /// </para>
+        /// </remarks>
+        public static ClrModuleMetadata CoreLib
+        {
+            get
+            {
+                if (coreLib != null)
+                    return coreLib;
+
+                try
+                {
+                    var handle = ContractDescriptor.Current.Globals.Dereference("ObjectMethodTable");
+
+                    if (handle == IntPtr.Zero || !ClrMethodTable.IsMethodTableHandle(handle))
+                        return null;
+
+                    var module = ClrMethodTable.Create(new MemoryReader(handle)).Module;
+
+                    if (module == IntPtr.Zero)
+                        return null;
+
+                    return coreLib = Of(ClrModule.At(module));
+                }
+                catch (Exception)
+                {
+                    return null;
+                }
+            }
+        }
 
         /// <summary>The metadata of the image mapped at <paramref name="imageBase"/>.</summary>
         public static ClrModuleMetadata AtImageBase(IntPtr imageBase)
@@ -252,7 +302,12 @@ namespace ClrSpector
                             ? this.TypeRefName(parent.RowId)
                             : parent.Table == MetadataTable.TypeDef
                                 ? this.FullTypeNameOfRow(parent.RowId)
-                                : parent.Table.ToString();
+                                : parent.Table == MetadataTable.TypeSpec
+                                    // A constructed type has no name, only a signature - which
+                                    // is how a call on a generic parameter is written, and what
+                                    // makes "TypeSpec" the wrong thing to print.
+                                    ? this.TypeSpecName(parent.RowId)
+                                    : parent.Table.ToString();
 
                         return $"{owner}::{name}";
                     }
@@ -396,6 +451,189 @@ namespace ClrSpector
             }
 
             return locals;
+        }
+
+        /// <summary>The type a TypeSpec row's signature constructs.</summary>
+        private string TypeSpecName(uint rowId)
+        {
+            if (rowId == 0 || rowId > (uint)this.Image.RowCount(MetadataTable.TypeSpec))
+                return MetadataTable.TypeSpec.ToString();
+
+            var blob = this.Image.Blob(this.Image.ReadColumn(MetadataTable.TypeSpec, rowId, 0));
+
+            return SignatureTypeReader.ReadType(ref blob, this.Image).ToString();
+        }
+
+        /// <summary>
+        /// A generic parameter as it was declared: its name, and what it was constrained to.
+        /// </summary>
+        /// <remarks>
+        /// Constraints are the clearest case of something that is metadata rather than code.
+        /// They change what the compiler may emit - <c>new()</c> is why <c>new T()</c> becomes a
+        /// call to <see cref="System.Activator"/>, and an interface constraint is why a call on
+        /// a type parameter can be a constrained call at all - but there is no instruction
+        /// anywhere in the body that says so.
+        /// </remarks>
+        public sealed class ClrGenericParameter
+        {
+            internal ClrGenericParameter(string name, ushort flags, IReadOnlyList<string> constraints)
+            {
+                this.Name = name;
+                this.Flags = flags;
+                this.Constraints = constraints;
+            }
+
+            /// <summary>The name the source gave it.</summary>
+            public string Name { get; }
+
+            /// <summary>GenericParamAttributes: the variance and the special constraints.</summary>
+            public ushort Flags { get; }
+
+            /// <summary>The types it was constrained to, as their names.</summary>
+            public IReadOnlyList<string> Constraints { get; }
+
+            /// <summary>True for <c>where T : class</c>.</summary>
+            public bool IsReferenceType => (this.Flags & 0x0004) != 0;
+
+            /// <summary>True for <c>where T : struct</c>.</summary>
+            public bool IsValueType => (this.Flags & 0x0008) != 0;
+
+            /// <summary>True for <c>where T : new()</c>.</summary>
+            public bool HasDefaultConstructor => (this.Flags & 0x0010) != 0;
+
+            public override string ToString()
+            {
+                var parts = new List<string>();
+
+                if (this.IsReferenceType)
+                    parts.Add("class");
+
+                if (this.IsValueType)
+                    parts.Add("struct");
+
+                parts.AddRange(this.Constraints);
+
+                if (this.HasDefaultConstructor)
+                    parts.Add("new()");
+
+                return parts.Count == 0 ? this.Name : $"{this.Name} : {string.Join(", ", parts)}";
+            }
+        }
+
+        /// <summary>
+        /// The generic parameters a type or a method declared, in order, with their constraints.
+        /// </summary>
+        public IReadOnlyList<ClrGenericParameter> GenericParameters(int ownerToken)
+        {
+            var parameters = new List<ClrGenericParameter>();
+
+            try
+            {
+                var table = (MetadataTable)(uint)((ownerToken >> 24) & 0xFF);
+                var rowId = (uint)ownerToken & RowIdMask;
+                var tag = Array.IndexOf(MetadataSchema.TablesOf(CodedIndex.TypeOrMethodDef), (int)table);
+
+                if (tag < 0 || rowId == 0)
+                    return parameters;
+
+                var key = (rowId << MetadataSchema.TagBitsOf(CodedIndex.TypeOrMethodDef)) | (uint)tag;
+                var found = new List<(int Number, uint Row, string Name, ushort Flags)>();
+
+                // GenericParam: Number, Flags, Owner, Name.
+                for (var row = 1u; row <= (uint)this.Image.RowCount(MetadataTable.GenericParam); row++)
+                {
+                    if (this.Image.ReadColumn(MetadataTable.GenericParam, row, 2) != key)
+                        continue;
+
+                    found.Add((
+                        (int)this.Image.ReadColumn(MetadataTable.GenericParam, row, 0),
+                        row,
+                        this.Image.String(this.Image.ReadColumn(MetadataTable.GenericParam, row, 3)),
+                        (ushort)this.Image.ReadColumn(MetadataTable.GenericParam, row, 1)));
+                }
+
+                foreach (var parameter in found.OrderBy(item => item.Number))
+                {
+                    parameters.Add(new ClrGenericParameter(
+                        parameter.Name, parameter.Flags, this.ConstraintsOf(parameter.Row)));
+                }
+            }
+            catch (Exception)
+            {
+                // A signature reads without them; it just does not say what it required.
+            }
+
+            return parameters;
+        }
+
+        /// <summary>The types a GenericParam row is constrained to.</summary>
+        private IReadOnlyList<string> ConstraintsOf(uint parameterRow)
+        {
+            var constraints = new List<string>();
+
+            // GenericParamConstraint: Owner (a GenericParam row), Constraint (a TypeDefOrRef).
+            for (var row = 1u; row <= (uint)this.Image.RowCount(MetadataTable.GenericParamConstraint); row++)
+            {
+                if (this.Image.ReadColumn(MetadataTable.GenericParamConstraint, row, 0) != parameterRow)
+                    continue;
+
+                var constraint = this.Image.DecodeCoded(
+                    CodedIndex.TypeDefOrRef,
+                    this.Image.ReadColumn(MetadataTable.GenericParamConstraint, row, 1));
+
+                var name = this.TokenName(((int)constraint.Table << 24) | (int)constraint.RowId);
+
+                if (!string.IsNullOrEmpty(name))
+                    constraints.Add(name);
+            }
+
+            return constraints;
+        }
+
+        /// <summary>
+        /// The names a type or a method gave its generic parameters, in order.
+        /// </summary>
+        /// <remarks>
+        /// A signature refers to them by position - <c>!0</c> for a type's, <c>!!0</c> for a
+        /// method's - because that is all a signature holds. The names are in the GenericParam
+        /// table, which is the only place <c>T</c> exists.
+        /// </remarks>
+        public IReadOnlyList<string> GenericParameterNames(int ownerToken)
+        {
+            var names = new List<string>();
+
+            try
+            {
+                var table = (MetadataTable)(uint)((ownerToken >> 24) & 0xFF);
+                var rowId = (uint)ownerToken & RowIdMask;
+                var tag = Array.IndexOf(MetadataSchema.TablesOf(CodedIndex.TypeOrMethodDef), (int)table);
+
+                if (tag < 0 || rowId == 0)
+                    return names;
+
+                var key = (rowId << MetadataSchema.TagBitsOf(CodedIndex.TypeOrMethodDef)) | (uint)tag;
+                var found = new List<(int Number, string Name)>();
+
+                // GenericParam: Number, Flags, Owner, Name.
+                for (var row = 1u; row <= (uint)this.Image.RowCount(MetadataTable.GenericParam); row++)
+                {
+                    if (this.Image.ReadColumn(MetadataTable.GenericParam, row, 2) != key)
+                        continue;
+
+                    found.Add((
+                        (int)this.Image.ReadColumn(MetadataTable.GenericParam, row, 0),
+                        this.Image.String(this.Image.ReadColumn(MetadataTable.GenericParam, row, 3))));
+                }
+
+                foreach (var parameter in found.OrderBy(item => item.Number))
+                    names.Add(parameter.Name);
+            }
+            catch (Exception)
+            {
+                // Without the names, a signature still reads - by position.
+            }
+
+            return names;
         }
 
         /// <summary>
@@ -794,7 +1032,9 @@ namespace ClrSpector
 
             for (var row = 1u; row <= (uint)this.Image.RowCount(MetadataTable.TypeRef); row++)
             {
-                var name = this.TypeRefName(row);
+                // The nested-aware name, so a nested TypeRef indexes under the same spelling a
+                // nested TypeDef does rather than under its bare short name.
+                var name = this.TypeRefFullName(row);
 
                 if (name != null && !index.ContainsKey(name))
                     index[name] = (MetadataTable.TypeRef, row);
@@ -818,10 +1058,24 @@ namespace ClrSpector
                 {
                     var target = this.FollowTypeRef(rowId);
 
-                    return target == null
-                        ? CorElementType.END
-                        : target.Value.Metadata.EnumUnderlyingType(
+                    if (target != null)
+                    {
+                        return target.Value.Metadata.EnumUnderlyingType(
                             MetadataTable.TypeDef, target.Value.RowId, depth + 1);
+                    }
+
+                    // Metadata could not reach it, which happens when the runtime has not bound
+                    // that assembly reference yet. If the type happens to be loaded anyway, its
+                    // MethodTable answers the same question without any metadata at all.
+                    var loaded = this.UnderlyingFromLoadedTypeRef(rowId);
+
+                    if (loaded != CorElementType.END)
+                        return loaded;
+
+                    // Neither route depended on anything but luck about what the process had
+                    // already touched. CoreLib does not, and is where nearly every enum used in
+                    // an attribute is defined.
+                    return UnderlyingFromCoreLib(this.TypeRefFullName(rowId), depth);
                 }
 
                 if (table != MetadataTable.TypeDef
@@ -852,6 +1106,66 @@ namespace ClrSpector
             {
                 return CorElementType.END;
             }
+        }
+
+        /// <summary>
+        /// An enum's underlying type looked up by name in CoreLib.
+        /// </summary>
+        private static CorElementType UnderlyingFromCoreLib(string name, int depth)
+        {
+            if (name == null || depth > MaximumResolutionHops)
+                return CorElementType.END;
+
+            var coreLibMetadata = CoreLib;
+
+            if (coreLibMetadata == null)
+                return CorElementType.END;
+
+            var token = coreLibMetadata.FindTypeDef(name);
+
+            return token == 0
+                ? CorElementType.END
+                : coreLibMetadata.EnumUnderlyingType(
+                    MetadataTable.TypeDef, token & RowIdMask, depth + 1);
+        }
+
+        /// <summary>
+        /// An enum's underlying type taken from its loaded MethodTable rather than from metadata.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The last resort, and the one that needs no name resolution at all. An enum's storage is
+        /// a single instance field, and a FieldDesc records its element type directly - so if the
+        /// runtime has built a MethodTable for the referenced type, the answer is one lookup away.
+        /// </para>
+        /// <para>
+        /// This is not redundant with the metadata route, it is complementary: metadata works for
+        /// a type that is declared but never loaded, and this works for a type that is loaded
+        /// through a reference the loader has not written into its AssemblyRef map. Both are
+        /// populated lazily, in different orders, so an enum that neither can reach is one whose
+        /// width genuinely is not recorded anywhere in the process.
+        /// </para>
+        /// </remarks>
+        private CorElementType UnderlyingFromLoadedTypeRef(uint rowId)
+        {
+            if (this.Owner == null)
+                return CorElementType.END;
+
+            var token = ((uint)MetadataTable.TypeRef << 24) | rowId;
+            var handle = this.Owner.TypeRefToMethodTable(token);
+
+            if (handle == IntPtr.Zero || !ClrMethodTable.IsMethodTableHandle(handle))
+                return CorElementType.END;
+
+            var table = ClrMethodTable.Create(new MemoryReader(handle));
+
+            foreach (var field in table.Fields)
+            {
+                if (!field.IsStatic)
+                    return field.ElementType;
+            }
+
+            return CorElementType.END;
         }
 
         /// <summary>
@@ -987,12 +1301,16 @@ namespace ClrSpector
         /// the assembly actually loaded rather than one that merely matches the name. A nested
         /// type's scope is another TypeRef, and is followed by name once the outer one resolves.
         /// </remarks>
-        private (ClrModuleMetadata Metadata, uint RowId)? FollowTypeRef(uint rowId)
+        private (ClrModuleMetadata Metadata, uint RowId)? FollowTypeRef(uint rowId, int depth = 0)
         {
-            if (rowId == 0 || rowId > (uint)this.Image.RowCount(MetadataTable.TypeRef))
+            if (rowId == 0
+                || rowId > (uint)this.Image.RowCount(MetadataTable.TypeRef)
+                || depth > MaximumResolutionHops)
+            {
                 return null;
+            }
 
-            var name = this.TypeRefName(rowId);
+            var name = this.TypeRefFullName(rowId);
 
             if (name == null)
                 return null;
@@ -1001,31 +1319,200 @@ namespace ClrSpector
             if (this.TryFindType(name, out var here) && here.Table == MetadataTable.TypeDef)
                 return (this, here.RowId);
 
-            if (this.Owner == null)
+            var scope = this.Image.DecodeCoded(
+                CodedIndex.ResolutionScope,
+                this.Image.ReadColumn(MetadataTable.TypeRef, rowId, 0));
+
+            // A nested type's scope is the TypeRef of the type that encloses it, so the enclosing
+            // one has to be resolved first - and the nested type is then found by name inside
+            // whichever assembly that landed in.
+            if (scope.Table == MetadataTable.TypeRef)
+            {
+                var enclosing = this.FollowTypeRef(scope.RowId, depth + 1);
+
+                if (enclosing == null)
+                    return null;
+
+                var nested = enclosing.Value.Metadata.FindTypeDef(name);
+
+                return nested == 0 ? null : (enclosing.Value.Metadata, nested & RowIdMask);
+            }
+
+            if (scope.Table != MetadataTable.AssemblyRef || this.Owner == null)
+                return null;
+
+            return this.FollowIntoAssemblyRef(scope.RowId, name, depth);
+        }
+
+        /// <summary>
+        /// Finds <paramref name="name"/> in the assembly an AssemblyRef row bound to, following a
+        /// type forwarder if that is all the assembly holds.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The assembly comes from the loader's own AssemblyRef map rather than from a name
+        /// search, so this reaches the assembly that was actually loaded.
+        /// </para>
+        /// <para>
+        /// The forwarding step is the one that is easy to leave out and expensive to leave out.
+        /// A reference assembly like <c>System.Runtime</c> defines almost nothing: its manifest is
+        /// mostly ExportedType rows saying "this name really lives over there". A TypeRef into it
+        /// therefore finds no TypeDef, and a resolver that stopped at that point would conclude
+        /// the type is unreachable - which for an enum means falling back to guessing its width.
+        /// Measured: every cross-assembly enum in an attribute went through a forwarder, so
+        /// without this step none of them resolved.
+        /// </para>
+        /// </remarks>
+        private (ClrModuleMetadata Metadata, uint RowId)? FollowIntoAssemblyRef(
+            uint assemblyRefRow, string name, int depth)
+        {
+            if (depth > MaximumResolutionHops)
+                return null;
+
+            var token = ((uint)MetadataTable.AssemblyRef << 24) | assemblyRefRow;
+
+            // The map holds the referenced Module, not its Assembly - see
+            // ClrModule.AssemblyRefToModule for why reading it the other way fails silently.
+            var referenced = this.Owner.AssemblyRefToModule(token);
+
+            if (referenced == IntPtr.Zero)
+                return null;
+
+            var module = ClrModule.At(referenced);
+
+            if (module == null || module.Base == IntPtr.Zero)
+                return null;
+
+            var metadata = Of(module);
+
+            if (metadata == null)
+                return null;
+
+            var found = metadata.FindTypeDef(name);
+
+            if (found != 0)
+                return (metadata, found & RowIdMask);
+
+            return metadata.FollowExportedType(name, depth + 1);
+        }
+
+        /// <summary>
+        /// Follows this module's ExportedType rows for <paramref name="name"/>, which is how a
+        /// facade assembly says the type is really defined somewhere else.
+        /// </summary>
+        /// <remarks>
+        /// An ExportedType whose Implementation is an AssemblyRef is a type forwarder. One whose
+        /// Implementation is another ExportedType is a nested type inside a forwarded one, and is
+        /// resolved by forwarding the enclosing name and then looking the nested one up there.
+        /// </remarks>
+        private (ClrModuleMetadata Metadata, uint RowId)? FollowExportedType(string name, int depth)
+        {
+            if (depth > MaximumResolutionHops || this.Owner == null)
+                return null;
+
+            var rows = (uint)this.Image.RowCount(MetadataTable.ExportedType);
+
+            for (var row = 1u; row <= rows; row++)
+            {
+                if (this.ExportedTypeFullName(row) != name)
+                    continue;
+
+                // ExportedType: Flags, TypeDefId, TypeName, TypeNamespace, Implementation.
+                var implementation = this.Image.DecodeCoded(
+                    CodedIndex.Implementation,
+                    this.Image.ReadColumn(MetadataTable.ExportedType, row, 4));
+
+                switch (implementation.Table)
+                {
+                    case MetadataTable.AssemblyRef:
+                        return this.FollowIntoAssemblyRef(implementation.RowId, name, depth);
+
+                    case MetadataTable.ExportedType:
+                    {
+                        // Nested: forward the enclosing name, then find this one inside it.
+                        var enclosing = this.ExportedTypeFullName(implementation.RowId);
+                        var target = enclosing == null
+                            ? null
+                            : this.FollowExportedType(enclosing, depth + 1);
+
+                        if (target == null)
+                            return null;
+
+                        var nested = target.Value.Metadata.FindTypeDef(name);
+
+                        return nested == 0 ? null : (target.Value.Metadata, nested & RowIdMask);
+                    }
+
+                    default:
+                        return null;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// The full name an ExportedType row carries, nested rows joined with <c>+</c> the way
+        /// <see cref="FullTypeName"/> spells a nested TypeDef.
+        /// </summary>
+        private string ExportedTypeFullName(uint rowId)
+        {
+            if (rowId == 0 || rowId > (uint)this.Image.RowCount(MetadataTable.ExportedType))
+                return null;
+
+            var name = this.Image.String(
+                this.Image.ReadColumn(MetadataTable.ExportedType, rowId, 2));
+            var space = this.Image.String(
+                this.Image.ReadColumn(MetadataTable.ExportedType, rowId, 3));
+
+            var full = string.IsNullOrEmpty(space) ? name : $"{space}.{name}";
+
+            var implementation = this.Image.DecodeCoded(
+                CodedIndex.Implementation,
+                this.Image.ReadColumn(MetadataTable.ExportedType, rowId, 4));
+
+            if (implementation.Table != MetadataTable.ExportedType || implementation.RowId == rowId)
+                return full;
+
+            var enclosing = this.ExportedTypeFullName(implementation.RowId);
+
+            return enclosing == null ? full : $"{enclosing}+{full}";
+        }
+
+        /// <summary>
+        /// The full name a TypeRef names, with a nested type joined to its enclosing one by
+        /// <c>+</c> so it matches how a TypeDef's name is spelled.
+        /// </summary>
+        /// <remarks>
+        /// A nested type's TypeRef carries only its own short name and points at its enclosing
+        /// type's TypeRef for the rest, so the name has to be rebuilt by walking that chain -
+        /// <c>DebuggingModes</c> alone matches no TypeDef, while
+        /// <c>System.Diagnostics.DebuggableAttribute+DebuggingModes</c> does.
+        /// </remarks>
+        private string TypeRefFullName(uint rowId, int depth = 0)
+        {
+            if (rowId == 0
+                || rowId > (uint)this.Image.RowCount(MetadataTable.TypeRef)
+                || depth > MaximumResolutionHops)
+            {
+                return null;
+            }
+
+            var name = this.TypeRefName(rowId);
+
+            if (name == null)
                 return null;
 
             var scope = this.Image.DecodeCoded(
                 CodedIndex.ResolutionScope,
                 this.Image.ReadColumn(MetadataTable.TypeRef, rowId, 0));
 
-            if (scope.Table != MetadataTable.AssemblyRef)
-                return null;
+            if (scope.Table != MetadataTable.TypeRef || scope.RowId == rowId)
+                return name;
 
-            var assemblyRefToken = ((uint)MetadataTable.AssemblyRef << 24) | scope.RowId;
-            var assembly = this.Owner.AssemblyRefToAssembly(assemblyRefToken);
+            var enclosing = this.TypeRefFullName(scope.RowId, depth + 1);
 
-            if (assembly == IntPtr.Zero)
-                return null;
-
-            var manifest = ClrAssembly.At(assembly)?.ManifestModule;
-
-            if (manifest == null || manifest.Base == IntPtr.Zero)
-                return null;
-
-            var metadata = Of(manifest);
-            var token = metadata.FindTypeDef(name);
-
-            return token == 0 ? null : (metadata, token & RowIdMask);
+            return enclosing == null ? name : $"{enclosing}+{name}";
         }
 
         /// <summary>A readable name for a type named by a TypeDef or TypeRef row.</summary>

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using ClrSpector;
 
@@ -96,6 +97,16 @@ namespace ClrSpectorTests
         public void Method()
         {
         }
+
+        /// <summary>
+        /// Carries both a real attribute and a pseudo-custom one, so the two paths can be told
+        /// apart on the same method.
+        /// </summary>
+        [Subject("both kinds")]
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.NoOptimization)]
+        public void Constrained()
+        {
+        }
     }
 
     /// <summary>
@@ -115,8 +126,17 @@ namespace ClrSpectorTests
     /// pseudo-custom attributes - <c>[Serializable]</c>, <c>[StructLayout]</c>,
     /// <c>[DllImport]</c>, <c>[MethodImpl]</c> and the rest of ECMA-335 II.21 - which are stored
     /// as bits in the defining table rather than as rows, and which reflection synthesises. Those
-    /// are excluded from the comparison rather than faked, and
-    /// <see cref="ThePseudoCustomAttributesAreTheKnownDifferenceFromReflection"/> pins that down.
+    /// are excluded from the row-to-row comparison rather than faked.
+    /// </para>
+    /// <para>
+    /// One of them is recoverable: <c>[MethodImpl]</c> lives in <c>MethodDef.ImplFlags</c>, and
+    /// <see cref="ClrMethodDescription.PseudoCustomAttributes"/> reconstructs it from there -
+    /// kept apart from the rows so a reconstruction is never mistaken for a reading. Reflection
+    /// does not report that one as an attribute either; it exposes the flags through
+    /// <see cref="MethodBase.GetMethodImplementationFlags"/>, which is what
+    /// <see cref="TheImplementationFlagsMatchTheOnesReflectionReports"/> checks against.
+    /// <see cref="TheRemainingPseudoCustomAttributesAreTheKnownDifferenceFromReflection"/> is the
+    /// rest of the gap.
     /// </para>
     /// </remarks>
     public class CustomAttributeTests
@@ -429,6 +449,153 @@ namespace ClrSpectorTests
         }
 
         /// <summary>
+        /// Every enum argument in every loaded assembly is read at the width its enum really has.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The single most dangerous thing a custom-attribute decoder can get wrong. The blob
+        /// stores an enum as a bare number and never says how wide it is, so the width has to come
+        /// from the enum's own definition - and a decoder that assumed <c>int</c> would read most
+        /// of them correctly, which is exactly why the mistake survives casual testing.
+        /// </para>
+        /// <para>
+        /// Reflection is the oracle: <c>Enum.GetUnderlyingType</c> on the real type says what the
+        /// width is, and every enum argument found is checked against it. Both halves matter -
+        /// <see cref="ClrAttributeArgumentType.UnderlyingResolved"/> being true everywhere says no
+        /// width was guessed, and the width comparison says the ones that were read were read
+        /// right. A run that resolved nothing and guessed <c>int</c> throughout would pass the
+        /// second check and fail the first.
+        /// </para>
+        /// <para>
+        /// Deliberately swept across several assemblies rather than one, because resolving a
+        /// cross-assembly enum is a different code path from resolving a local one and only the
+        /// cross-assembly path had the bugs: the reference map holds a Module where an Assembly
+        /// was assumed, a facade assembly answers with a type forwarder rather than a definition,
+        /// and a nested enum's reference carries only its short name.
+        /// </para>
+        /// </remarks>
+        [Test]
+        public async Task EveryEnumArgumentIsReadAtItsRealWidth()
+        {
+            var anchors = new[]
+            {
+                typeof(object), typeof(CustomAttributeTests), typeof(Uri), typeof(Enumerable),
+                typeof(ClrObject), typeof(List<>)
+            };
+
+            var guessed = new List<string>();
+            var wrong = new List<string>();
+            var compared = 0;
+            var widths = new HashSet<CorElementType>();
+
+            foreach (var anchor in anchors)
+            {
+                var metadata = ClrModuleMetadata.Of(ClrModule.Of(anchor));
+
+                if (metadata == null)
+                    continue;
+
+                foreach (var attribute in metadata.AllCustomAttributes)
+                {
+                    var arguments = attribute.ConstructorArguments.Concat(attribute.NamedArguments);
+
+                    foreach (var argument in arguments)
+                    {
+                        if (argument.Type?.IsEnum != true)
+                            continue;
+
+                        if (!argument.Type.UnderlyingResolved)
+                        {
+                            guessed.Add($"{attribute.TypeName} -> {argument.Type.TypeName}");
+
+                            continue;
+                        }
+
+                        var real = UnderlyingOf(argument.Type.TypeName);
+
+                        if (real == CorElementType.END)
+                            continue;
+
+                        compared++;
+                        widths.Add(real);
+
+                        if (real != argument.Type.Underlying)
+                        {
+                            wrong.Add($"{argument.Type.TypeName}: " +
+                                      $"read as {argument.Type.Underlying}, really {real}");
+                        }
+                    }
+                }
+            }
+
+            await Assert.That(compared).IsGreaterThan(1000);
+
+            await Assert.That(guessed.Distinct().ToList())
+                .IsEmpty()
+                .Because("an unresolved enum means the width was guessed rather than read");
+
+            await Assert.That(wrong.Distinct().ToList()).IsEmpty();
+
+            // If every enum in the sweep were int-backed, the check above would pass without
+            // saying anything about the widths that are actually hard.
+            await Assert.That(widths).Contains(CorElementType.U1);
+            await Assert.That(widths).Contains(CorElementType.I8);
+        }
+
+        /// <summary>
+        /// A cross-assembly enum resolves through a facade's type forwarder, not by luck.
+        /// </summary>
+        /// <remarks>
+        /// <c>AttributeTargets</c> is referenced from this assembly through
+        /// <c>System.Runtime</c>, which defines almost nothing: its manifest forwards the name on
+        /// to CoreLib. A resolver that stopped when the reference assembly held no matching
+        /// TypeDef would find nothing here.
+        /// </remarks>
+        [Test]
+        public async Task ACrossAssemblyEnumResolvesThroughItsForwarder()
+        {
+            var metadata = ClrModuleMetadata.Of(ClrModule.Of(typeof(CustomAttributeTests)));
+
+            await Assert.That(metadata.TryFindType("System.AttributeTargets", out var found))
+                .IsTrue();
+
+            await Assert.That(found.Table)
+                .IsEqualTo(MetadataTable.TypeRef)
+                .Because("this assembly references it rather than defining it");
+
+            await Assert.That(metadata.EnumUnderlyingType(found.Table, found.RowId))
+                .IsEqualTo(CorElementType.I4);
+        }
+
+        /// <summary>
+        /// CoreLib is reachable from the contract descriptor alone, which is what makes the last
+        /// resort of enum resolution independent of what the process has already loaded.
+        /// </summary>
+        /// <remarks>
+        /// Every other route to another assembly goes through a map the runtime fills in lazily,
+        /// so it resolves or does not depending on execution history. This one goes through the
+        /// published MethodTable of <c>System.Object</c>, which is always there.
+        /// </remarks>
+        [Test]
+        public async Task CoreLibIsReachableWithoutTheLoadersReferenceMaps()
+        {
+            var coreLib = ClrModuleMetadata.CoreLib;
+
+            await Assert.That(coreLib).IsNotNull();
+
+            await Assert.That(coreLib.ImageBase)
+                .IsEqualTo(ClrModule.Of(typeof(object)).Base);
+
+            // And it can answer the question the fallback asks of it.
+            var token = coreLib.FindTypeDef("System.AttributeTargets");
+
+            await Assert.That(token).IsNotEqualTo(0u);
+
+            await Assert.That(coreLib.EnumUnderlyingType(MetadataTable.TypeDef, token & 0x00FFFFFF))
+                .IsEqualTo(CorElementType.I4);
+        }
+
+        /// <summary>
         /// Every attribute in CoreLib decodes, which is the breadth this cannot be argued into.
         /// </summary>
         /// <remarks>
@@ -458,16 +625,108 @@ namespace ClrSpectorTests
         }
 
         /// <summary>
-        /// Pseudo-custom attributes are the one thing reflection reports and this does not.
+        /// <c>[MethodImpl]</c> has no row, and is recovered from the MethodDef row's own flags.
         /// </summary>
         /// <remarks>
-        /// <c>[Serializable]</c> is a bit in TypeDef.Flags, not a CustomAttribute row, so there
-        /// is nothing in the table to find. Asserted rather than left as a comment, so that if a
-        /// future change starts synthesising these the claim in the class remarks stops being
-        /// true out loud.
+        /// The compiler folds it into <c>ImplFlags</c> and writes nothing to the CustomAttribute
+        /// table, so reading rows alone cannot see it however carefully it looks. Both flags are
+        /// set here because the value is a bitmask: recovering one and dropping the other would
+        /// still look plausible.
         /// </remarks>
         [Test]
-        public async Task ThePseudoCustomAttributesAreTheKnownDifferenceFromReflection()
+        public async Task MethodImplIsRecoveredFromTheRowsImplementationFlags()
+        {
+            var table = ClrObject.From<AttributeSubject>().MethodTable;
+            var method = table.FindMethod("Constrained");
+
+            await Assert.That(method).IsNotNull();
+
+            // NoInlining is 0x0008 and NoOptimization 0x0040.
+            await Assert.That(method.ImplementationFlags & 0x0048).IsEqualTo(0x0048);
+
+            // The row carries only the real attribute.
+            await Assert.That(method.CustomAttributes.Count).IsEqualTo(1);
+            await Assert.That(method.CustomAttributes[0].TypeName)
+                .IsEqualTo("ClrSpectorTests.SubjectAttribute");
+
+            var pseudo = method.PseudoCustomAttributes;
+
+            await Assert.That(pseudo.Count).IsEqualTo(1);
+            await Assert.That(pseudo[0].TypeName)
+                .IsEqualTo("System.Runtime.CompilerServices.MethodImplAttribute");
+
+            await Assert.That(pseudo[0].Arguments[0])
+                .IsEqualTo("MethodImplOptions.NoInlining | MethodImplOptions.NoOptimization");
+
+            // A reconstruction says so, so it is never taken for something that was read.
+            await Assert.That(pseudo[0].IsSynthesised).IsTrue();
+            await Assert.That(pseudo[0].Token).IsEqualTo(0u);
+            await Assert.That(method.CustomAttributes[0].IsSynthesised).IsFalse();
+
+            // The combined view is the reflection-equivalent one.
+            await Assert.That(method.AllAttributes.Count).IsEqualTo(2);
+        }
+
+        /// <summary>
+        /// A method with no implementation flags reconstructs nothing, rather than something empty.
+        /// </summary>
+        [Test]
+        public async Task AMethodWithNoImplementationFlagsReconstructsNothing()
+        {
+            var method = ClrObject.From<AttributeSubject>().MethodTable.FindMethod("Method");
+
+            await Assert.That(method.ImplementationFlags).IsEqualTo((ushort)0);
+            await Assert.That(method.PseudoCustomAttributes).IsEmpty();
+            await Assert.That(method.AllAttributes.Count).IsEqualTo(method.CustomAttributes.Count);
+        }
+
+        /// <summary>
+        /// The implementation flags read from the row are the ones reflection reports.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Reflection does not surface <c>[MethodImpl]</c> through attribute data at all - it is
+        /// absent from <c>GetCustomAttributesData</c> - and exposes the flags directly through
+        /// <see cref="MethodBase.GetMethodImplementationFlags"/> instead. So that is the oracle
+        /// here, and the reconstruction is a rendering of those same flags rather than a claim of
+        /// parity with anything reflection calls an attribute.
+        /// </para>
+        /// <para>
+        /// Which means the combined view is not "what reflection reports": for a method it is
+        /// slightly more, because the rendered <c>[MethodImpl]</c> has no counterpart in the
+        /// attribute data at all.
+        /// </para>
+        /// </remarks>
+        [Test]
+        [Arguments("Constrained")]
+        [Arguments("Method")]
+        public async Task TheImplementationFlagsMatchTheOnesReflectionReports(string name)
+        {
+            var method = ClrObject.From<AttributeSubject>().MethodTable.FindMethod(name);
+            var oracle = typeof(AttributeSubject).GetMethod(name).GetMethodImplementationFlags();
+
+            await Assert.That(method.ImplementationFlags).IsEqualTo((ushort)oracle);
+
+            // Rows and reconstructions are disjoint, and together they are the combined view.
+            await Assert.That(method.AllAttributes.Count)
+                .IsEqualTo(method.CustomAttributes.Count + method.PseudoCustomAttributes.Count);
+
+            await Assert.That(method.AllAttributes.Count(a => a.IsSynthesised))
+                .IsEqualTo(method.PseudoCustomAttributes.Count);
+        }
+
+        /// <summary>
+        /// The pseudo-custom attributes that stay out of reach, and why.
+        /// </summary>
+        /// <remarks>
+        /// <c>[Serializable]</c> is a bit in TypeDef.Flags, not a CustomAttribute row, so there is
+        /// nothing in the table to find and nothing reconstructs it - unlike
+        /// <c>[MethodImpl]</c>, which <see cref="MethodImplIsRecoveredFromTheRowsImplementationFlags"/>
+        /// does recover. Asserted rather than left as a comment, so that if a future change starts
+        /// synthesising these the claim in the class remarks stops being true out loud.
+        /// </remarks>
+        [Test]
+        public async Task TheRemainingPseudoCustomAttributesAreTheKnownDifferenceFromReflection()
         {
             var reflected = typeof(Guid).GetCustomAttributesData();
 
@@ -491,6 +750,40 @@ namespace ClrSpectorTests
         {
             foreach (var method in ClrObject.From<int[]>().MethodTable.Methods)
                 await Assert.That(method.CustomAttributes).IsEmpty();
+        }
+
+        /// <summary>
+        /// The width an enum named by an attribute argument really has, via reflection.
+        /// </summary>
+        /// <remarks>
+        /// The name may be assembly-qualified, since a named argument spells it out that way.
+        /// <see cref="CorElementType.END"/> means the type could not be resolved, which makes it
+        /// no evidence either way rather than a failure.
+        /// </remarks>
+        private static CorElementType UnderlyingOf(string typeName)
+        {
+            if (typeName == null)
+                return CorElementType.END;
+
+            var comma = typeName.IndexOf(',');
+            var bare = comma > 0 ? typeName.Substring(0, comma) : typeName;
+            var type = Type.GetType(bare, throwOnError: false);
+
+            if (type == null || !type.IsEnum)
+                return CorElementType.END;
+
+            switch (Type.GetTypeCode(Enum.GetUnderlyingType(type)))
+            {
+                case TypeCode.SByte: return CorElementType.I1;
+                case TypeCode.Byte: return CorElementType.U1;
+                case TypeCode.Int16: return CorElementType.I2;
+                case TypeCode.UInt16: return CorElementType.U2;
+                case TypeCode.Int32: return CorElementType.I4;
+                case TypeCode.UInt32: return CorElementType.U4;
+                case TypeCode.Int64: return CorElementType.I8;
+                case TypeCode.UInt64: return CorElementType.U8;
+                default: return CorElementType.END;
+            }
         }
 
         /// <summary>The attribute carrying <paramref name="predicate"/> on the subject type.</summary>

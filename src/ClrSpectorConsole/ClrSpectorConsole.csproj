@@ -7,6 +7,13 @@
     <Features>runtime-async=on</Features>
 
     <!--
+      The union in Modern.cs is a .NET 11 preview language feature, so the sample needs the
+      preview language version to compile. Rider's own analyser does not parse it yet and will
+      mark it red; the compiler is the authority.
+    -->
+    <LangVersion>preview</LangVersion>
+
+    <!--
       Tiered compilation rewrites the same dispatch slot a detour patches, so MethodDetour
       refuses a method the runtime may recompile. Turning it off is what a consumer of the
       detour API has to do, and the sample is no exception.

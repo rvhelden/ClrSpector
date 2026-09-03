@@ -1537,12 +1537,42 @@ every value after it is read from the wrong offset.
 
 **An enum is a bare number, and the blob will not say how wide.** `[Audited(AuditLevel.Full)]`
 stores one byte if `AuditLevel : byte` and eight if it is `: long`, and the blob says only
-"value type" and which type. Assuming `int` gets the common case right and silently desynchronises
-the rest. The width has to come from the enum's own definition - its single instance field, whose
-signature *is* the underlying type - which usually lives in **another assembly**, reached by
-following the TypeRef through the loader's AssemblyRef map. Because the whole blob is required to
-be consumed exactly, a wrong assumption is reported rather than returned: leftover bytes become a
-`DecodeError`.
+"value type" and which type. Assuming `int` reads most enums correctly and silently
+desynchronises everything after a `byte`- or `long`-backed one - which is precisely why the
+mistake survives casual testing. The width has to come from the enum's own definition: its single
+instance field, whose signature *is* the underlying type.
+
+That definition usually lives in **another assembly**, and getting there turned out to be where
+all the real difficulty was. Three things have to be right, and each fails silently on its own:
+
+- **The reference map holds a `Module`, not an `Assembly`.** The descriptor calls the field
+  `ManifestModuleReferencesMap` and the runtime's setter is named `StoreAssemblyRef` - but that
+  setter takes an `Assembly*` and stores `value->GetModule()`, and the field is declared
+  `LookupMap<PTR_Module>` (`ceeload.h`). Reading it as an Assembly yields a structure that decodes
+  without complaint and reports an empty name and a null manifest module, so the error shows up as
+  resolution that quietly never succeeds - not as a crash.
+- **A reference assembly answers with a forwarder, not a definition.** `System.Runtime` and
+  friends define almost nothing; their manifests are mostly `ExportedType` rows saying "that name
+  really lives over there". A resolver that stops when the referenced assembly has no matching
+  `TypeDef` concludes the type is unreachable. Measured: *every* cross-assembly enum in an
+  attribute went through a forwarder, so without this step none of them resolved.
+- **A nested enum's reference carries only its short name.** `DebuggingModes` matches no
+  `TypeDef`; `System.Diagnostics.DebuggableAttribute+DebuggingModes` does. The full name has to be
+  rebuilt by walking the TypeRef's resolution scope, which for a nested type is the enclosing
+  type's TypeRef.
+
+Even with all three, the loader's maps are filled in **lazily** - a reference nothing has needed
+yet has no entry - so resolution through them succeeds or fails depending on what the process
+happened to do first. The last resort avoids them entirely: the descriptor publishes the
+MethodTable of `System.Object`, a MethodTable knows its module, so **CoreLib is reachable from the
+contract descriptor alone**, and nearly every enum used in an attribute is defined there.
+
+Measured across CoreLib and five other loaded assemblies: 4,792 enum arguments, **none guessed**,
+and every width matching what `Enum.GetUnderlyingType` reports - 360 of them `long`-backed and 270
+`byte`-backed, so the hard cases are actually represented. Before the three fixes above, 85
+arguments fell back to guessing `int`; they all happened to *be* int-backed, which is exactly the
+kind of luck that hides a bug. And a guess is never returned as though it were read: the whole
+blob must be consumed exactly, so a wrong width leaves bytes over and becomes a `DecodeError`.
 
 Going one step further recovers the member name too, from the enum's literal fields and their
 `Constant` rows - so `Parts = 5` reads back as `AuditParts.Inputs | AuditParts.Timing`.
@@ -1567,10 +1597,27 @@ The compiler turns them into bits in the defining table - `tdSerializable` in `T
 `MethodDef.ImplFlags` for `[MethodImpl]` - and writes no row. Reflection synthesises them back on
 the way out, which is why `GetCustomAttributesData()` reports them.
 
-There is nothing in the `CustomAttribute` table to find, so they are absent here rather than
-faked, and a test asserts that difference so it stays a documented gap rather than a surprise.
-`[MethodImpl(MethodImplOptions.NoInlining)]` on `Order.Describe` is the case to look at in the
-sample.
+There is nothing in the `CustomAttribute` table to find, so they are absent from
+`CustomAttributes` rather than faked, and a test asserts that difference so it stays a documented
+gap rather than a surprise.
+
+One of them is recoverable. `[MethodImpl]` lives in `MethodDef.ImplFlags`, which a MethodDesc's
+row can simply be read for:
+
+```csharp
+method.ImplementationFlags      // the raw flags, matching GetMethodImplementationFlags()
+method.PseudoCustomAttributes   // [MethodImpl(MethodImplOptions.NoInlining | ...)]
+method.AllAttributes            // the rows plus the reconstructions
+```
+
+Reconstructions are kept apart from rows rather than mixed in, and each carries
+`IsSynthesised`, so "was read" and "was rebuilt from flags" never blur. Note that reflection does
+not report this one as an attribute either - `GetCustomAttributesData` omits it and
+`GetMethodImplementationFlags` is where it surfaces - so this is slightly *more* than reflection's
+attribute view, not parity with it.
+
+The rest stay out of reach: `[Serializable]` and `[ComImport]` would need `TypeDef.Flags`, and
+`[StructLayout]` its arguments from the `ClassLayout` table.
 
 ## The sample
 

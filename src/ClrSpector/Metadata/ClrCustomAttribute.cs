@@ -684,6 +684,26 @@ namespace ClrSpector
             {
                 type.TypeTable = found.Table;
                 type.TypeRowId = found.RowId;
+
+                ResolveUnderlying(metadata, type, ref assumed);
+
+                return;
+            }
+
+            // Nothing in this module mentions the enum: setting a property does not emit a
+            // reference to the property's type, so a named argument can be the only thing in the
+            // assembly that names it. CoreLib is then the place to look, by name.
+            var coreLib = ClrModuleMetadata.CoreLib;
+            var token = name == null || coreLib == null ? 0 : coreLib.FindTypeDef(name);
+
+            if (token != 0)
+            {
+                type.TypeTable = MetadataTable.TypeDef;
+                type.TypeRowId = token & 0x00FFFFFF;
+
+                ResolveUnderlying(coreLib, type, ref assumed);
+
+                return;
             }
 
             ResolveUnderlying(metadata, type, ref assumed);

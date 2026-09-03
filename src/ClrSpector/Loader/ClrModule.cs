@@ -322,20 +322,46 @@ namespace ClrSpector
             return this.Lookup("MethodDefToDescMap", methodDefToken);
         }
 
-        /// <summary>The FieldDesc for a FieldDef token, or zero when not yet created.</summary>
         /// <summary>
-        /// The Assembly an AssemblyRef token resolves to, or zero when this module has not
-        /// needed that reference yet.
+        /// The Module an AssemblyRef token resolves to, or zero when this module has not needed
+        /// that reference yet.
         /// </summary>
         /// <remarks>
+        /// <para>
         /// This is the module's own view of its dependencies: metadata lists what it references
-        /// by name, and this map records which loaded Assembly each of those names turned out to
-        /// be. Zero means the reference has not been resolved yet, since the runtime binds them
-        /// lazily - not that the dependency is missing.
+        /// by name, and this map records what each of those names turned out to be at run time.
+        /// Zero means the reference has not been bound yet, since the runtime binds them lazily -
+        /// not that the dependency is missing.
+        /// </para>
+        /// <para>
+        /// It stores a <b>Module</b>, not an Assembly, despite the descriptor calling the field
+        /// <c>ManifestModuleReferencesMap</c> and the runtime's own setter being named
+        /// <c>StoreAssemblyRef</c>. That setter takes an <c>Assembly*</c> and stores
+        /// <c>value-&gt;GetModule()</c>, and the field is declared
+        /// <c>LookupMap&lt;PTR_Module&gt;</c> (<c>ceeload.h</c>). Reading it as an Assembly
+        /// produces a structure that decodes without complaint and reports an empty name and a
+        /// null manifest module - so the mistake shows up as a resolution that quietly never
+        /// succeeds rather than as a crash. <see cref="AssemblyRefToAssembly"/> is the other step.
+        /// </para>
+        /// </remarks>
+        public IntPtr AssemblyRefToModule(uint assemblyRefToken)
+        {
+            return this.Lookup("ManifestModuleReferencesMap", assemblyRefToken);
+        }
+
+        /// <summary>
+        /// The Assembly an AssemblyRef token resolves to, or zero when the reference has not been
+        /// bound yet.
+        /// </summary>
+        /// <remarks>
+        /// One hop further than <see cref="AssemblyRefToModule"/>, since what the map holds is
+        /// the referenced module and the assembly is the module's owner.
         /// </remarks>
         public IntPtr AssemblyRefToAssembly(uint assemblyRefToken)
         {
-            return this.Lookup("ManifestModuleReferencesMap", assemblyRefToken);
+            var module = this.AssemblyRefToModule(assemblyRefToken);
+
+            return module == IntPtr.Zero ? IntPtr.Zero : At(module).Assembly;
         }
 
         /// <summary>

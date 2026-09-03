@@ -259,6 +259,15 @@ namespace ClrSpector
         /// <summary>The MethodDesc this was decoded from, when it came from one.</summary>
         public ClrMethodDescription Description { get; private set; }
 
+        /// <summary>
+        /// The module metadata this method was read through, for either source of IL - which is
+        /// where everything about the method that is not in its body lives.
+        /// </summary>
+        public ClrModuleMetadata Metadata { get; private set; }
+
+        /// <summary>The MethodDef token of the method, or zero when it has no row.</summary>
+        public uint MetadataToken { get; private set; }
+
         /// <summary>The raw IL bytes.</summary>
         public byte[] Bytes { get; private set; }
 
@@ -276,6 +285,29 @@ namespace ClrSpector
         /// reflection's locals, or the body's own local signature decoded from metadata.
         /// </summary>
         public IReadOnlyList<ClrIlLocal> LocalVariables { get; private set; }
+
+        /// <summary>
+        /// The attributes the method was declared with, rows and pseudo-custom attributes alike.
+        /// </summary>
+        /// <remarks>
+        /// Read from the module's metadata for either source of IL, because that is where they
+        /// are: <c>[MethodImpl]</c> is folded into the MethodDef row's own flags rather than
+        /// written to the CustomAttribute table, so both places have to be read to see what
+        /// source wrote. See <see cref="ClrCustomAttribute"/>.
+        /// </remarks>
+        public IReadOnlyList<ClrCustomAttribute> Attributes { get; private set; }
+            = Array.Empty<ClrCustomAttribute>();
+
+        /// <summary>
+        /// The MethodDef row's own flags - the accessibility and the virtualness that source
+        /// spells as keywords. Zero when there is no row to read them from.
+        /// </summary>
+        /// <remarks>
+        /// These are MethodAttributes: the low three bits are the accessibility, and the rest
+        /// are the modifiers. They are not attributes in the CustomAttribute sense and are not
+        /// reported as such; they are what <c>public</c> and <c>virtual</c> compile into.
+        /// </remarks>
+        public ushort DeclarationFlags { get; private set; }
 
         /// <summary>
         /// The try/catch/finally regions the method declares, as reflection reports them. Always
@@ -333,6 +365,13 @@ namespace ClrSpector
 
             NameLocals(il.LocalVariables, ImageBaseOf(method), (uint)method.MetadataToken);
 
+            var image = ClrModuleMetadata.AtImageBase(ImageBaseOf(method));
+
+            il.Metadata = image;
+            il.MetadataToken = (uint)method.MetadataToken;
+            il.Attributes = AttributesOf(image, (uint)method.MetadataToken);
+            il.DeclarationFlags = DeclarationFlagsOf(image, (uint)method.MetadataToken);
+
             return il;
         }
 
@@ -372,6 +411,11 @@ namespace ClrSpector
 
             NameLocals(
                 il.LocalVariables, metadata?.ImageBase ?? IntPtr.Zero, method.MetadataToken);
+
+            il.Metadata = metadata;
+            il.MetadataToken = method.MetadataToken;
+            il.Attributes = AttributesOf(metadata, method.MetadataToken);
+            il.DeclarationFlags = DeclarationFlagsOf(metadata, method.MetadataToken);
 
             return il;
         }
@@ -422,6 +466,54 @@ namespace ClrSpector
             return regions;
         }
 
+        /// <summary>The MethodDef row's Flags column, or zero when there is no row.</summary>
+        private static ushort DeclarationFlagsOf(ClrModuleMetadata metadata, uint methodDefToken)
+        {
+            var rowId = methodDefToken & 0x00FFFFFF;
+
+            if (metadata == null || rowId == 0
+                || rowId > (uint)metadata.Image.RowCount(MetadataTable.MethodDef))
+            {
+                return 0;
+            }
+
+            // MethodDef: RVA, ImplFlags, Flags, Name, Signature, ParamList.
+            return (ushort)metadata.Image.ReadColumn(MetadataTable.MethodDef, rowId, 2);
+        }
+
+        /// <summary>
+        /// The attributes on a MethodDef token: the CustomAttribute rows, then the ones the
+        /// row's own implementation flags stand for.
+        /// </summary>
+        private static IReadOnlyList<ClrCustomAttribute> AttributesOf(
+            ClrModuleMetadata metadata, uint methodDefToken)
+        {
+            if (metadata == null)
+                return Array.Empty<ClrCustomAttribute>();
+
+            try
+            {
+                var attributes = metadata.CustomAttributes((int)methodDefToken).ToList();
+                var rowId = methodDefToken & 0x00FFFFFF;
+
+                if (rowId == 0 || rowId > (uint)metadata.Image.RowCount(MetadataTable.MethodDef))
+                    return attributes;
+
+                // MethodDef: RVA, ImplFlags, Flags, Name, Signature, ParamList.
+                var flags = (ushort)metadata.Image.ReadColumn(MetadataTable.MethodDef, rowId, 1);
+
+                if (flags != 0)
+                    attributes.AddRange(ClrCustomAttribute.OfImplementationFlags(flags));
+
+                return attributes;
+            }
+            catch (Exception)
+            {
+                // A listing without its attributes is still a listing.
+                return Array.Empty<ClrCustomAttribute>();
+            }
+        }
+
         /// <summary>
         /// Gives the local slots the names the module's PDB has for them, when there is one.
         /// </summary>
@@ -445,6 +537,39 @@ namespace ClrSpector
             {
                 if (names.TryGetValue(local.Index, out var name))
                     local.Name = name;
+            }
+
+            Disambiguate(locals);
+        }
+
+        /// <summary>
+        /// Numbers apart the slots that share a name, so a copy between two of them does not
+        /// read as a copy to itself.
+        /// </summary>
+        /// <remarks>
+        /// A PDB names a slot per lexical scope, and two scopes that never overlap can each
+        /// declare an <c>i</c> - as the arms of a switch over patterns do, one variable per arm.
+        /// The compiler gave them different slots, and a listing that calls both <c>i</c> would
+        /// print <c>i = i</c> for the copy between them.
+        /// </remarks>
+        private static void Disambiguate(IReadOnlyList<ClrIlLocal> locals)
+        {
+            var seen = new Dictionary<string, int>();
+
+            foreach (var local in locals)
+            {
+                if (local.Name == null)
+                    continue;
+
+                if (!seen.TryGetValue(local.Name, out var count))
+                {
+                    seen[local.Name] = 1;
+
+                    continue;
+                }
+
+                seen[local.Name] = count + 1;
+                local.Name = $"{local.Name}_{count}";
             }
         }
 

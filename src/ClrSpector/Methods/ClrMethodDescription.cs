@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using ClrSpector.Cdac;
@@ -304,6 +305,70 @@ namespace ClrSpector
         public IReadOnlyList<ClrCustomAttribute> CustomAttributes =>
             this.Metadata?.CustomAttributes((int)this.MetadataToken)
             ?? (IReadOnlyList<ClrCustomAttribute>)new ClrCustomAttribute[0];
+
+        /// <summary>
+        /// The implementation flags the MethodDef row carries, which <c>[MethodImpl]</c> compiles
+        /// into.
+        /// </summary>
+        /// <remarks>
+        /// Read from column 1 of the row directly. Zero when there is no row to read.
+        /// </remarks>
+        public ushort ImplementationFlags
+        {
+            get
+            {
+                var metadata = this.Metadata;
+
+                if (metadata == null)
+                    return 0;
+
+                var rowId = this.MetadataToken & 0x00FFFFFF;
+
+                if (rowId == 0 || rowId > (uint)metadata.Image.RowCount(MetadataTable.MethodDef))
+                    return 0;
+
+                // MethodDef: RVA, ImplFlags, Flags, Name, Signature, ParamList.
+                return (ushort)metadata.Image.ReadColumn(MetadataTable.MethodDef, rowId, 1);
+            }
+        }
+
+        /// <summary>
+        /// The attributes that were applied in source but were compiled into the MethodDef row's
+        /// bits rather than into a CustomAttribute row.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <c>[MethodImpl]</c> is a <i>pseudo-custom attribute</i> (ECMA-335 II.21): the compiler
+        /// folds it into <see cref="ImplementationFlags"/> and writes nothing to the
+        /// CustomAttribute table, so <see cref="CustomAttributes"/> cannot see it however
+        /// carefully it looks. Reflection synthesises it back on the way out, which is why
+        /// <c>GetCustomAttributesData</c> reports it.
+        /// </para>
+        /// <para>
+        /// Kept separate from <see cref="CustomAttributes"/> rather than mixed into it, so that
+        /// "was read from a row" and "was reconstructed from flags" stay distinguishable -
+        /// everything here has <see cref="ClrCustomAttribute.IsSynthesised"/> set.
+        /// <see cref="AllAttributes"/> is the combined, reflection-equivalent view.
+        /// </para>
+        /// </remarks>
+        public IReadOnlyList<ClrCustomAttribute> PseudoCustomAttributes
+        {
+            get
+            {
+                var flags = this.ImplementationFlags;
+
+                return flags == 0
+                    ? (IReadOnlyList<ClrCustomAttribute>)new ClrCustomAttribute[0]
+                    : ClrCustomAttribute.OfImplementationFlags(flags).ToList();
+            }
+        }
+
+        /// <summary>
+        /// Every attribute source applied to this method: the rows, then the ones reconstructed
+        /// from the row's own flags.
+        /// </summary>
+        public IReadOnlyList<ClrCustomAttribute> AllAttributes =>
+            this.CustomAttributes.Concat(this.PseudoCustomAttributes).ToList();
 
         /// <summary>
         /// True when this MethodDesc carries its own signature instead of pointing at a metadata

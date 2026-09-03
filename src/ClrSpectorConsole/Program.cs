@@ -24,6 +24,7 @@ namespace ClrSpectorConsole
             Section("names and IL straight from memory", FromMemory);
             Section("IL disassembly", Disassembly);
             Section("one method as IL, as C#, and as structured C#", CSharpProjection);
+            Section("modern C# there and back: generics, patterns, unions, filters", ModernCSharp);
             Section("dispatch: precode and vtable", Dispatch);
             Section("an address back to its method", CodeMap);
             Section("tiering", Tiering);
@@ -160,7 +161,7 @@ namespace ClrSpectorConsole
             // signature, the try and catch blocks come out of its data sections, and the caught
             // type and every operand are named from the module's metadata.
             var fromMemory = ClrMethodIl.Of(
-                ClrObject.From(typeof(AwaitChain)).MethodTable.FindMethod(nameof(AwaitChain.AwaitsTheInnerCall)));
+                ClrObject.From(typeof(Order)).MethodTable.FindMethod(nameof(Order.Restock)));
 
             var faithful = fromMemory.ToCSharp();
             var structured = fromMemory.ToCSharp(ClrCSharpForm.Structured);
@@ -174,6 +175,11 @@ namespace ClrSpectorConsole
             var symbols = ClrModuleSymbols.AtImageBase(fromMemory.Description.Metadata.ImageBase);
 
             Line("symbols", symbols?.ToString() ?? "none found - locals keep their slot numbers");
+
+            // Attributes come from two different places, and both are read here: the rows in
+            // the CustomAttribute table, and the MethodDef flags [MethodImpl] compiles into.
+            foreach (var attribute in fromMemory.Attributes)
+                Line("  attribute", attribute.ToString());
 
             foreach (var local in fromMemory.LocalVariables)
                 Line("  local", local.ToString());
@@ -189,6 +195,48 @@ namespace ClrSpectorConsole
             View("the IL", fromMemory.Dump(IlDumpStyle.Auto));
             View("as C#, faithful: the stack undone, the control flow as it is", faithful.Dump(IlDumpStyle.Auto));
             View("as C#, structured: the compiler's scaffolding undone too", structured.Dump(IlDumpStyle.Auto));
+        }
+
+        /// <summary>
+        /// The constructs of modern C# put through the round trip, one method at a time: what
+        /// each compiles to, and what comes back.
+        /// </summary>
+        /// <remarks>
+        /// Read through reflection on the open generic definition, because a constrained generic
+        /// method is the interesting case and it has no closed instantiation until something
+        /// calls it. The locals still come back named, because the names are in the PDB either
+        /// way.
+        /// </remarks>
+        private static void ModernCSharp()
+        {
+            var ledger = typeof(Ledger<>);
+
+            var methods = new (Type Type, string Name)[]
+            {
+                (ledger, nameof(Ledger<int>.Classify)),
+                (ledger, nameof(Ledger<int>.Area)),
+                (ledger, nameof(Ledger<int>.Guarded)),
+                (ledger, nameof(Ledger<int>.Largest)),
+                (typeof(Patterns), nameof(Patterns.Describe)),
+                (typeof(Patterns), nameof(Patterns.Sequence)),
+                (typeof(Patterns), nameof(Patterns.IsSmall))
+            };
+
+            foreach (var (type, name) in methods)
+            {
+                var il = ClrMethodIl.Of(type.GetMethod(name));
+
+                if (il == null)
+                    continue;
+
+                var structured = il.ToCSharp(ClrCSharpForm.Structured);
+
+                Line(name, $"{il.Instructions.Count} instructions -> " +
+                           $"{il.ToCSharp().Lines.Count} faithful -> {structured.Lines.Count} structured");
+
+                View($"{name}: the IL", il.Dump(IlDumpStyle.Auto));
+                View($"{name}: structured C#", structured.Dump(IlDumpStyle.Auto));
+            }
         }
 
         /// <summary>One rendering of a method, under a heading of its own.</summary>
@@ -623,9 +671,21 @@ namespace ClrSpectorConsole
             // The one systematic gap, said out loud rather than papered over: ECMA-335 II.21
             // attributes are compiled into bits in the defining table, not into rows, so there is
             // nothing in the CustomAttribute table to find. Reflection synthesises them back.
+            // ECMA-335 II.21 attributes are compiled into bits in the defining table, not into
+            // rows, so no amount of reading the CustomAttribute table will find them. One of them
+            // can be rebuilt from the bits it went into.
             Line(string.Empty, string.Empty);
-            Line("not in the table", "[MethodImpl] is on Describe in source but is a bit in " +
+            Line("not in the table", "[MethodImpl] is on Describe in source but went into " +
                                      "MethodDef.ImplFlags, so no row carries it");
+
+            if (method != null)
+            {
+                Line("  rebuilt from flags", $"0x{method.ImplementationFlags:x4} -> " +
+                                             string.Join(", ", method.PseudoCustomAttributes));
+
+                Line("  still out of reach", "[Serializable] needs TypeDef.Flags and " +
+                                             "[StructLayout] the ClassLayout table");
+            }
 
             Line(string.Empty, string.Empty);
             foreach (var attribute in ClrAssembly.Of(typeof(object)).CustomAttributes.Take(4))

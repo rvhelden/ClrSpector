@@ -44,6 +44,15 @@ namespace ClrSpector
         private const int BitXor = 6;
         private const int BitOr = 5;
 
+        // MethodAttributes, which is what source's keywords compile into.
+        private const ushort MemberAccessMask = 0x0007;
+        private const ushort StaticFlag = 0x0010;
+        private const ushort FinalFlag = 0x0020;
+        private const ushort VirtualFlag = 0x0040;
+        private const ushort NewSlotFlag = 0x0100;
+        private const ushort AbstractFlag = 0x0400;
+        private const ushort PInvokeFlag = 0x2000;
+
         /// <summary>A signature's calling convention bit for a method that has a <c>this</c>.</summary>
         private const byte HasThisConvention = 0x20;
 
@@ -83,6 +92,12 @@ namespace ClrSpector
         private readonly List<ClrIlInstruction> prefixes = new List<ClrIlInstruction>();
 
         private string[] argumentNames;
+
+        /// <summary>The names of the method's own generic parameters, by position.</summary>
+        private IReadOnlyList<string> methodTypeParameters = Array.Empty<string>();
+
+        /// <summary>The names of the declaring type's generic parameters, by position.</summary>
+        private IReadOnlyList<string> typeTypeParameters = Array.Empty<string>();
 
         /// <summary>The name of the exception the handler being entered was given, if any.</summary>
         private string pendingException;
@@ -157,6 +172,17 @@ namespace ClrSpector
             /// <summary>The instructions folded into it, in order, for the trailing comment.</summary>
             public List<ClrIlInstruction> Source { get; } = new List<ClrIlInstruction>();
 
+            /// <summary>
+            /// What this is the address of, when it is an address: the tokens for the place
+            /// itself, without the <c>&amp;</c>.
+            /// </summary>
+            /// <remarks>
+            /// Calling a value type's method needs its address, so the IL takes one where the
+            /// source called a method on a field or a local. Keeping the place lets the call be
+            /// written the way it was written, rather than as a call on an address.
+            /// </remarks>
+            public List<ClrCSharpToken> AddressedPlace { get; set; }
+
             /// <summary>True for a bare name or literal, which never needs spilling.</summary>
             public bool IsAtom => this.Tokens.Count == 1 && !this.HasSideEffects;
         }
@@ -176,7 +202,8 @@ namespace ClrSpector
 
             if (this.form == ClrCSharpForm.Structured)
             {
-                var declared = CSharpStructurer.Apply(this.body, this.handlerOffsets, this.LocalTypeOf);
+                var declared = CSharpStructurer.Apply(
+                    this.body, this.handlerOffsets, this.LocalTypeOf, this.IsSourceNamed);
 
                 // Declarations come after the passes, because a slot the passes folded into the
                 // statement that read it is no longer a variable the method has.
@@ -206,6 +233,8 @@ namespace ClrSpector
         /// </remarks>
         private void ReadSignature()
         {
+            this.ReadTypeParameters();
+
             var method = this.il.Method;
 
             if (method != null)
@@ -248,20 +277,130 @@ namespace ClrSpector
             this.argumentNames = Array.Empty<string>();
         }
 
+        /// <summary>
+        /// Finds what the generic parameters are called, so a signature that refers to them by
+        /// position can be written the way source wrote it.
+        /// </summary>
+        /// <remarks>
+        /// A signature holds no names for them: a method's parameter is <c>!!0</c> and a type's
+        /// is <c>!0</c>, by position. Reflection has the names on the type arguments; a
+        /// MethodDesc has them in the module's GenericParam table.
+        /// </remarks>
+        private void ReadTypeParameters()
+        {
+            var method = this.il.Method;
+
+            if (method != null)
+            {
+                try
+                {
+                    this.methodTypeParameters = method.IsGenericMethodDefinition || method.IsGenericMethod
+                        ? method.GetGenericArguments().Select(argument => argument.Name).ToList()
+                        : (IReadOnlyList<string>)Array.Empty<string>();
+
+                    var declaring = method.DeclaringType;
+
+                    this.typeTypeParameters = declaring != null && declaring.IsGenericType
+                        ? declaring.GetGenericArguments().Select(argument => argument.Name).ToList()
+                        : Array.Empty<string>();
+                }
+                catch (Exception)
+                {
+                    // A signature by position still reads; it just reads as a position.
+                }
+
+                return;
+            }
+
+            var metadata = this.il.Description?.Metadata;
+
+            if (metadata == null)
+                return;
+
+            this.methodTypeParameters = metadata.GenericParameterNames((int)this.il.Description.MetadataToken);
+
+            var table = this.il.Description.DeclaringMethodTable;
+
+            if (table != null)
+                this.typeTypeParameters = metadata.GenericParameterNames((int)table.TypeDefToken);
+        }
+
+        /// <summary>
+        /// Replaces the positions a signature refers to its generic parameters by with their
+        /// names: <c>!!0</c> with the method's first, <c>!0</c> with the type's.
+        /// </summary>
+        private string Named(string text)
+        {
+            if (string.IsNullOrEmpty(text) || text.IndexOf('!') < 0)
+                return text;
+
+            var named = new StringBuilder(text.Length);
+
+            for (var i = 0; i < text.Length; i++)
+            {
+                if (text[i] != '!')
+                {
+                    named.Append(text[i]);
+
+                    continue;
+                }
+
+                var method = i + 1 < text.Length && text[i + 1] == '!';
+                var digits = i + (method ? 2 : 1);
+                var end = digits;
+
+                while (end < text.Length && char.IsDigit(text[end]))
+                    end++;
+
+                if (end == digits || !int.TryParse(text.Substring(digits, end - digits), out var position))
+                {
+                    named.Append(text[i]);
+
+                    continue;
+                }
+
+                var names = method ? this.methodTypeParameters : this.typeTypeParameters;
+
+                named.Append(position < names.Count && !string.IsNullOrEmpty(names[position])
+                    ? names[position]
+                    : text.Substring(i, end - i));
+
+                i = end - 1;
+            }
+
+            return named.ToString();
+        }
+
         private IEnumerable<CSharpNode> Header()
         {
             // The first line is the IL dump's own header, unchanged, so the two listings can be
             // lined up next to each other.
             yield return this.Scaffold(0, Comment(this.DescribeMethod()));
 
+            // The attributes the method was declared with, one per line as source writes them.
+            foreach (var attribute in this.il.Attributes)
+                yield return this.Scaffold(0, Attribute(attribute));
+
             var tokens = new List<ClrCSharpToken>();
 
-            if (this.IsStatic())
-                tokens.Add(Keyword("static "));
+            foreach (var modifier in this.Modifiers())
+            {
+                tokens.Add(Keyword(modifier));
+                tokens.Add(Punctuation(" "));
+            }
 
             tokens.Add(Type(this.ReturnTypeText()));
             tokens.Add(Punctuation(" "));
             tokens.Add(CallName(this.MethodName()));
+
+            // The method's own type parameters, which its signature refers to by position.
+            if (this.methodTypeParameters.Count > 0)
+            {
+                tokens.Add(Punctuation("<"));
+                tokens.Add(Type(string.Join(", ", this.methodTypeParameters)));
+                tokens.Add(Punctuation(">"));
+            }
+
             tokens.Add(Punctuation("("));
 
             var first = true;
@@ -280,7 +419,232 @@ namespace ClrSpector
             tokens.Add(Punctuation(")"));
 
             yield return this.Scaffold(0, tokens.ToArray());
+
+            // The constraints, which are the reason some of the calls above are calls at all.
+            foreach (var constraint in this.Constraints())
+                yield return this.Scaffold(1, constraint);
+
             yield return this.Scaffold(0, Punctuation("{"));
+        }
+
+        /// <summary>
+        /// One attribute, tokenised so a dump can colour it.
+        /// </summary>
+        /// <remarks>
+        /// The arguments arrive already written the way source writes them, so they are coloured
+        /// by what they look like rather than by a type the projection would have to re-derive:
+        /// a quote makes a literal, a digit or a sign makes a number, and everything else is a
+        /// name of something.
+        /// </remarks>
+        private static IEnumerable<ClrCSharpToken> Attribute(ClrCustomAttribute attribute)
+        {
+            var tokens = new List<ClrCSharpToken> { Punctuation("["), Type(attribute.ShortName) };
+            var arguments = attribute.Arguments;
+
+            if (arguments.Count > 0)
+            {
+                tokens.Add(Punctuation("("));
+
+                for (var i = 0; i < arguments.Count; i++)
+                {
+                    if (i > 0)
+                        tokens.Add(Punctuation(", "));
+
+                    tokens.AddRange(ArgumentTokens(arguments[i]));
+                }
+
+                tokens.Add(Punctuation(")"));
+            }
+
+            tokens.Add(Punctuation("]"));
+
+            // An attribute that could not be decoded to the end says so where it is written,
+            // rather than looking like one that had nothing more to say.
+            if (!attribute.IsComplete)
+                tokens.Add(Comment($"  /* {attribute.DecodeError} */"));
+
+            return tokens;
+        }
+
+        private static IEnumerable<ClrCSharpToken> ArgumentTokens(string argument)
+        {
+            if (string.IsNullOrEmpty(argument))
+                return new[] { Punctuation(string.Empty) };
+
+            // A named argument is a name, an equals and a value; the value is the part worth
+            // colouring and shortening, since the name is already only a name.
+            var equals = argument.IndexOf(" = ", StringComparison.Ordinal);
+
+            if (equals > 0)
+            {
+                return new[] { MemberToken(argument.Substring(0, equals)), Punctuation(" = ") }
+                    .Concat(ArgumentTokens(argument.Substring(equals + 3)));
+            }
+
+            if (argument[0] == '"' || argument[0] == '\'')
+                return new[] { Literal(argument) };
+
+            return new[]
+            {
+                char.IsDigit(argument[0]) || argument[0] == '-'
+                    ? Number(argument)
+                    : MemberToken(ShortenQualified(argument))
+            };
+        }
+
+        /// <summary>
+        /// Drops the namespace from a qualified member reference, keeping the type that names it.
+        /// </summary>
+        /// <remarks>
+        /// An enum argument is decoded fully qualified, and source wrote <c>AuditLevel.Full</c>
+        /// rather than <c>Some.Namespace.AuditLevel.Full</c> - so the last two segments are what
+        /// is kept, being the type and the member. Shortening to one would drop the type name
+        /// the source did write.
+        /// </remarks>
+        private static string ShortenQualified(string argument)
+        {
+            var segments = argument.Split('.');
+
+            return segments.Length <= 2
+                ? argument
+                : string.Join(".", segments.Skip(segments.Length - 2));
+        }
+
+        /// <summary>
+        /// The keywords the method was declared with, in the order C# writes them.
+        /// </summary>
+        /// <remarks>
+        /// All of it is in the MethodDef row's flags. Whether a virtual method is
+        /// <c>virtual</c> or <c>override</c> is the new-slot bit: a method that takes a slot of
+        /// its own introduces the virtual, and one that reuses a slot is overriding whatever
+        /// declared it.
+        /// </remarks>
+        private IEnumerable<string> Modifiers()
+        {
+            var flags = this.il.DeclarationFlags;
+
+            if (flags == 0)
+            {
+                // No row to read - a dynamic method, or IL from somewhere with no metadata.
+                if (this.IsStatic())
+                    yield return "static";
+
+                yield break;
+            }
+
+            switch (flags & MemberAccessMask)
+            {
+                case 1: yield return "private"; break;
+                case 2: yield return "private protected"; break;
+                case 3: yield return "internal"; break;
+                case 4: yield return "protected"; break;
+                case 5: yield return "protected internal"; break;
+                case 6: yield return "public"; break;
+            }
+
+            if ((flags & StaticFlag) != 0)
+                yield return "static";
+
+            var reusesSlot = (flags & NewSlotFlag) == 0;
+
+            if ((flags & AbstractFlag) != 0)
+            {
+                yield return "abstract";
+
+                if (reusesSlot)
+                    yield return "override";
+            }
+            else if ((flags & VirtualFlag) != 0)
+            {
+                if (!reusesSlot)
+                {
+                    yield return "virtual";
+                }
+                else
+                {
+                    if ((flags & FinalFlag) != 0)
+                        yield return "sealed";
+
+                    yield return "override";
+                }
+            }
+
+            if ((flags & PInvokeFlag) != 0)
+                yield return "extern";
+        }
+
+        /// <summary>
+        /// Rewrites a zero or a one being stored somewhere that holds a bool as
+        /// <c>false</c> or <c>true</c>.
+        /// </summary>
+        /// <remarks>
+        /// A bool is an integer in IL: <c>ldc.i4.1; stloc.0</c> is what <c>flag = true</c>
+        /// compiles to, and the only thing that knows the difference is the type of the slot
+        /// being written. Doing it here rather than at the return means the value is already
+        /// spelled right wherever it ends up - including in a return the structuring passes
+        /// build later out of the assignment.
+        /// </remarks>
+        private void SpellBooleanLiteral(Slot value, Flavour destination)
+        {
+            if (destination != Flavour.Boolean || value.Tokens.Count != 1)
+                return;
+
+            var literal = value.Tokens[0];
+
+            if (literal.Kind != ClrCSharpTokenKind.Number || literal.Text != "0" && literal.Text != "1")
+                return;
+
+            value.Tokens[0] = Keyword(literal.Text == "0" ? "false" : "true");
+            value.Flavour = Flavour.Boolean;
+        }
+
+        /// <summary>
+        /// The tokens for a returned value, with a bool spelled the way source spells one.
+        /// </summary>
+        /// <remarks>
+        /// A bool is an integer in IL, so returning true is <c>ldc.i4.1</c> and comes back as
+        /// <c>return 1;</c> from a method whose signature says bool. The signature is the thing
+        /// that knows better, so it decides.
+        /// </remarks>
+        private List<ClrCSharpToken> Returned(Slot value)
+        {
+            if (this.ReturnTypeText() != "bool" || value.Tokens.Count != 1)
+                return value.Tokens;
+
+            var literal = value.Tokens[0];
+
+            if (literal.Kind != ClrCSharpTokenKind.Number || literal.Text != "0" && literal.Text != "1")
+                return value.Tokens;
+
+            return new List<ClrCSharpToken> { Keyword(literal.Text == "0" ? "false" : "true") };
+        }
+
+        /// <summary>
+        /// A <c>where</c> clause per constrained type parameter, as source wrote them.
+        /// </summary>
+        /// <remarks>
+        /// Only the method's own parameters: a constraint on the declaring type belongs to the
+        /// type, and a listing of one method should not claim it.
+        /// </remarks>
+        private IEnumerable<ClrCSharpToken[]> Constraints()
+        {
+            if (this.il.Metadata == null || this.il.MetadataToken == 0)
+                yield break;
+
+            foreach (var parameter in this.il.Metadata.GenericParameters((int)this.il.MetadataToken))
+            {
+                var described = parameter.ToString();
+
+                if (described == parameter.Name)
+                    continue;
+
+                yield return new[]
+                {
+                    Keyword("where"),
+                    Punctuation(" "),
+                    Type(this.Named(CSharpNames.ShortenAll(described)))
+                };
+            }
         }
 
         private bool IsStatic()
@@ -310,12 +674,12 @@ namespace ClrSpector
         private string ReturnTypeText()
         {
             if (this.il.Method is MethodInfo info)
-                return CSharpNames.Of(info.ReturnType);
+                return this.Named(CSharpNames.Of(info.ReturnType));
 
             if (this.il.Method is ConstructorInfo)
                 return "void";
 
-            return this.signature == null ? "var" : CSharpNames.Of(this.signature.ReturnType);
+            return this.signature == null ? "var" : this.Named(CSharpNames.Of(this.signature.ReturnType));
         }
 
         private IEnumerable<(string Type, string Name)> ParameterText()
@@ -325,7 +689,10 @@ namespace ClrSpector
             if (this.il.Method != null)
             {
                 foreach (var parameter in this.il.Method.GetParameters())
-                    yield return (CSharpNames.Of(parameter.ParameterType), this.ArgumentName(parameter.Position + offset));
+                {
+                    yield return (this.Named(CSharpNames.Of(parameter.ParameterType)),
+                        this.ArgumentName(parameter.Position + offset));
+                }
 
                 yield break;
             }
@@ -334,7 +701,10 @@ namespace ClrSpector
                 yield break;
 
             foreach (var parameter in this.signature.Parameters)
-                yield return (CSharpNames.Of(parameter.Type), this.ArgumentName(parameter.Index + offset));
+            {
+                yield return (this.Named(CSharpNames.Of(parameter.Type)),
+                    this.ArgumentName(parameter.Index + offset));
+            }
         }
 
         /// <summary>
@@ -362,7 +732,7 @@ namespace ClrSpector
                             local.IsPinned
                                 ? new[] { Keyword("fixed"), Punctuation(" ") }
                                 : Array.Empty<ClrCSharpToken>(),
-                            Type(LocalTypeText(local)),
+                            Type(this.Named(LocalTypeText(local))),
                             Punctuation(" "),
                             Identifier(local.DisplayName),
                             Punctuation(";")));
@@ -424,10 +794,33 @@ namespace ClrSpector
 
                 return local.IsPinned || local.Type == null && local.SignatureType == null
                     ? null
-                    : LocalTypeText(local);
+                    : this.Named(LocalTypeText(local));
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Whether <paramref name="name"/> is a variable the source declared, as opposed to a
+        /// slot the compiler needed or one this projection invented.
+        /// </summary>
+        /// <remarks>
+        /// Only a PDB says so, and only for what the source named: a compiler temporary either
+        /// has no name at all or one that could not be written in source, which is what the
+        /// angle brackets and dollars in it are for.
+        /// </remarks>
+        private bool IsSourceNamed(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return false;
+
+            foreach (var local in this.il.LocalVariables)
+            {
+                if (local.Name == name)
+                    return name.IndexOf('<') < 0 && name.IndexOf('$') < 0;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -859,6 +1252,7 @@ namespace ClrSpector
                 var slot = IndexOf(instruction);
                 var value = this.Pop();
 
+                this.SpellBooleanLiteral(value, this.LocalFlavour(slot));
                 this.SpillDependents(slot, false, false);
                 this.Assign(instruction, value, Identifier(this.LocalName(slot)));
 
@@ -915,7 +1309,51 @@ namespace ClrSpector
             var right = this.Pop();
             var left = this.Pop();
 
+            if (this.TryNormalisedCondition(instruction, left, op, right))
+                return true;
+
             this.Push(this.BinaryOp(instruction, left, op, right, precedence));
+
+            return true;
+        }
+
+        /// <summary>
+        /// Folds away the comparison against zero the compiler uses to normalise a bool.
+        /// </summary>
+        /// <remarks>
+        /// A condition that has already been computed into a bool is turned back into a bool
+        /// with <c>cgt.un</c> against zero, so <c>e.Message.Length &gt; 1</c> arrives as
+        /// <c>(e.Message.Length &gt; 1) &gt; 0</c>. Comparing a bool to zero that way is the
+        /// identity, and comparing it with <c>ceq</c> is its negation - both of which say less
+        /// than the expression already did.
+        /// </remarks>
+        private bool TryNormalisedCondition(ClrIlInstruction instruction, Slot left, string op, Slot right)
+        {
+            if (this.form != ClrCSharpForm.Structured || !left.IsCondition)
+                return false;
+
+            if (right.Tokens.Count != 1 || right.Tokens[0].Text != "0")
+                return false;
+
+            if (op != ">" && op != "!=" && op != "==")
+                return false;
+
+            var folded = this.Build(instruction, left.Precedence, left, right);
+
+            if (op == "==")
+            {
+                folded.Tokens.Add(Punctuation("!"));
+                folded.Tokens.AddRange(Wrap(left, Unary));
+                folded.Precedence = Unary;
+            }
+            else
+            {
+                folded.Tokens.AddRange(left.Tokens);
+            }
+
+            folded.Flavour = Flavour.Boolean;
+
+            this.Push(folded);
 
             return true;
         }
@@ -1022,9 +1460,9 @@ namespace ClrSpector
             var conditional = this.Statement(
                 source,
                 Join(
-                    new[] { ControlKeyword("if"), Punctuation(" (") },
-                    condition,
-                    Punctuation(") "))
+                        new[] { ControlKeyword("if"), Punctuation(" (") },
+                        condition,
+                        Punctuation(") "))
                     .Concat(GotoTokens(branch.Target))
                     .ToArray());
 
@@ -1056,7 +1494,11 @@ namespace ClrSpector
                 var line = this.Fixed(this.Scaffold(
                     this.indent + 1,
                     Join(
-                        new[] { ControlKeyword("case"), Punctuation(" "), Number(i.ToString(CultureInfo.InvariantCulture)), Punctuation(": ") },
+                        new[]
+                        {
+                            ControlKeyword("case"), Punctuation(" "), Number(i.ToString(CultureInfo.InvariantCulture)),
+                            Punctuation(": ")
+                        },
                         GotoTokens(targets[i]))));
 
                 // The case's jump is not rewritten, but it is still a jump: a pass that did not
@@ -1098,7 +1540,7 @@ namespace ClrSpector
                 var value = receiver == null ? this.New(instruction) : this.Build(instruction, Unary, receiver);
 
                 value.Tokens.AddRange(Join(
-                    new[] { Punctuation("&"), Type(target.Owner), Punctuation("."), CallName(target.Name) }));
+                    Punctuation("&"), this.Qualifier(target), CallName(target.Name)));
 
                 this.Push(value);
 
@@ -1131,6 +1573,12 @@ namespace ClrSpector
             if (this.TryProperty(instruction, target, arguments, instance))
                 return true;
 
+            if (this.TryOperator(instruction, target, arguments, instance))
+                return true;
+
+            if (this.TryValueConstruction(instruction, target, arguments, instance))
+                return true;
+
             var call = this.Build(instruction, Primary, operands.ToArray());
             call.HasSideEffects = true;
             call.Flavour = name == "newobj" ? Flavour.Reference : target.Returns;
@@ -1147,8 +1595,7 @@ namespace ClrSpector
             }
             else
             {
-                call.Tokens.Add(Type(target.Owner));
-                call.Tokens.Add(Punctuation("."));
+                call.Tokens.AddRange(this.Qualifier(target));
                 call.Tokens.Add(CallName(target.Name));
             }
 
@@ -1166,7 +1613,8 @@ namespace ClrSpector
 
             if (name == "jmp")
             {
-                this.Statement(call.Source, Join(new[] { ControlKeyword("return"), Punctuation(" ") }, call.Tokens, Punctuation(";")));
+                this.Statement(call.Source,
+                    Join(new[] { ControlKeyword("return"), Punctuation(" ") }, call.Tokens, Punctuation(";")));
 
                 return true;
             }
@@ -1287,20 +1735,28 @@ namespace ClrSpector
         }
 
         /// <summary>
+        /// The type a static call is qualified by, and the dot after it - or nothing, when the
+        /// operand did not say which type it belongs to.
+        /// </summary>
+        /// <remarks>
+        /// A token that names no owner is not a reason to write one: <c>?.Method()</c> claims
+        /// there is a type called <c>?</c>, where <c>Method()</c> says only what is known.
+        /// </remarks>
+        private List<ClrCSharpToken> Qualifier(CallTarget target)
+        {
+            return string.IsNullOrEmpty(target.Owner) || target.Owner == "?"
+                ? new List<ClrCSharpToken>()
+                : new List<ClrCSharpToken> { Type(this.Named(target.Owner)), Punctuation(".") };
+        }
+
+        /// <summary>
         /// A call's receiver. The address of a local is spelled as the local: calling a value
         /// type's method needs its address, and <c>(&amp;loc0).ToString()</c> is that ceremony
         /// rather than anything the source said.
         /// </summary>
         private static List<ClrCSharpToken> Receiver(Slot instance)
         {
-            if (instance.Tokens.Count == 2
-                && instance.Tokens[0].Text == "&"
-                && instance.Tokens[1].Kind == ClrCSharpTokenKind.Identifier)
-            {
-                return new List<ClrCSharpToken> { instance.Tokens[1] };
-            }
-
-            return Wrap(instance, Primary);
+            return instance.AddressedPlace ?? Wrap(instance, Primary);
         }
 
         /// <summary>
@@ -1312,14 +1768,150 @@ namespace ClrSpector
         /// without walking the Property table. The convention is the compiler's own, so
         /// <c>get_Current()</c> with no arguments is a property read and nothing else.
         /// </remarks>
+        /// <summary>
+        /// An operator method written as the operator it is.
+        /// </summary>
+        /// <remarks>
+        /// C# compiles an operator on anything that is not a primitive into a call to a method
+        /// with a reserved name, and generic maths turns every operator on a type parameter into
+        /// one - so a constrained generic method reads as a list of calls until they are written
+        /// back. The names are the ones ECMA-335 reserves, so nothing is called this by accident.
+        /// </remarks>
+        private bool TryOperator(
+            ClrIlInstruction instruction, CallTarget target, List<Slot> arguments, Slot instance)
+        {
+            if (this.form != ClrCSharpForm.Structured || instance != null)
+                return false;
+
+            var (symbol, precedence, arity) = OperatorOf(target.Name);
+
+            if (symbol == null || arguments.Count != arity)
+                return false;
+
+            var result = this.Build(instruction, precedence, arguments.ToArray());
+            result.HasSideEffects = true;
+
+            if (arity == 1)
+            {
+                // A step reads as one: an increment is not a prefix operator on its operand.
+                if (symbol == "++" || symbol == "--")
+                {
+                    result.Tokens.AddRange(Wrap(arguments[0], Additive));
+                    result.Tokens.Add(Punctuation(symbol == "++" ? " + " : " - "));
+                    result.Tokens.Add(Number("1"));
+                }
+                else
+                {
+                    result.Tokens.Add(Punctuation(symbol));
+                    result.Tokens.AddRange(Wrap(arguments[0], Unary));
+                }
+            }
+            else
+            {
+                result.Tokens.AddRange(Wrap(arguments[0], precedence));
+                result.Tokens.Add(Punctuation($" {symbol} "));
+                result.Tokens.AddRange(Wrap(arguments[1], precedence + 1));
+            }
+
+            if (precedence == Equality || precedence == Relational)
+                result.Flavour = Flavour.Boolean;
+
+            this.Push(result);
+
+            return true;
+        }
+
+        /// <summary>
+        /// The operator a method's reserved name stands for, how tightly it binds, and how many
+        /// operands it takes.
+        /// </summary>
+        private static (string Symbol, int Precedence, int Arity) OperatorOf(string name)
+        {
+            switch (name)
+            {
+                case "op_Addition": return ("+", Additive, 2);
+                case "op_Subtraction": return ("-", Additive, 2);
+                case "op_Multiply": return ("*", Multiplicative, 2);
+                case "op_Division": return ("/", Multiplicative, 2);
+                case "op_Modulus": return ("%", Multiplicative, 2);
+                case "op_BitwiseAnd": return ("&", BitAnd, 2);
+                case "op_BitwiseOr": return ("|", BitOr, 2);
+                case "op_ExclusiveOr": return ("^", BitXor, 2);
+                case "op_LeftShift": return ("<<", Shift, 2);
+                case "op_RightShift": return (">>", Shift, 2);
+                case "op_Equality": return ("==", Equality, 2);
+                case "op_Inequality": return ("!=", Equality, 2);
+                case "op_LessThan": return ("<", Relational, 2);
+                case "op_GreaterThan": return (">", Relational, 2);
+                case "op_LessThanOrEqual": return ("<=", Relational, 2);
+                case "op_GreaterThanOrEqual": return (">=", Relational, 2);
+                case "op_UnaryNegation": return ("-", Unary, 1);
+                case "op_UnaryPlus": return ("+", Unary, 1);
+                case "op_LogicalNot": return ("!", Unary, 1);
+                case "op_OnesComplement": return ("~", Unary, 1);
+                case "op_Increment": return ("++", Additive, 1);
+                case "op_Decrement": return ("--", Additive, 1);
+                default: return (null, 0, 0);
+            }
+        }
+
+        /// <summary>
+        /// A value type's constructor, written as the assignment it amounts to.
+        /// </summary>
+        /// <remarks>
+        /// A struct is constructed in place: the IL takes the address of the local and calls the
+        /// constructor on it, where the source wrote an assignment of a new value. Left alone it
+        /// reads as <c>span..ctor(values)</c>, which is not something anyone wrote.
+        /// </remarks>
+        private bool TryValueConstruction(
+            ClrIlInstruction instruction, CallTarget target, List<Slot> arguments, Slot instance)
+        {
+            if (this.form != ClrCSharpForm.Structured || target.Name != ".ctor")
+                return false;
+
+            if (instance?.AddressedPlace == null)
+                return false;
+
+            var construction = this.Build(instruction, Primary, arguments.ToArray());
+
+            construction.Tokens.Add(Keyword("new"));
+            construction.Tokens.Add(Punctuation(" "));
+            construction.Tokens.Add(Type(this.Named(target.Owner)));
+            construction.Tokens.Add(Punctuation("("));
+
+            for (var i = 0; i < arguments.Count; i++)
+            {
+                if (i > 0)
+                    construction.Tokens.Add(Punctuation(", "));
+
+                construction.Tokens.AddRange(arguments[i].Tokens);
+            }
+
+            construction.Tokens.Add(Punctuation(")"));
+
+            var node = this.Statement(
+                construction.Source.Concat(instance.Source).OrderBy(item => item.Offset),
+                Join(instance.AddressedPlace, Punctuation(" = "), construction.Tokens, Punctuation(";")));
+
+            node.Value = construction.Tokens;
+
+            if (instance.AddressedPlace.Count == 1
+                && instance.AddressedPlace[0].Kind == ClrCSharpTokenKind.Identifier)
+            {
+                node.AssignedName = instance.AddressedPlace[0].Text;
+            }
+
+            return true;
+        }
+
         private bool TryProperty(
             ClrIlInstruction instruction, CallTarget target, List<Slot> arguments, Slot instance)
         {
             if (this.form != ClrCSharpForm.Structured)
                 return false;
 
-            var getter = target.Name.StartsWith("get_", StringComparison.Ordinal) && arguments.Count == 0;
-            var setter = target.Name.StartsWith("set_", StringComparison.Ordinal) && arguments.Count == 1;
+            var getter = target.Name.StartsWith("get_", StringComparison.Ordinal);
+            var setter = target.Name.StartsWith("set_", StringComparison.Ordinal);
 
             if (!getter && !setter)
                 return false;
@@ -1329,15 +1921,47 @@ namespace ClrSpector
             if (property.Length == 0)
                 return false;
 
+            // An indexer is a property called Item whose arguments are the index. Anything else
+            // taking arguments is a method whose name happens to start the same way.
+            var indexer = property == "Item" && (getter ? arguments.Count > 0 : arguments.Count > 1);
+
+            if (!indexer && (getter ? arguments.Count != 0 : arguments.Count != 1))
+                return false;
+
+            var indices = indexer
+                ? arguments.Take(getter ? arguments.Count : arguments.Count - 1).ToList()
+                : new List<Slot>();
+
             var operands = instance == null ? arguments : new[] { instance }.Concat(arguments).ToList();
             var access = this.Build(instruction, Primary, operands.ToArray());
 
-            access.Tokens.AddRange(instance == null
-                ? new[] { Type(target.Owner) }
-                : Receiver(instance));
+            if (instance == null)
+                access.Tokens.AddRange(this.Qualifier(target));
+            else
+                access.Tokens.AddRange(Receiver(instance));
 
-            access.Tokens.Add(Punctuation("."));
-            access.Tokens.Add(MemberToken(property));
+            if (indexer)
+            {
+                access.Tokens.Add(Punctuation("["));
+
+                for (var i = 0; i < indices.Count; i++)
+                {
+                    if (i > 0)
+                        access.Tokens.Add(Punctuation(", "));
+
+                    access.Tokens.AddRange(indices[i].Tokens);
+                }
+
+                access.Tokens.Add(Punctuation("]"));
+            }
+            else
+            {
+                if (instance != null)
+                    access.Tokens.Add(Punctuation("."));
+
+                access.Tokens.Add(MemberToken(property));
+            }
+
             access.HasSideEffects = true;
             access.Flavour = target.Returns;
 
@@ -1348,10 +1972,14 @@ namespace ClrSpector
                 return true;
             }
 
-            var node = this.Statement(
-                access.Source, Join(access.Tokens, Punctuation(" = "), arguments[0].Tokens, Punctuation(";")));
+            // The value assigned is the setter's last argument, which for an indexer comes after
+            // the indices.
+            var assigned = arguments[arguments.Count - 1];
 
-            node.Value = arguments[0].Tokens;
+            var node = this.Statement(
+                access.Source, Join(access.Tokens, Punctuation(" = "), assigned.Tokens, Punctuation(";")));
+
+            node.Value = assigned.Tokens;
 
             return true;
         }
@@ -1676,7 +2304,7 @@ namespace ClrSpector
 
             var returned = this.Statement(
                 value.Source.Append(instruction),
-                Join(new[] { ControlKeyword("return"), Punctuation(" ") }, value.Tokens, Punctuation(";")));
+                Join(new[] { ControlKeyword("return"), Punctuation(" ") }, this.Returned(value), Punctuation(";")));
 
             returned.Control = CSharpControl.Return;
             returned.Value = value.Tokens;
@@ -1923,6 +2551,18 @@ namespace ClrSpector
             if (instructions.Count == 0)
                 return null;
 
+            // An offset something jumps to has to keep its own label, even when an instruction
+            // before it - a nop the compiler left as a sequence point - was folded into the same
+            // statement and would otherwise name it.
+            var target = instructions.FirstOrDefault(item => this.boundaries.Contains(item.Offset));
+
+            if (target != null)
+            {
+                this.lastLabel = Math.Max(this.lastLabel, target.Offset);
+
+                return target.Offset;
+            }
+
             var first = instructions.Min(item => item.Offset);
 
             // A branch target keeps its own label whatever else has been printed - a goto with
@@ -2031,6 +2671,7 @@ namespace ClrSpector
         private Slot AddressOf(ClrIlInstruction from, ClrCSharpToken name)
         {
             var slot = this.Leaf(from, Punctuation("&"), name);
+            slot.AddressedPlace = new List<ClrCSharpToken> { name };
 
             // Taking an address binds more loosely than a member access does, so &n.ToString()
             // would read as the address of the result rather than a call on the address.
@@ -2042,6 +2683,8 @@ namespace ClrSpector
         private Slot AddressOfExpression(ClrIlInstruction from, Slot receiver, string member)
         {
             var slot = this.MemberAccess(from, receiver, member);
+
+            slot.AddressedPlace = slot.Tokens.ToList();
             slot.Tokens.Insert(0, Punctuation("&"));
             slot.Precedence = Unary;
 
@@ -2294,7 +2937,8 @@ namespace ClrSpector
 
             var dot = name.LastIndexOf('.');
 
-            if (dot >= 0 && dot + 1 < name.Length && char.IsDigit(name[dot + 1]) && name.StartsWith("ldc.i4.", StringComparison.Ordinal))
+            if (dot >= 0 && dot + 1 < name.Length && char.IsDigit(name[dot + 1]) &&
+                name.StartsWith("ldc.i4.", StringComparison.Ordinal))
                 return name.Substring(dot + 1);
 
             var text = instruction.OperandText();
@@ -2354,7 +2998,7 @@ namespace ClrSpector
             }
         }
 
-        private static string TypeName(object operand)
+        private string TypeName(object operand)
         {
             switch (operand)
             {
@@ -2365,7 +3009,7 @@ namespace ClrSpector
                     return "?";
 
                 default:
-                    return CSharpNames.ShortenAll(operand.ToString());
+                    return this.Named(CSharpNames.ShortenAll(operand.ToString()));
             }
         }
 
@@ -2633,7 +3277,7 @@ namespace ClrSpector
             foreach (var character in text)
             {
                 if (char.IsLetterOrDigit(character) || character == '_'
-                    || character == '.' || character == '+' || character == '`')
+                                                    || character == '.' || character == '+' || character == '`')
                 {
                     run.Append(character);
 

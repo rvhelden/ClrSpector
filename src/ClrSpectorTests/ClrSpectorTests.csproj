@@ -15,6 +15,9 @@
     -->
     <TieredCompilation>false</TieredCompilation>
     <Features>runtime-async=on</Features>
+
+    <!-- ModernSample.cs uses a .NET 11 union, which is a preview language feature. -->
+    <LangVersion>preview</LangVersion>
   </PropertyGroup>
 
   <ItemGroup>

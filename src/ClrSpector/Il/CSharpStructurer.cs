@@ -33,10 +33,17 @@ namespace ClrSpector
     internal sealed class CSharpStructurer
     {
         /// <summary>
-        /// A stop on the rewrite loop. Each round has to remove something to earn another, so
-        /// this is only ever reached if a pass undoes what another did - a bug, but a bounded one.
+        /// How many rewrites are allowed per statement before the loop gives up.
         /// </summary>
-        private const int MaximumRounds = 12;
+        /// <remarks>
+        /// A round applies one rewrite and starts again, because a fold often exposes the next
+        /// one - a conditional expression only becomes foldable once the temporary feeding it
+        /// has been. So the budget has to scale with the method: a fixed dozen rounds silently
+        /// stopped halfway through anything larger than an example. Each rewrite removes at
+        /// least one statement, so this is a stop on a pass undoing another's work, not on
+        /// ordinary progress.
+        /// </remarks>
+        private const int RoundsPerStatement = 4;
 
         private readonly List<CSharpNode> nodes;
 
@@ -44,15 +51,21 @@ namespace ClrSpector
 
         private readonly Func<string, string> localTypeOf;
 
+        private readonly Func<string, bool> isSourceNamed;
+
         /// <summary>Names this declared inside a loop header, so nothing declares them again.</summary>
         private readonly HashSet<string> declaredInPlace = new HashSet<string>();
 
         private CSharpStructurer(
-            List<CSharpNode> nodes, IEnumerable<int> pinnedOffsets, Func<string, string> localTypeOf)
+            List<CSharpNode> nodes,
+            IEnumerable<int> pinnedOffsets,
+            Func<string, string> localTypeOf,
+            Func<string, bool> isSourceNamed)
         {
             this.nodes = nodes;
             this.pinnedOffsets = new HashSet<int>(pinnedOffsets);
             this.localTypeOf = localTypeOf;
+            this.isSourceNamed = isSourceNamed;
         }
 
         /// <summary>
@@ -65,11 +78,19 @@ namespace ClrSpector
         /// </param>
         /// <param name="localTypeOf">How to spell a local's type, for a loop variable declared
         /// in the loop that uses it.</param>
+        /// <param name="isSourceNamed">
+        /// Whether a name is one the source wrote. Those are left alone: folding a variable the
+        /// author declared into the expression that reads it moves further from the source than
+        /// the jumps did, and the whole point of the pass is to move closer to it.
+        /// </param>
         /// <returns>The names declared inside a loop header, which nothing else should declare.</returns>
         public static IReadOnlyCollection<string> Apply(
-            List<CSharpNode> nodes, IEnumerable<int> pinnedOffsets, Func<string, string> localTypeOf)
+            List<CSharpNode> nodes,
+            IEnumerable<int> pinnedOffsets,
+            Func<string, string> localTypeOf,
+            Func<string, bool> isSourceNamed = null)
         {
-            var structurer = new CSharpStructurer(nodes, pinnedOffsets, localTypeOf);
+            var structurer = new CSharpStructurer(nodes, pinnedOffsets, localTypeOf, isSourceNamed);
             structurer.Run();
 
             return structurer.declaredInPlace;
@@ -77,9 +98,12 @@ namespace ClrSpector
 
         private void Run()
         {
-            for (var round = 0; round < MaximumRounds; round++)
+            var budget = this.nodes.Count * RoundsPerStatement + 16;
+
+            for (var round = 0; round < budget; round++)
             {
-                var changed = this.DropRedundantJumps()
+                var changed = this.SimplifyConstantBranches()
+                              || this.DropRedundantJumps()
                               || this.FoldConditionalExpressions()
                               || this.InlineSingleUseValues()
                               || this.CollapseReturnTemporaries()
@@ -93,7 +117,7 @@ namespace ClrSpector
             // Loops and conditionals are structured after the expression work: a loop whose test
             // is still spread over two statements does not match the pattern, and a conditional
             // whose arms have not been folded is not one.
-            for (var round = 0; round < MaximumRounds; round++)
+            for (var round = 0; round < budget; round++)
             {
                 if (!this.StructureLoops() && !this.StructureConditionals())
                     break;
@@ -101,7 +125,7 @@ namespace ClrSpector
 
             // Declarations move last, once the statements they would move onto have stopped
             // being rewritten and the loops have taken the variables that belong to them.
-            for (var round = 0; round < MaximumRounds; round++)
+            for (var round = 0; round < budget; round++)
             {
                 if (!this.DeclareAtFirstAssignment())
                     break;
@@ -109,6 +133,100 @@ namespace ClrSpector
         }
 
         // ---------- the passes ----------
+
+        /// <summary>
+        /// Rewrites a branch whose condition is a constant into the jump it always is, or
+        /// removes it when it never jumps.
+        /// </summary>
+        /// <remarks>
+        /// The compiler emits <c>ldc.i4.1; brtrue</c> around a switch expression and a few other
+        /// constructs, as somewhere to hang a sequence point. Read literally it is
+        /// <c>if (1 != 0) goto next</c>, which says nothing about the method: the jump is always
+        /// taken, and once it is unconditional the pass that drops jumps to the next statement
+        /// takes it away entirely.
+        /// </remarks>
+        private bool SimplifyConstantBranches()
+        {
+            for (var i = 0; i < this.nodes.Count; i++)
+            {
+                var test = this.nodes[i];
+
+                if (test.IsFixed || test.Control != CSharpControl.ConditionalGoto || test.Condition == null)
+                    continue;
+
+                var taken = AlwaysTaken(test.Condition);
+
+                if (taken == null)
+                    continue;
+
+                if (taken.Value)
+                {
+                    test.Tokens = Join(
+                        Keyword("goto"),
+                        Space(),
+                        Keyword($"IL_{test.Target ?? 0:x4}"),
+                        Semicolon());
+                    test.Control = CSharpControl.Goto;
+                    test.Condition = null;
+
+                    return true;
+                }
+
+                // Never taken: the statement is the branch and nothing else, so it goes - its
+                // instructions stay named on whatever follows it, which is also where anything
+                // that jumped to it was going to end up.
+                var next = this.NextStatement(i, allowClose: true, allowOpen: true);
+
+                if (next < 0 || this.nodes[next].Offset == null)
+                    continue;
+
+                this.RedirectJumps(test.Offset, this.nodes[next].Offset.Value);
+
+                this.MergeComment(this.nodes[next], test);
+                this.nodes.RemoveAt(i);
+
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Whether a condition is a constant, and which way - or null when it depends on
+        /// something.
+        /// </summary>
+        /// <remarks>
+        /// The two shapes a branch on a constant is projected as: the comparison against zero
+        /// that <c>brtrue</c> and <c>brfalse</c> become, and a bare number.
+        /// </remarks>
+        private static bool? AlwaysTaken(List<ClrCSharpToken> condition)
+        {
+            if (condition.Count == 1 && IsNumber(condition[0]))
+                return condition[0].Text != "0";
+
+            if (condition.Count != 3 || !IsNumber(condition[0]) || !IsNumber(condition[2]))
+                return null;
+
+            var zero = condition[2].Text == "0";
+            var nonZero = condition[0].Text != "0";
+
+            switch (condition[1].Text)
+            {
+                case " != " when zero:
+                    return nonZero;
+
+                case " == " when zero:
+                    return !nonZero;
+
+                default:
+                    return null;
+            }
+        }
+
+        private static bool IsNumber(ClrCSharpToken token)
+        {
+            return token.Kind == ClrCSharpTokenKind.Number;
+        }
 
         /// <summary>
         /// Drops a jump to the statement that already follows it. The compiler emits these at
@@ -129,6 +247,11 @@ namespace ClrSpector
 
                 if (next < 0 || this.nodes[next].Offset != jump.Target)
                     continue;
+
+                // Anything that jumped here now jumps where this jump went: arriving at this
+                // statement only ever meant going there, so the label goes with it rather than
+                // disappearing along with the statement.
+                this.RedirectJumps(jump.Offset, jump.Target.Value);
 
                 this.MergeComment(this.nodes[next], jump);
                 this.nodes.RemoveAt(i);
@@ -177,7 +300,11 @@ namespace ClrSpector
                 if (this.JumpsTo(whenFalse.Offset) != 0)
                     continue;
 
-                if (!this.SameDepth(i, i + 4) || this.AnyPinned(i, i + 4))
+                // Only the statements that go have to be unpinned: the test survives as the
+                // assignment, and the statement after the arms is not touched at all. Refusing
+                // on those would refuse every conditional at the start of a try block, whose
+                // first statement carries the region's own offset.
+                if (!this.SameDepth(i, i + 4) || this.AnyPinned(i + 1, i + 3))
                     continue;
 
                 // The branch is taken when the condition holds, so the arm it jumps to is the
@@ -225,6 +352,11 @@ namespace ClrSpector
                     continue;
 
                 var name = producer.AssignedName;
+
+                // A variable the source declared stays a variable.
+                if (this.isSourceNamed?.Invoke(name) == true)
+                    continue;
+
                 var next = this.NextStatement(i, allowClose: false, allowOpen: false);
 
                 if (next != i + 1)
@@ -235,7 +367,10 @@ namespace ClrSpector
                 if (consumer.IsFixed || this.JumpsTo(consumer.Offset) != 0)
                     continue;
 
-                if (!this.SameDepth(i, next) || this.AnyPinned(i, next))
+                // The producer is the statement that goes, so it is the one that may not sit
+                // at an offset the exception table names - and the consumer keeps its own label
+                // if that label is one, rather than taking the producer's over it.
+                if (!this.SameDepth(i, next) || this.AnyPinned(i, i) || this.AnyPinned(next, next))
                     continue;
 
                 if (consumer.ReadNames.Count(read => read == name) != 1)
@@ -280,16 +415,36 @@ namespace ClrSpector
                 if (node.Kind != CSharpNodeKind.Statement || !node.ReadNames.Contains(name))
                     continue;
 
-                var previous = this.PreviousStatement(i);
-
-                if (previous < 0 || this.nodes[previous].AssignedName != name)
+                if (!this.IsFedByTheStatementBefore(i, name))
                     return false;
 
-                if (this.JumpsTo(node.Offset) != 0 || this.nodes[previous].Depth != node.Depth)
-                    return false;
+                // A read something jumps to is reached more than one way, so every one of those
+                // ways has to write the name too - which is what a value carried to a shared
+                // statement by two branches looks like.
+                for (var j = 0; j < this.nodes.Count; j++)
+                {
+                    if (this.nodes[j].Target != node.Offset)
+                        continue;
+
+                    if (!this.IsFedByTheStatementBefore(j, name))
+                        return false;
+                }
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Whether the statement before <paramref name="index"/> writes <paramref name="name"/>,
+        /// at the same nesting - so control arriving here has just given the name its value.
+        /// </summary>
+        private bool IsFedByTheStatementBefore(int index, string name)
+        {
+            var previous = this.PreviousStatement(index);
+
+            return previous >= 0
+                   && this.nodes[previous].AssignedName == name
+                   && this.nodes[previous].Depth == this.nodes[index].Depth;
         }
 
         /// <summary>
@@ -441,15 +596,15 @@ namespace ClrSpector
 
                 var rest = node.Value.Skip(2).ToList();
 
-                // The remainder has to be one whole expression. A single token always is, and a
-                // bracketed run is one with its brackets on; anything else may be a chain -
+                // The remainder has to be one whole expression, or the operator it binds
+                // against may be looser than the compound assignment's implicit one:
                 // x = x - a - b is not x -= a - b.
                 if (rest.Count != 1)
                 {
-                    if (!IsBracketed(rest))
+                    if (IsBracketed(rest))
+                        rest = rest.Skip(1).Take(rest.Count - 2).ToList();
+                    else if (HasTopLevelOperator(rest))
                         continue;
-
-                    rest = rest.Skip(1).Take(rest.Count - 2).ToList();
                 }
 
                 var step = symbol.Text == " + " ? "++" : symbol.Text == " - " ? "--" : null;
@@ -462,6 +617,37 @@ namespace ClrSpector
                 node.AssignedName = null;
 
                 return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Whether <paramref name="tokens"/> has an operator outside any brackets, which is what
+        /// makes it more than one expression.
+        /// </summary>
+        /// <remarks>
+        /// A member access or an index is a single expression however many tokens it takes -
+        /// <c>this.Quantity</c>, <c>values[i]</c>, <c>reader.Read()</c> - and moving one to the
+        /// right of a compound assignment changes nothing. An operator at the top level would.
+        /// </remarks>
+        private static bool HasTopLevelOperator(List<ClrCSharpToken> tokens)
+        {
+            var operators = new[]
+            {
+                " + ", " - ", " * ", " / ", " % ", " & ", " | ", " ^ ", " << ", " >> ",
+                " == ", " != ", " < ", " > ", " <= ", " >= ", " ? ", " : ", " as "
+            };
+
+            var depth = 0;
+
+            foreach (var token in tokens)
+            {
+                depth += token.Text.Count(c => c == '(' || c == '[')
+                         - token.Text.Count(c => c == ')' || c == ']');
+
+                if (depth == 0 && operators.Contains(token.Text))
+                    return true;
             }
 
             return false;
@@ -572,14 +758,23 @@ namespace ClrSpector
                 if (entry.IsFixed || entry.Control != CSharpControl.Goto || entry.Target != back.Offset)
                     continue;
 
-                if (!this.IsSelfContained(body, test, entry))
+                // Where the loop leaves for when its test fails, which is what a break goes to.
+                var after = this.NextStatement(test, allowClose: true, allowOpen: false);
+                var exit = after < 0 ? null : this.nodes[after].Offset;
+
+                // A jump from inside the loop to its test is a continue, and one to what follows
+                // it is a break - so those two are the targets a self-contained loop may name
+                // outside itself.
+                if (!this.IsSelfContained(body, test, new[] { entry }, new[] { back.Offset, exit }))
                     continue;
 
-                // The test's label goes when the test does, so the jump into the loop has to be
-                // the only one that names it - a continue would name it too, and this does not
-                // model one. Same for the body's label and the back edge.
-                if (this.JumpsTo(back.Offset) != 1 || this.JumpsTo(this.nodes[body].Offset) != 1)
+                // From outside, the only jump into the loop may be the one that enters it: the
+                // test's label goes when the test does, and the body's is the back edge's.
+                if (this.JumpsFromOutside(back.Offset, body, test, entry) != 0
+                    || this.JumpsFromOutside(this.nodes[body].Offset, body, test, entry) != 0)
+                {
                     continue;
+                }
 
                 var increment = this.IncrementOf(test - 1, back.Condition, body);
                 var initialiser = increment == null ? -1 : this.InitialiserOf(preheader - 1, increment);
@@ -598,6 +793,9 @@ namespace ClrSpector
                         Punctuation("; "),
                         Expression(increment),
                         Punctuation(")"));
+
+                // Rewritten before the wrap, while the offsets still say what they say.
+                this.RewriteLoopJumps(body, test - 1, back.Offset, exit);
 
                 var last = increment == null ? test - 1 : test - 2;
 
@@ -691,7 +889,7 @@ namespace ClrSpector
         /// exception table names, a jump in from outside, or a jump out to anywhere other than
         /// the run's own labels.
         /// </remarks>
-        private bool IsSelfContained(int first, int last, params CSharpNode[] entries)
+        private bool IsSelfContained(int first, int last, CSharpNode[] entries = null, int?[] allowed = null)
         {
             if (first > last || first <= 0 || last >= this.nodes.Count)
                 return false;
@@ -734,7 +932,12 @@ namespace ClrSpector
 
                 // The jumps that make the block work - a loop's jump to its test - are the
                 // block's own entry, and are about to be replaced by it.
-                if (entries.Any(entry => ReferenceEquals(entry, this.nodes[i])))
+                if (entries != null && entries.Any(entry => ReferenceEquals(entry, this.nodes[i])))
+                    continue;
+
+                // A jump out of the block to somewhere the block itself accounts for: its test,
+                // or the statement after it, which become continue and break.
+                if (from && allowed != null && allowed.Any(offset => offset == target))
                     continue;
 
                 // A jump in from outside would skip the block's header; a jump out of it would
@@ -744,6 +947,70 @@ namespace ClrSpector
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// How many jumps from outside <paramref name="first"/>..<paramref name="last"/> name
+        /// <paramref name="offset"/>, not counting the block's own entry.
+        /// </summary>
+        private int JumpsFromOutside(int? offset, int first, int last, CSharpNode entry)
+        {
+            if (offset == null)
+                return 0;
+
+            var count = 0;
+
+            for (var i = 0; i < this.nodes.Count; i++)
+            {
+                if (this.nodes[i].Target != offset || (i >= first && i <= last))
+                    continue;
+
+                if (!ReferenceEquals(this.nodes[i], entry))
+                    count++;
+            }
+
+            return count;
+        }
+
+        /// <summary>
+        /// Turns the jumps a loop's body makes to its own test and its own exit into
+        /// <c>continue</c> and <c>break</c>.
+        /// </summary>
+        /// <remarks>
+        /// This is what the compiler does with both keywords, and with the false branch of an
+        /// <c>if</c> that is the last thing in a loop body - so a loop whose body branches back
+        /// to the test is far more common than one whose body does not.
+        /// </remarks>
+        private void RewriteLoopJumps(int first, int last, int? test, int? exit)
+        {
+            for (var i = first; i <= last && i < this.nodes.Count; i++)
+            {
+                var node = this.nodes[i];
+
+                if (node.IsFixed || node.Target == null)
+                    continue;
+
+                var keyword = node.Target == test ? "continue" : node.Target == exit ? "break" : null;
+
+                if (keyword == null)
+                    continue;
+
+                node.Tokens = node.Control == CSharpControl.ConditionalGoto && node.Condition != null
+                    ? Join(
+                        Keyword("if"),
+                        Space(),
+                        Punctuation("("),
+                        node.Condition,
+                        Punctuation(") "),
+                        Keyword(keyword),
+                        Semicolon())
+                    : Join(Keyword(keyword), Semicolon());
+
+                // No target any more: the keyword says where it goes, and nothing has to keep a
+                // label for it.
+                node.Target = null;
+                node.Control = CSharpControl.Goto;
+            }
         }
 
         /// <summary>
@@ -910,6 +1177,42 @@ namespace ClrSpector
         private IEnumerable<CSharpNode> Statements()
         {
             return this.nodes.Where(node => node.Kind == CSharpNodeKind.Statement);
+        }
+
+        /// <summary>
+        /// Points every jump to <paramref name="from"/> at <paramref name="to"/> instead.
+        /// </summary>
+        /// <remarks>
+        /// What makes this sound is that it is only ever used where arriving at
+        /// <paramref name="from"/> leads to <paramref name="to"/> and nowhere else - a jump to
+        /// the next statement, or a branch that is never taken. The label in the tokens is
+        /// rewritten with the target, so the printed goto and the recorded target cannot drift
+        /// apart.
+        /// </remarks>
+        private void RedirectJumps(int? from, int to)
+        {
+            if (from == null || from == to)
+                return;
+
+            foreach (var node in this.nodes)
+            {
+                if (node.Target != from)
+                    continue;
+
+                // A switch's cases are redirected too. Their shape is not rewritten - that is
+                // what makes them fixed - but a jump is a jump, and leaving one pointing at a
+                // label that has gone is worse than touching it.
+                node.Target = to;
+
+                for (var i = 0; i < node.Tokens.Count; i++)
+                {
+                    if (node.Tokens[i].Kind == ClrCSharpTokenKind.ControlKeyword
+                        && node.Tokens[i].Text.StartsWith("IL_", StringComparison.Ordinal))
+                    {
+                        node.Tokens[i] = Keyword($"IL_{to:x4}");
+                    }
+                }
+            }
         }
 
         /// <summary>How many jumps name <paramref name="offset"/> as their target.</summary>
@@ -1115,10 +1418,11 @@ namespace ClrSpector
             if (value == null || value.Count == 0)
                 return false;
 
-            // A value that is the whole of what it is substituted into needs no brackets; one
-            // going into the middle of an expression does, unless it is a single token.
+            // A value substituted into the middle of an expression needs brackets only if it
+            // has an operator of its own: a member access or a call is one thing however many
+            // tokens it takes, and bracketing it would only add noise.
             var whole = IsWhole(node.Value, name) || IsWhole(node.Condition, name);
-            var wrapped = value.Count > 1 && !whole ? Bracket(value) : value;
+            var wrapped = !whole && HasTopLevelOperator(value) ? Bracket(value) : value;
 
             var substituted = false;
 
