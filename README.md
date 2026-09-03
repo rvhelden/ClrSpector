@@ -1498,6 +1498,16 @@ name reads *nothing* off the frame: the offsets depend entirely on the kind, so 
 identifier — a real possibility, since a chain is mutated by the thread that owns it — stays
 harmless instead of convincing.
 
+Reading another thread's chain also has to assume every pointer on it is bad. The chain is mutated
+by the thread that owns it, so a snapshot can catch a frame mid-push: measured under load, other
+threads' chains produced identifiers like `7821424755623103304` alongside the real ones. An
+unrecognised kind therefore has *nothing* read off it — the offsets depend entirely on the kind —
+and every pointer that is followed (a MethodDesc, its MethodTable, that table's EEClass and Module)
+is alignment-checked and page-probed first. That is not defensive habit: **an access violation in
+.NET is a fatal error, not a catchable exception**, so a `try`/`catch` around the read cannot save
+the process. Chasing this down found three separate paths that would happily take the process out
+on a stale pointer.
+
 One limitation, stated because the sample shows it: an address in **ReadyToRun** code is placed in
 a range but not named. A jitted method's code header carries its MethodDesc; precompiled code does
 not, and naming a method there needs that image's own function table — a different lookup than the

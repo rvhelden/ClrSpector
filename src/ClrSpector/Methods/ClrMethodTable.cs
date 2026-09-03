@@ -585,17 +585,27 @@ namespace ClrSpector
             mt.UnionKind = (MethodTableUnionFieldKind)(union.ToInt64() & UnionTagMask);
             var unionTarget = new IntPtr(union.ToInt64() & ~(long)UnionTagMask);
 
+            // Passing the MethodTable's own readability check does not make its EEClass pointer
+            // good: a caller can reach this from an address read out of a live structure, and
+            // random memory that looks enough like a MethodTable can carry a null or wild pointer
+            // here. Following it would be an access violation, which is fatal rather than
+            // catchable, so it is probed first and left null when it does not hold up.
+            var usable = IsReadableStructure(unionTarget, "EEClass");
+
             switch (mt.UnionKind)
             {
                 case MethodTableUnionFieldKind.EEClass:
-                    mt.EEClass = ClrEEClass.Create(new MemoryReader(unionTarget));
+                    mt.EEClass = usable ? ClrEEClass.Create(new MemoryReader(unionTarget)) : null;
                     mt.CanonMethodTablePointer = mt.Address;
                     break;
 
                 case MethodTableUnionFieldKind.MethodTable:
                     // A shared instantiation: the EEClass hangs off the canonical MethodTable.
                     mt.CanonMethodTablePointer = unionTarget;
-                    mt.EEClass = EEClassOf(unionTarget);
+                    mt.EEClass = IsMethodTableHandle(unionTarget)
+                                 && IsReadableStructure(unionTarget, "MethodTable")
+                        ? EEClassOf(unionTarget)
+                        : null;
                     break;
 
                 default:
@@ -609,6 +619,24 @@ namespace ClrSpector
                 : ReadMethods(mt.EEClass.MethodDescChunks, descriptor);
 
             return mt;
+        }
+
+        /// <summary>
+        /// Whether a structure of the named descriptor type can be read at
+        /// <paramref name="address"/>.
+        /// </summary>
+        /// <remarks>
+        /// A pointer-alignment check first, because an unaligned pointer is never one of these
+        /// and rejecting it costs nothing; then the page probe, which is memoised per page.
+        /// </remarks>
+        private static bool IsReadableStructure(IntPtr address, string typeName)
+        {
+            if (address == IntPtr.Zero || address.ToInt64() % IntPtr.Size != 0)
+                return false;
+
+            var size = ContractDescriptor.Current.GetDataType(typeName).Size ?? (uint)IntPtr.Size;
+
+            return ProcessMemoryRegions.IsReadable(address, size);
         }
 
         /// <summary>

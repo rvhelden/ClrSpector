@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using ClrSpector;
@@ -380,22 +381,172 @@ namespace ClrSpectorConsole
             Line("resumed", $"result {pending.GetAwaiter().GetResult()}");
         }
 
+        /// <summary>
+        /// The managed threads, and where each one is.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// There is no "current instruction pointer" to read. A running thread's IP is in its
+        /// registers and on its own stack; the runtime caches it nowhere, so no structure holds
+        /// it and the only ways to it are to suspend the thread and ask the OS, or to be that
+        /// thread.
+        /// </para>
+        /// <para>
+        /// What the runtime does record is the explicit frame chain: every time a thread crosses
+        /// a boundary jitted code cannot describe by itself - a P/Invoke, a stub, a hijack - it
+        /// pushes a Frame holding what is needed to get back, which for a P/Invoke is the exact
+        /// managed return address. So a thread parked in native code can be placed precisely,
+        /// and a thread running managed code straight through reports nothing at all, because
+        /// there is nothing recorded to report.
+        /// </para>
+        /// </remarks>
         private static void Threads()
         {
-            using var gate = new ManualResetEventSlim();
-            var worker = new Thread(() => gate.Wait()) { IsBackground = true };
+            // Park a thread in native code so it has a transition frame to find. A plain managed
+            // wait would work too, but its return address lands in CoreLib's precompiled code,
+            // where the code map can name the kind but not the method - see below.
+            var parked = new ManualResetEventSlim();
+            var release = 0;
+
+            var worker = new Thread(() =>
+            {
+                parked.Set();
+                WaitNatively(ref release);
+            })
+            {
+                IsBackground = true
+            };
+
             worker.Start();
-            Thread.Sleep(50);
+            parked.Wait();
+            Thread.Sleep(100);
 
             var store = ClrThreadStore.Read();
             Line("store", store.ToString());
 
-            foreach (var thread in store.Threads.Take(3))
+            foreach (var thread in store.Threads)
+            {
                 Line($"  thread {thread.ManagedThreadId}", thread.ToString());
 
-            gate.Set();
+                // FRAME_TOP is ~0, not null: it means "this thread has pushed no frames", which
+                // is the normal state of a thread running managed code.
+                if (thread.Frames.Count == 0)
+                {
+                    Line("    where", "no frames - running managed code, so nothing records an ip");
+
+                    continue;
+                }
+
+                foreach (var frame in thread.Frames)
+                    Line("    frame", frame.ToString());
+
+                var innermost = thread.InnermostManagedFrame;
+
+                if (innermost != null)
+                {
+                    Line("    its ip", $"0x{innermost.ReturnAddress.ToInt64():x} is " +
+                                       $"{innermost.Method.DeclaringTypeName}::" +
+                                       $"{innermost.Method.Name}+" +
+                                       $"0x{innermost.CodeBlock?.OffsetIntoMethod:x}");
+
+                    ShowSource(thread);
+                }
+                else
+                {
+                    // An ip in precompiled code: the code map places the address in a
+                    // ReadyToRun range but a MethodDesc needs that image's own function table,
+                    // which is a different lookup from the one a jitted method's header answers.
+                    var withIp = thread.Frames.FirstOrDefault(f => f.ReturnAddress != IntPtr.Zero);
+
+                    Line("    its ip", withIp == null
+                        ? "no frame in the chain records one"
+                        : $"0x{withIp.ReturnAddress.ToInt64():x} in " +
+                          $"{withIp.CodeBlock?.Kind.ToString() ?? "unmapped"} code, " +
+                          "which the code map cannot name a method for");
+                }
+            }
+
+            Volatile.Write(ref release, 1);
             worker.Join();
+            parked.Dispose();
         }
+
+        /// <summary>
+        /// The C# of the nearest method on a thread's frame chain that has a body.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Not every method a frame names has a body. A P/Invoke is the obvious case and the one
+        /// this sample lands on: its implementation is the native function, so its MethodDef row
+        /// carries an RVA of zero and there is no IL anywhere to read. The same goes for an
+        /// abstract method and for an InternalCall.
+        /// </para>
+        /// <para>
+        /// <see cref="ClrMethodIl.Of(ClrMethodDescription)"/> returns <c>null</c> for those
+        /// rather than throwing, so projecting straight off its result is what turns "no body" -
+        /// an ordinary answer - into a NullReferenceException.
+        /// <see cref="ClrMethodDescription.HasBody"/> is the cheap way to ask first: it reads the
+        /// RVA out of metadata and no IL at all.
+        /// </para>
+        /// </remarks>
+        private static void ShowSource(ClrThread thread)
+        {
+            // The nearest frame that names a method with a body, which is not always the nearest
+            // frame that names a method at all.
+            var named = thread.Frames.Where(f => f.Method != null).ToList();
+            var withBody = named.FirstOrDefault(f => f.Method.HasBody);
+
+            if (withBody == null)
+            {
+                var names = string.Join(", ", named.Select(f => f.Method.Name));
+
+                Line("    no source", $"{names} - a transition frame names the stub it is " +
+                                      "standing on, and a stub has no IL body to project");
+
+                return;
+            }
+
+            var il = ClrMethodIl.Of(withBody.Method);
+
+            if (il == null)
+            {
+                Line("    no source", $"{withBody.Method.Name} has a body that would not read");
+
+                return;
+            }
+
+            View($"{withBody.Method.Name} as structured C#",
+                il.ToCSharp(ClrCSharpForm.Structured).Dump(IlDumpStyle.Auto));
+        }
+
+        /// <summary>
+        /// Blocks in a native call, so the thread is sitting on a transition frame.
+        /// </summary>
+        /// <remarks>
+        /// The P/Invoke is declared in this assembly, so its marshalling stub is jitted here and
+        /// the frame's return address resolves to a method. The same wait through CoreLib would
+        /// land in precompiled code instead.
+        /// </remarks>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void WaitNatively(ref int release)
+        {
+            while (Volatile.Read(ref release) == 0)
+                SleepNatively(20);
+        }
+
+        private static void SleepNatively(uint milliseconds)
+        {
+            if (OperatingSystem.IsWindows())
+                SleepWindows(milliseconds);
+            else
+                SleepPosix(milliseconds * 1000);
+        }
+
+        [DllImport("kernel32", EntryPoint = "Sleep")]
+        private static extern void SleepWindows(uint milliseconds);
+
+        [DllImport("libc", EntryPoint = "usleep")]
+        private static extern int SleepPosix(uint microseconds);
 
         private static void ExceptionFrames()
         {

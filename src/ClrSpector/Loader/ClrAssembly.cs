@@ -161,12 +161,22 @@ namespace ClrSpector
             return At(ClrModule.Of(typeInAssembly).Assembly);
         }
 
+        /// <summary>
+        /// The Assembly at <paramref name="address"/>, or null when there is not one there.
+        /// </summary>
+        /// <remarks>
+        /// Validated before it is read, for the same reason as
+        /// <see cref="ClrModule.At"/>: an address taken out of another structure can be stale,
+        /// and reading unmapped memory is fatal rather than catchable.
+        /// </remarks>
         public static ClrAssembly At(IntPtr address)
         {
-            if (address == IntPtr.Zero)
+            var descriptor = ContractDescriptor.Current;
+
+            if (!ClrModule.IsReadableStructure(address, descriptor, "Assembly"))
                 return null;
 
-            var layout = ContractDescriptor.Current.GetDataType("Assembly");
+            var layout = descriptor.GetDataType("Assembly");
             var reader = new MemoryReader(address);
 
             var assembly = new ClrAssembly

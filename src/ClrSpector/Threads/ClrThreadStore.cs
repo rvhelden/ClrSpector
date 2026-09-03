@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using ClrSpector.Cdac;
 
 namespace ClrSpector
@@ -75,6 +76,35 @@ namespace ClrSpector
 
         /// <summary>The runtime's current frame chain head for this thread.</summary>
         public IntPtr Frame { get; internal set; }
+
+        /// <summary>
+        /// The thread's explicit frame chain, nearest frame first.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// This is as close as an in-process reader gets to "where is this thread". A running
+        /// thread's instruction pointer is in its registers, not in any structure the runtime
+        /// keeps, so there is no field anywhere that holds it - reaching it means suspending the
+        /// thread and asking the OS for its context. What the runtime does record is this chain:
+        /// a frame per boundary the thread has crossed that jitted code cannot describe by
+        /// itself, each holding the return address or MethodDesc needed to get back across it.
+        /// </para>
+        /// <para>
+        /// So a thread parked in native code reports an exact managed call site, while one
+        /// running managed code straight through reports nothing at all - its
+        /// <see cref="Frame"/> is <c>FRAME_TOP</c> and there is genuinely nothing to read. Both
+        /// answers are honest; neither is a stack walk.
+        /// </para>
+        /// </remarks>
+        public IReadOnlyList<ClrFrame> Frames => this.frames ??= ClrFrame.Chain(this.Frame);
+
+        private IReadOnlyList<ClrFrame> frames;
+
+        /// <summary>
+        /// The nearest frame that names a managed method, or null when the chain names none.
+        /// </summary>
+        public ClrFrame InnermostManagedFrame =>
+            this.Frames.FirstOrDefault(f => f.Method != null);
 
         public bool IsBackground => (this.State & ClrThreadState.Background) != 0;
 

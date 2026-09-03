@@ -292,9 +292,44 @@ namespace ClrSpector
         }
 
         /// <summary>Reads the runtime's Module at <paramref name="address"/>.</summary>
+        /// <summary>
+        /// The Module at <paramref name="address"/>, or null when there is not one there.
+        /// </summary>
+        /// <remarks>
+        /// The address is validated before it is read. Callers reach this with pointers taken out
+        /// of other structures - a MethodTable's Module field, an AssemblyRef map entry - and one
+        /// of those can be null, stale or torn if the structure it came from was not itself
+        /// trustworthy. Reading unmapped memory raises an access violation, which in .NET is a
+        /// fatal error rather than a catchable exception, so there is no recovering from having
+        /// read it: the check has to come first.
+        /// </remarks>
         public static ClrModule At(IntPtr address)
         {
-            return address == IntPtr.Zero ? null : new ClrModule(address, ContractDescriptor.Current);
+            var descriptor = ContractDescriptor.Current;
+
+            if (!IsReadableStructure(address, descriptor, "Module"))
+                return null;
+
+            return new ClrModule(address, descriptor);
+        }
+
+        /// <summary>
+        /// Whether a structure of the named descriptor type can be read at
+        /// <paramref name="address"/>.
+        /// </summary>
+        /// <remarks>
+        /// The alignment test comes first because it costs nothing and no runtime structure is
+        /// ever unaligned; the page probe behind it is memoised per page.
+        /// </remarks>
+        internal static bool IsReadableStructure(
+            IntPtr address, ContractDescriptor descriptor, string typeName)
+        {
+            if (address == IntPtr.Zero || address.ToInt64() % IntPtr.Size != 0)
+                return false;
+
+            var size = descriptor.GetDataType(typeName).Size ?? (uint)IntPtr.Size;
+
+            return ProcessMemoryRegions.IsReadable(address, size);
         }
 
         /// <summary>

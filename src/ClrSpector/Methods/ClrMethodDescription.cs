@@ -687,7 +687,11 @@ namespace ClrSpector
                 if (methodTable == null || methodTable.Module == IntPtr.Zero)
                     return null;
 
-                return ClrModuleMetadata.Of(ClrModule.At(methodTable.Module));
+                // ClrModule.At validates the address and returns null when there is no Module
+                // there, which a stale MethodTable can point at.
+                var module = ClrModule.At(methodTable.Module);
+
+                return module == null ? null : ClrModuleMetadata.Of(module);
             }
         }
 
@@ -774,8 +778,30 @@ namespace ClrSpector
             var alignment = (int)descriptor.Globals.Number("MethodDescAlignment");
             var remainderBits = (int)descriptor.Globals.Number("MethodDescTokenRemainderBitCount");
 
+            // An address handed in here can come from a live structure - a frame on a running
+            // thread, a hash table mid-resize - so it is validated before it is dereferenced
+            // rather than after. Reading unmapped memory raises an access violation, and that is
+            // a fatal error in .NET rather than a catchable exception, so a try/catch around the
+            // read would not save the process. The only safe order is to ask first.
+            if (address.ToInt64() % IntPtr.Size != 0)
+                throw new ClrSpectorUnsupportedRuntimeException(
+                    $"0x{address.ToInt64():x} is not pointer-aligned, so it is not a MethodDesc.");
+
+            if (!ProcessMemoryRegions.IsReadable(address, (int)layout.RequiredSize))
+                throw new ClrSpectorUnsupportedRuntimeException(
+                    $"The {layout.RequiredSize} bytes at 0x{address.ToInt64():x} are not readable, " +
+                    $"so there is no MethodDesc there.");
+
             var chunkIndex = new MemoryReader(address).ReadByte(layout["ChunkIndex"]);
             var chunk = address - (int)chunkLayout.RequiredSize - (chunkIndex * alignment);
+
+            // The step back is computed from a byte just read out of that same untrusted memory,
+            // so where it lands has to be checked too.
+            if (!ProcessMemoryRegions.IsReadable(chunk, (int)chunkLayout.RequiredSize))
+                throw new ClrSpectorUnsupportedRuntimeException(
+                    $"The MethodDesc at 0x{address.ToInt64():x} reports chunk index {chunkIndex}, " +
+                    $"which points back to 0x{chunk.ToInt64():x} - not readable, so the address is " +
+                    $"not a MethodDesc.");
 
             var chunkReader = new MemoryReader(chunk);
             var count = chunkReader.ReadByte(chunkLayout["Count"]) + 1;
