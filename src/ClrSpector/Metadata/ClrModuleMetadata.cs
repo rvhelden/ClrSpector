@@ -72,6 +72,15 @@ namespace ClrSpector
         /// <summary>The table byte of a user string token, which names the <c>#US</c> heap.</summary>
         private const int UserStringTokenType = 0x70;
 
+        /// <summary>The calling convention byte that marks a signature as an instantiation.</summary>
+        private const byte GenericInstantiationConvention = 0x0A;
+
+        /// <summary>
+        /// A stop on a generic argument count read from a blob, past which the blob is not being
+        /// read as a MethodSpec signature at all.
+        /// </summary>
+        private const uint MaximumGenericArguments = 1024;
+
         /// <summary>The calling convention byte that marks a signature blob as a field's.</summary>
         private const byte FieldSignatureConvention = 0x06;
 
@@ -116,6 +125,10 @@ namespace ClrSpector
             if (module == null) throw new ArgumentNullException(nameof(module));
 
             var metadata = AtImageBase(module.Base);
+
+            // Null for a dynamic module, which has no mapped image to read metadata out of.
+            if (metadata == null)
+                return null;
 
             // Kept so a TypeRef can be followed to the assembly that defines it, which needs the
             // loader's AssemblyRef map and so cannot be done from the image alone. Assigned rather
@@ -255,7 +268,7 @@ namespace ClrSpector
                     }
 
                     case MetadataTable.MethodSpec:
-                        return $"MethodSpecification 0x{token:x8}";
+                        return this.MethodSpecName(rowId);
 
                     default:
                         return $"0x{token:x8}";
@@ -383,6 +396,46 @@ namespace ClrSpector
             }
 
             return locals;
+        }
+
+        /// <summary>
+        /// The name of a generic method instantiation: the method's own name, with the types it
+        /// was instantiated with.
+        /// </summary>
+        /// <remarks>
+        /// A MethodSpec has no name of its own - only a reference to the generic method and a
+        /// blob of the type arguments - so both halves have to be read to say anything about it.
+        /// This is what a call to a generic method looks like in IL, so leaving it unresolved
+        /// leaves a hole in every listing that has one.
+        /// </remarks>
+        private string MethodSpecName(uint rowId)
+        {
+            if (rowId == 0 || rowId > (uint)this.Image.RowCount(MetadataTable.MethodSpec))
+                return null;
+
+            // MethodSpec: Method (a MethodDefOrRef), Instantiation (a blob).
+            var method = this.Image.DecodeCoded(
+                CodedIndex.MethodDefOrRef,
+                this.Image.ReadColumn(MetadataTable.MethodSpec, rowId, 0));
+
+            var name = this.TokenName(((int)method.Table << 24) | (int)method.RowId);
+            var blob = this.Image.Blob(this.Image.ReadColumn(MetadataTable.MethodSpec, rowId, 1));
+
+            // A MethodSpec signature is GENERICINST, an argument count, then the arguments.
+            if (blob.Remaining < 2 || blob.ReadByte() != GenericInstantiationConvention)
+                return name;
+
+            var count = blob.ReadCompressedUInt();
+
+            if (count == 0 || count > MaximumGenericArguments)
+                return name;
+
+            var arguments = new List<string>((int)count);
+
+            for (var i = 0u; i < count; i++)
+                arguments.Add(SignatureTypeReader.ReadType(ref blob, this.Image).ToString());
+
+            return $"{name}<{string.Join(", ", arguments)}>";
         }
 
         /// <summary>The user string a <c>ldstr</c> token names.</summary>
@@ -874,15 +927,29 @@ namespace ClrSpector
                 switch (element)
                 {
                     case CorElementType.BOOLEAN:
-                    case CorElementType.U1: value = (long)blob.ReadFixed(1); return true;
-                    case CorElementType.I1: value = (sbyte)blob.ReadFixed(1); return true;
+                    case CorElementType.U1:
+                        value = (long)blob.ReadFixed(1);
+                        return true;
+                    case CorElementType.I1:
+                        value = (sbyte)blob.ReadFixed(1);
+                        return true;
                     case CorElementType.CHAR:
-                    case CorElementType.U2: value = (long)blob.ReadFixed(2); return true;
-                    case CorElementType.I2: value = (short)blob.ReadFixed(2); return true;
-                    case CorElementType.U4: value = (long)(uint)blob.ReadFixed(4); return true;
-                    case CorElementType.I4: value = (int)blob.ReadFixed(4); return true;
+                    case CorElementType.U2:
+                        value = (long)blob.ReadFixed(2);
+                        return true;
+                    case CorElementType.I2:
+                        value = (short)blob.ReadFixed(2);
+                        return true;
+                    case CorElementType.U4:
+                        value = (long)(uint)blob.ReadFixed(4);
+                        return true;
+                    case CorElementType.I4:
+                        value = (int)blob.ReadFixed(4);
+                        return true;
                     case CorElementType.U8:
-                    case CorElementType.I8: value = (long)blob.ReadFixed(8); return true;
+                    case CorElementType.I8:
+                        value = (long)blob.ReadFixed(8);
+                        return true;
                     default: return false;
                 }
             }

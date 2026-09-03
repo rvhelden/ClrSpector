@@ -160,7 +160,7 @@ namespace ClrSpectorConsole
             // signature, the try and catch blocks come out of its data sections, and the caught
             // type and every operand are named from the module's metadata.
             var fromMemory = ClrMethodIl.Of(
-                ClrObject.From<Order>().MethodTable.FindMethod(nameof(Order.Restock)));
+                ClrObject.From(typeof(AwaitChain)).MethodTable.FindMethod(nameof(AwaitChain.AwaitsTheInnerCall)));
 
             var faithful = fromMemory.ToCSharp();
             var structured = fromMemory.ToCSharp(ClrCSharpForm.Structured);
@@ -168,6 +168,12 @@ namespace ClrSpectorConsole
             Line("method", $"{fromMemory.Description.DeclaringTypeName}::{fromMemory.Description.Name}");
             Line("its source", "ClrSpectorConsole/Order.cs, to read the three views against");
             Line("body in memory", fromMemory.Description.ReadIl().ToString());
+
+            // The locals below are named only because a PDB was found to read them from; the
+            // metadata and the runtime have their types and nothing else.
+            var symbols = ClrModuleSymbols.AtImageBase(fromMemory.Description.Metadata.ImageBase);
+
+            Line("symbols", symbols?.ToString() ?? "none found - locals keep their slot numbers");
 
             foreach (var local in fromMemory.LocalVariables)
                 Line("  local", local.ToString());

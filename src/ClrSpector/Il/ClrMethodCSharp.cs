@@ -169,8 +169,13 @@ namespace ClrSpector
     /// with the offset it starts at. <see cref="ClrCSharpForm.Structured"/> goes on to undo the
     /// compiler's scaffolding - its temporaries, its conditional jumps, its bottom-tested loops -
     /// but only where it can prove the shape it is rewriting, so a method it cannot prove keeps
-    /// its gotos rather than being guessed at. Neither form invents names: a local is
-    /// <c>loc0</c>, because names live in the PDB and nothing here reads one.
+    /// its gotos rather than being guessed at.
+    /// </para>
+    /// <para>
+    /// Names are never invented, but they are read where they exist. A local is called what the
+    /// source called it when the module's PDB can be found - see
+    /// <see cref="ClrModuleSymbols"/> - and <c>loc0</c> when it cannot, which is the only thing
+    /// the method's own data says about it.
     /// </para>
     /// <para>
     /// The output is a reading aid and will not compile. Both sources of IL project the same

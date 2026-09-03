@@ -24,9 +24,10 @@ namespace ClrSpector
     /// exception table names cannot be folded away: the passes treat those offsets as fixed.
     /// </para>
     /// <para>
-    /// What this deliberately does not do is rename anything. The locals are still <c>loc0</c>
-    /// and <c>loc1</c>, because their real names are in the PDB and nothing here reads one -
-    /// the shape can be recovered from the IL, the names cannot.
+    /// What this deliberately does not do is rename anything. A local is called whatever
+    /// <see cref="ClrMethodIl.LocalVariables"/> says it is - the name from the module's PDB
+    /// where there is one, the slot number where there is not - and no pass invents or improves
+    /// on that.
     /// </para>
     /// </remarks>
     internal sealed class CSharpStructurer
