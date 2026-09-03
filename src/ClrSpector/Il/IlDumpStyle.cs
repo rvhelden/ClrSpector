@@ -115,10 +115,58 @@ namespace ClrSpector
             }
         }
 
+        /// <summary>
+        /// The colour a projected C# token should be shown in.
+        /// </summary>
+        /// <remarks>
+        /// The C# projection deliberately borrows this palette rather than defining one: the two
+        /// dumps are read side by side, so an operand named in the IL listing and the same
+        /// operand named in the C# has to be the same colour or the eye stops matching them up.
+        /// </remarks>
+        public static string ColourFor(ClrCSharpTokenKind kind)
+        {
+            switch (kind)
+            {
+                case ClrCSharpTokenKind.Offset:
+                    return Offset;
+
+                case ClrCSharpTokenKind.ControlKeyword:
+                    return ControlFlow;
+
+                case ClrCSharpTokenKind.Keyword:
+                    return Directive;
+
+                case ClrCSharpTokenKind.Type:
+                case ClrCSharpTokenKind.Member:
+                    return Member;
+
+                case ClrCSharpTokenKind.Call:
+                    return Call;
+
+                case ClrCSharpTokenKind.Literal:
+                    return Literal;
+
+                case ClrCSharpTokenKind.Number:
+                    return Number;
+
+                case ClrCSharpTokenKind.Comment:
+                    return Comment;
+
+                default:
+                    // Identifiers and punctuation are left in the terminal's own foreground.
+                    // Painting them too would put an escape sequence around every bracket and
+                    // say nothing: what colour is for here is picking out the parts that name
+                    // something outside the statement.
+                    return null;
+            }
+        }
+
         /// <summary>Wraps <paramref name="text"/> in <paramref name="colour"/> when colouring.</summary>
         internal static string Paint(string text, string colour, bool colouring)
         {
-            return colouring && text.Length > 0 ? colour + text + Reset : text;
+            return colouring && text.Length > 0 && !string.IsNullOrEmpty(colour)
+                ? colour + text + Reset
+                : text;
         }
 
         /// <summary>Resolves <see cref="IlDumpStyle.Auto"/> to a definite answer.</summary>

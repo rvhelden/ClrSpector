@@ -154,6 +154,100 @@ namespace ClrSpector
             }
         }
 
+        /// <summary>
+        /// The MethodTable a substituted type variable resolved to, when this node came from
+        /// closing an open signature. Zero otherwise.
+        /// </summary>
+        public IntPtr SubstitutedMethodTable { get; internal set; }
+
+        /// <summary>
+        /// A copy of this type with its type variables replaced by the given arguments.
+        /// </summary>
+        /// <remarks>
+        /// A MethodDef signature is the open definition: <c>!0</c> is the declaring type's first
+        /// parameter and <c>!!0</c> the method's own. Closing it means substituting the actual
+        /// instantiation, which is not in metadata at all - a type's arguments come from its
+        /// MethodTable's PerInstInfo and a generic method's from its own MethodDesc.
+        ///
+        /// An argument that is missing, or is itself a type variable rather than a real type, is
+        /// left as it was rather than guessed at - so an open definition closes to itself, which
+        /// is the honest result.
+        /// </remarks>
+        public ClrSignatureType WithArguments(
+            IReadOnlyList<ClrSignatureType> typeArguments,
+            IReadOnlyList<ClrSignatureType> methodArguments)
+        {
+            switch (this.ElementType)
+            {
+                case CorElementType.VAR:
+                    return Pick(typeArguments, this.GenericParameterIndex) ?? this;
+
+                case CorElementType.MVAR:
+                    return Pick(methodArguments, this.GenericParameterIndex) ?? this;
+            }
+
+            var element = this.Element?.WithArguments(typeArguments, methodArguments);
+            var open = this.GenericType?.WithArguments(typeArguments, methodArguments);
+
+            ClrSignatureType[] arguments = null;
+            if (this.GenericArguments.Count > 0)
+            {
+                arguments = new ClrSignatureType[this.GenericArguments.Count];
+                for (var i = 0; i < arguments.Length; i++)
+                    arguments[i] = this.GenericArguments[i].WithArguments(typeArguments, methodArguments);
+            }
+
+            // Nothing underneath changed, so there is nothing to copy.
+            if (ReferenceEquals(element, this.Element)
+                && ReferenceEquals(open, this.GenericType)
+                && arguments == null)
+            {
+                return this;
+            }
+
+            return new ClrSignatureType(this.ElementType)
+            {
+                Element = element,
+                GenericType = open,
+                GenericArguments = arguments ?? this.GenericArguments,
+                CustomModifiers = this.CustomModifiers,
+                TypeTable = this.TypeTable,
+                TypeRowId = this.TypeRowId,
+                TypeName = this.TypeName,
+                GenericParameterIndex = this.GenericParameterIndex,
+                Rank = this.Rank,
+                ArraySizes = this.ArraySizes,
+                ArrayLowerBounds = this.ArrayLowerBounds,
+                FunctionPointer = this.FunctionPointer,
+                SubstitutedMethodTable = this.SubstitutedMethodTable
+            };
+        }
+
+        private static ClrSignatureType Pick(IReadOnlyList<ClrSignatureType> arguments, int index)
+        {
+            return arguments != null && index >= 0 && index < arguments.Count
+                ? arguments[index]
+                : null;
+        }
+
+        /// <summary>
+        /// A node standing for a type reached by MethodTable rather than by token - what a
+        /// substituted type variable becomes.
+        /// </summary>
+        internal static ClrSignatureType ForMethodTable(ClrMethodTable table)
+        {
+            if (table == null)
+                return null;
+
+            var element = table.IsValueType ? CorElementType.VALUETYPE : CorElementType.CLASS;
+
+            return new ClrSignatureType(element)
+            {
+                TypeName = table.MetadataName,
+                SubstitutedMethodTable = table.Address
+            };
+        }
+
         /// <summary>Renders the type the way source would spell it.</summary>
         public override string ToString()
         {

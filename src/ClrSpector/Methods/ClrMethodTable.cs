@@ -120,6 +120,160 @@ namespace ClrSpector
 
         public IntPtr AuxiliaryData { get; private set; }
 
+        /// <summary>
+        /// The module this type's runtime structures were allocated from, which is not always the
+        /// module that declares it.
+        /// </summary>
+        /// <remarks>
+        /// A constructed generic has to live somewhere: <c>List&lt;MyType&gt;</c> is declared by
+        /// neither CoreLib nor your assembly alone, so the runtime picks a loader module for it -
+        /// usually the one that makes the whole instantiation collectible together. That is why
+        /// unloading an assembly can free MethodTables whose TypeDef row lives in CoreLib.
+        /// </remarks>
+        public IntPtr LoaderModule
+        {
+            get
+            {
+                if (this.AuxiliaryData == IntPtr.Zero)
+                    return IntPtr.Zero;
+
+                var descriptor = ContractDescriptor.Current;
+
+                return descriptor.TryGetDataType("MethodTableAuxiliaryData", out var layout)
+                       && layout.HasField("LoaderModule")
+                    ? new MemoryReader(this.AuxiliaryData).ReadIntPtr(layout["LoaderModule"])
+                    : IntPtr.Zero;
+            }
+        }
+
+        /// <summary>
+        /// How many generic dictionaries this type has - one for itself plus one per generic
+        /// ancestor - or zero for a non-generic type.
+        /// </summary>
+        /// <remarks>
+        /// A generic type's dictionary count and type-parameter count live in a GenericsDictInfo
+        /// stored immediately <b>before the PerInstInfo array</b> - not inside the MethodTable,
+        /// and not before the MethodTable either - so it is reached by stepping back from
+        /// PerInstInfo. Measured: the eight bytes there decode as (1 dictionary, 1 type argument)
+        /// for <c>List&lt;T&gt;</c> and (1, 2) for <c>Dictionary&lt;K,V&gt;</c>.
+        ///
+        /// The descriptor publishes the two field offsets but no size for the structure, so the
+        /// size is derived from the last field rather than assumed - see
+        /// <see cref="GenericsDictInfoSize"/>.
+        /// </remarks>
+        public ushort GenericDictionaryCount => this.GenericsDictInfo("NumDicts");
+
+        /// <summary>How many type parameters this type declares, or zero when it is not generic.</summary>
+        public ushort GenericTypeArgumentCount => this.GenericsDictInfo("NumTypeArgs");
+
+        /// <summary>
+        /// This type's actual type arguments, as type handles, or an empty array when it is not
+        /// a constructed generic.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// PerInstInfo is an array of dictionary pointers, one per generic type in the
+        /// inheritance chain, and the last is this type's own. A dictionary begins with its type
+        /// arguments, so the first <see cref="GenericTypeArgumentCount"/> entries of that last
+        /// dictionary are the instantiation. Measured: <c>List&lt;string&gt;</c> yields
+        /// System.String, and <c>Dictionary&lt;string,int&gt;</c> yields System.String and
+        /// System.Int32.
+        /// </para>
+        /// <para>
+        /// Not every entry is a MethodTable. An open definition like <c>List&lt;T&gt;</c> has
+        /// type <i>variables</i> here, and a pointer or byref argument is a TypeDesc - both of
+        /// which the runtime marks in the handle's low bits, so
+        /// <see cref="IsMethodTableHandle"/> says which are safe to decode.
+        /// </para>
+        /// </remarks>
+        public IntPtr[] TypeArguments
+        {
+            get
+            {
+                var count = this.GenericTypeArgumentCount;
+                var dictionaries = this.GenericDictionaryCount;
+
+                if (count == 0 || dictionaries == 0 || this.PerInstInfo == IntPtr.Zero)
+                    return Array.Empty<IntPtr>();
+
+                var own = new MemoryReader(this.PerInstInfo)
+                    .ReadIntPtr((dictionaries - 1) * IntPtr.Size);
+
+                if (own == IntPtr.Zero || !ProcessMemoryRegions.IsReadable(own, count * IntPtr.Size))
+                    return Array.Empty<IntPtr>();
+
+                var reader = new MemoryReader(own);
+                var arguments = new IntPtr[count];
+
+                for (var i = 0; i < count; i++)
+                    arguments[i] = reader.ReadIntPtr(i * IntPtr.Size);
+
+                return arguments;
+            }
+        }
+
+        /// <summary>
+        /// True when a type handle is a MethodTable rather than a TypeDesc.
+        /// </summary>
+        /// <remarks>
+        /// The runtime tags the low bits of a type handle to mark the ones that are not
+        /// MethodTables - type variables, pointers, byrefs and function pointers are TypeDescs -
+        /// so decoding one as a MethodTable would read the wrong structure entirely.
+        /// </remarks>
+        public static bool IsMethodTableHandle(IntPtr handle)
+        {
+            return handle != IntPtr.Zero && (handle.ToInt64() & 3) == 0;
+        }
+
+        /// <summary>
+        /// The size of the GenericsDictInfo that precedes a generic type's MethodTable.
+        /// </summary>
+        /// <remarks>
+        /// Derived rather than hardcoded: the descriptor gives the field offsets but not the
+        /// structure's size, so it is the end of the last field rounded up to pointer alignment,
+        /// which is what puts the MethodTable itself back on its natural boundary.
+        /// </remarks>
+        private static int GenericsDictInfoSize
+        {
+            get
+            {
+                var layout = ContractDescriptor.Current.GetDataType("GenericsDictInfo");
+
+                if (layout.Size.HasValue)
+                    return (int)layout.Size.Value;
+
+                var end = 0;
+                foreach (var name in layout.FieldNames)
+                    end = Math.Max(end, layout[name] + sizeof(ushort));
+
+                return (end + IntPtr.Size - 1) & ~(IntPtr.Size - 1);
+            }
+        }
+
+        private ushort GenericsDictInfo(string field)
+        {
+            // Only a generic type has one; reading before a non-generic MethodTable would be
+            // reading whatever the loader heap happened to put there.
+            if (!this.HasInstantiation)
+                return 0;
+
+            var descriptor = ContractDescriptor.Current;
+            if (!descriptor.TryGetDataType("GenericsDictInfo", out var layout)
+                || !layout.HasField(field))
+            {
+                return 0;
+            }
+
+            if (this.PerInstInfo == IntPtr.Zero)
+                return 0;
+
+            var info = this.PerInstInfo - GenericsDictInfoSize;
+
+            return ProcessMemoryRegions.IsReadable(info, GenericsDictInfoSize)
+                ? new MemoryReader(info).ReadUShort(layout[field])
+                : (ushort)0;
+        }
+
         public IntPtr PerInstInfo { get; private set; }
 
         /// <summary>

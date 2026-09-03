@@ -49,6 +49,31 @@ namespace ClrSpector
         public ushort NumberOfThreadStaticFields { get; private set; }
         public ushort NumberOfNonVirtualSlots { get; private set; }
 
+        /// <summary>
+        /// How many bytes of the MethodTable's BaseSize are padding rather than fields.
+        /// </summary>
+        /// <remarks>
+        /// A type's instances are never smaller than the minimum object size, so a small type is
+        /// padded up to it. Subtracting this from BaseSize gives what the fields actually need,
+        /// which is the difference between "this object is 24 bytes" and "this object's fields
+        /// are 4 bytes and the rest is the allocator's floor".
+        /// </remarks>
+        public byte BaseSizePadding { get; private set; }
+
+        /// <summary>
+        /// The EEClass's optional fields, or <see cref="IntPtr.Zero"/> when it has none.
+        /// </summary>
+        /// <remarks>
+        /// Rarely-used per-type data - explicit layout information, a COM interface type, the
+        /// module a type was loaded from when it differs - is kept out of every EEClass and put
+        /// in a side structure only the types that need it pay for. The descriptor publishes the
+        /// pointer but no fields for what it points at, so this is the address only.
+        /// </remarks>
+        public IntPtr OptionalFields { get; private set; }
+
+        /// <summary>True when this type carries the optional side structure.</summary>
+        public bool HasOptionalFields => this.OptionalFields != IntPtr.Zero;
+
         public bool IsInterface =>
             (this.AttrClass & (uint)CorTypeAttr.tdClassSemanticsMask) == (uint)CorTypeAttr.tdInterface;
 
@@ -88,6 +113,12 @@ namespace ClrSpector
             eeclass.NumberOfStaticFields = reader.ReadUShort(layout["NumStaticFields"]);
             eeclass.NumberOfThreadStaticFields = reader.ReadUShort(layout["NumThreadStaticFields"]);
             eeclass.NumberOfNonVirtualSlots = reader.ReadUShort(layout["NumNonVirtualSlots"]);
+
+            if (layout.HasField("BaseSizePadding"))
+                eeclass.BaseSizePadding = reader.ReadByte(layout["BaseSizePadding"]);
+
+            if (layout.HasField("OptionalFields"))
+                eeclass.OptionalFields = reader.ReadIntPtr(layout["OptionalFields"]);
 
             return eeclass;
         }

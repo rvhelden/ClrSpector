@@ -34,6 +34,24 @@ namespace ClrSpector
 
         public bool IsLoaded { get; private set; }
 
+        /// <summary>
+        /// The exception recorded against this assembly, or zero when it loaded cleanly.
+        /// </summary>
+        /// <remarks>
+        /// A load failure is remembered on the Assembly rather than only thrown, so that every
+        /// later attempt fails the same way. Non-zero here is the handle to that stored error.
+        /// </remarks>
+        public IntPtr Error { get; private set; }
+
+        /// <summary>True when the assembly failed to load and the failure was recorded.</summary>
+        public bool HasError => this.Error != IntPtr.Zero;
+
+        /// <summary>
+        /// Which load notifications the runtime has already raised for this assembly, so a
+        /// profiler or debugger attaching later can tell what it missed.
+        /// </summary>
+        public uint NotifyFlags { get; private set; }
+
         /// <summary>The manifest module - the one carrying the assembly's own metadata.</summary>
         public ClrModule ManifestModule =>
             this.Module == IntPtr.Zero ? null : ClrModule.At(this.Module);
@@ -148,6 +166,12 @@ namespace ClrSpector
             if (layout.HasField("IsLoaded"))
                 assembly.IsLoaded = reader.ReadByte(layout["IsLoaded"]) != 0;
 
+            if (layout.HasField("Error"))
+                assembly.Error = reader.ReadIntPtr(layout["Error"]);
+
+            if (layout.HasField("NotifyFlags"))
+                assembly.NotifyFlags = reader.ReadUInt(layout["NotifyFlags"]);
+
             return assembly;
         }
 
@@ -197,6 +221,31 @@ namespace ClrSpector
 
         public IntPtr ExecutableHeap { get; private set; }
 
+        /// <summary>
+        /// The handle to the managed LoaderAllocator object that keeps this allocator alive.
+        /// </summary>
+        /// <remarks>
+        /// This is the mechanism behind collectible unloading: a collectible allocator is kept
+        /// alive by a managed object, and when nothing references that object any more the whole
+        /// allocator - every MethodTable and precode carved out of its heaps - can go.
+        /// </remarks>
+        public IntPtr ObjectHandle { get; private set; }
+
+        /// <summary>
+        /// The stub manager that owns this allocator's interface dispatch stubs.
+        /// </summary>
+        /// <remarks>
+        /// Interface calls resolve through stubs it allocates and rewrites as call sites warm up,
+        /// which is why an interface dispatch cannot be redirected the way a precode can.
+        /// </remarks>
+        public IntPtr VirtualCallStubManager { get; private set; }
+
+        /// <summary>
+        /// A serial number, incremented per allocator created, so two allocators at the same
+        /// reused address can still be told apart.
+        /// </summary>
+        public uint CreationNumber { get; private set; }
+
         /// <summary>Reads the loader allocator behind a type's module.</summary>
         public static ClrLoaderAllocator Of(Type type)
         {
@@ -228,6 +277,11 @@ namespace ClrSpector
             allocator.LowFrequencyHeap = Read(reader, layout, "LowFrequencyHeap");
             allocator.StaticsHeap = Read(reader, layout, "StaticsHeap");
             allocator.ExecutableHeap = Read(reader, layout, "ExecutableHeap");
+            allocator.ObjectHandle = Read(reader, layout, "ObjectHandle");
+            allocator.VirtualCallStubManager = Read(reader, layout, "VirtualCallStubManager");
+
+            if (layout.HasField("CreationNumber"))
+                allocator.CreationNumber = reader.ReadUInt(layout["CreationNumber"]);
 
             return allocator;
         }

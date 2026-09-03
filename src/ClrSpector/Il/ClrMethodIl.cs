@@ -153,16 +153,45 @@ namespace ClrSpector
     /// </remarks>
     public sealed class ClrIlToken
     {
-        internal ClrIlToken(int token, string name)
+        private readonly ClrModuleMetadata metadata;
+
+        private ClrMethodSignature signature;
+
+        private bool signatureRead;
+
+        internal ClrIlToken(int token, string name, ClrModuleMetadata metadata = null)
         {
             this.Token = token;
             this.Name = name;
+            this.metadata = metadata;
         }
 
         public int Token { get; }
 
         /// <summary>What the token names, or its hexadecimal value when it does not resolve.</summary>
         public string Name { get; }
+
+        /// <summary>
+        /// The signature of the callable this token names, or null when it names something else
+        /// or the module's metadata is not readable.
+        /// </summary>
+        /// <remarks>
+        /// Decoded on first use rather than during the IL walk: most tokens in a body are types
+        /// and fields, and only a call site is ever asked what it consumes.
+        /// </remarks>
+        public ClrMethodSignature Signature
+        {
+            get
+            {
+                if (!this.signatureRead)
+                {
+                    this.signature = this.metadata?.TokenSignature(this.Token);
+                    this.signatureRead = true;
+                }
+
+                return this.signature;
+            }
+        }
 
         public override string ToString() => this.Name ?? $"0x{this.Token:x8}";
     }
@@ -238,8 +267,18 @@ namespace ClrSpector
         /// <summary>The method's local variables, in slot order.</summary>
         public IReadOnlyList<LocalVariableInfo> Locals { get; private set; }
 
-        /// <summary>The try/catch/finally regions the method declares.</summary>
+        /// <summary>
+        /// The try/catch/finally regions the method declares, as reflection reports them. Always
+        /// empty for IL read from a MethodDesc, which never goes through reflection; use
+        /// <see cref="ExceptionRegions"/> for the regions of either source.
+        /// </summary>
         public IReadOnlyList<ExceptionHandlingClause> ExceptionHandlers { get; private set; }
+
+        /// <summary>
+        /// The try/catch/finally regions the method declares, from whichever source the IL came
+        /// from - reflection's clauses, or the exception table read out of the body in memory.
+        /// </summary>
+        public IReadOnlyList<ClrIlExceptionRegion> ExceptionRegions { get; private set; }
 
         public int MaxStackSize { get; private set; }
 
@@ -273,11 +312,13 @@ namespace ClrSpector
                 Bytes = bytes,
                 Locals = body.LocalVariables.ToArray(),
                 ExceptionHandlers = SafeClauses(body),
+                ExceptionRegions = Array.Empty<ClrIlExceptionRegion>(),
                 MaxStackSize = body.MaxStackSize,
                 InitLocals = body.InitLocals
             };
 
             il.Instructions = Decode(method, bytes);
+            il.ExceptionRegions = il.ExceptionHandlers.Select(RegionOf).ToArray();
 
             return il;
         }
@@ -306,6 +347,7 @@ namespace ClrSpector
                 Bytes = body.Il,
                 Locals = Array.Empty<LocalVariableInfo>(),
                 ExceptionHandlers = Array.Empty<ExceptionHandlingClause>(),
+                ExceptionRegions = NameCaughtTypes(body.ExceptionRegions, metadata),
                 MaxStackSize = body.MaxStack,
                 InitLocals = body.InitLocals,
                 Description = method
@@ -316,6 +358,52 @@ namespace ClrSpector
             return il;
         }
 
+        /// <summary>
+        /// Reflection's clause in the form both sources share.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="ExceptionHandlingClause.CatchType"/> and
+        /// <see cref="ExceptionHandlingClause.FilterOffset"/> each throw unless the clause is of
+        /// the matching kind, so neither is read without checking which kind it is first.
+        /// </remarks>
+        private static ClrIlExceptionRegion RegionOf(ExceptionHandlingClause clause)
+        {
+            var kind = (ClrIlExceptionRegionKind)clause.Flags;
+
+            var region = new ClrIlExceptionRegion(
+                kind,
+                clause.TryOffset,
+                clause.TryLength,
+                clause.HandlerOffset,
+                clause.HandlerLength,
+                kind == ClrIlExceptionRegionKind.Filter ? clause.FilterOffset : 0,
+                kind == ClrIlExceptionRegionKind.Catch ? (uint)(clause.CatchType?.MetadataToken ?? 0) : 0);
+
+            if (kind == ClrIlExceptionRegionKind.Catch)
+                region.CatchTypeName = clause.CatchType?.FullName;
+
+            return region;
+        }
+
+        /// <summary>
+        /// Names the types the typed catches in <paramref name="regions"/> catch, from the
+        /// module's own metadata - the body carries only their tokens.
+        /// </summary>
+        private static IReadOnlyList<ClrIlExceptionRegion> NameCaughtTypes(
+            IReadOnlyList<ClrIlExceptionRegion> regions, ClrModuleMetadata metadata)
+        {
+            if (metadata == null)
+                return regions;
+
+            foreach (var region in regions)
+            {
+                if (region.Kind == ClrIlExceptionRegionKind.Catch && region.CatchTypeToken != 0)
+                    region.CatchTypeName = metadata.TokenName((int)region.CatchTypeToken);
+            }
+
+            return regions;
+        }
+
         private static object NameToken(ClrModuleMetadata metadata, OperandType operandType, int token)
         {
             if (metadata == null)
@@ -324,7 +412,7 @@ namespace ClrSpector
             if (operandType == OperandType.InlineString)
                 return metadata.UserString(token) ?? (object)token;
 
-            return new ClrIlToken(token, metadata.TokenName(token));
+            return new ClrIlToken(token, metadata.TokenName(token), metadata);
         }
 
         private static IReadOnlyList<ExceptionHandlingClause> SafeClauses(MethodBody body)
@@ -542,6 +630,16 @@ namespace ClrSpector
         }
 
         /// <summary>
+        /// The same method as low-level C#: the stack machine undone into expressions, with the
+        /// control flow left as it is. See <see cref="ClrMethodCSharp"/> for what the projection
+        /// does and does not claim.
+        /// </summary>
+        public ClrMethodCSharp ToCSharp() => ClrMethodCSharp.Of(this);
+
+        /// <summary>The C# projection rendered as text, coloured like an IL dump.</summary>
+        public string DumpCSharp(IlDumpStyle style = IlDumpStyle.Plain) => this.ToCSharp().Dump(style);
+
+        /// <summary>
         /// The method rendered as IL text: signature, locals, then one instruction per line.
         /// </summary>
         public string Dump() => this.Dump(IlDumpStyle.Plain);
@@ -583,16 +681,8 @@ namespace ClrSpector
             foreach (var instruction in this.Instructions)
                 text.AppendLine(instruction.Render(colouring));
 
-            foreach (var handler in this.ExceptionHandlers)
-            {
-                var line = $"// {handler.Flags} try IL_{handler.TryOffset:x4}..IL_{handler.TryOffset + handler.TryLength:x4} " +
-                           $"handler IL_{handler.HandlerOffset:x4}..IL_{handler.HandlerOffset + handler.HandlerLength:x4}" +
-                           (handler.Flags == ExceptionHandlingClauseOptions.Clause
-                               ? $" catch {handler.CatchType?.FullName}"
-                               : string.Empty);
-
-                text.AppendLine(IlPalette.Paint(line, IlPalette.Comment, colouring));
-            }
+            foreach (var region in this.ExceptionRegions)
+                text.AppendLine(IlPalette.Paint("// " + region, IlPalette.Comment, colouring));
 
             return text.ToString().TrimEnd();
         }

@@ -55,6 +55,9 @@ namespace ClrSpector
         /// <summary>The table byte of a user string token, which names the <c>#US</c> heap.</summary>
         private const int UserStringTokenType = 0x70;
 
+        /// <summary>The calling convention byte that marks a signature blob as a field's.</summary>
+        private const byte FieldSignatureConvention = 0x06;
+
         private static readonly ConcurrentDictionary<IntPtr, ClrModuleMetadata> cache =
             new ConcurrentDictionary<IntPtr, ClrModuleMetadata>();
 
@@ -219,6 +222,75 @@ namespace ClrSpector
             {
                 return $"0x{token:x8}";
             }
+        }
+
+        /// <summary>
+        /// The signature of whatever callable a token names - a MethodDef, a MemberRef, a
+        /// generic instantiation or a standalone signature - or null when the token names
+        /// nothing with a signature.
+        /// </summary>
+        /// <remarks>
+        /// A name is enough to print a call, but not to read one: to know how much of the
+        /// evaluation stack a <c>call</c> consumes you need its parameter count and whether it
+        /// has a <c>this</c>, and both live in the signature blob. That is what
+        /// <see cref="ClrMethodCSharp"/> needs to project a call read from a MethodDesc, where
+        /// no reflection <see cref="System.Reflection.MethodBase"/> exists to ask.
+        /// </remarks>
+        public ClrMethodSignature TokenSignature(int token)
+        {
+            try
+            {
+                var table = (MetadataTable)(uint)((token >> 24) & 0xFF);
+                var rowId = (uint)token & RowIdMask;
+
+                switch (table)
+                {
+                    // MethodDef column 4, MemberRef column 2 and StandAloneSig column 0 are all
+                    // the row's signature blob.
+                    case MetadataTable.MethodDef:
+                        return this.DecodeSignature(MetadataTable.MethodDef, rowId, 4);
+
+                    case MetadataTable.MemberRef:
+                        return this.DecodeSignature(MetadataTable.MemberRef, rowId, 2);
+
+                    case MetadataTable.StandAloneSig:
+                        return this.DecodeSignature(MetadataTable.StandAloneSig, rowId, 0);
+
+                    case MetadataTable.MethodSpec:
+                    {
+                        // A MethodSpec is an instantiation of another method; the parameter
+                        // count and the this-ness are the generic method's own.
+                        var parent = this.Image.DecodeCoded(
+                            CodedIndex.MethodDefOrRef,
+                            this.Image.ReadColumn(MetadataTable.MethodSpec, rowId, 0));
+
+                        return this.TokenSignature(((int)parent.Table << 24) | (int)parent.RowId);
+                    }
+
+                    default:
+                        return null;
+                }
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        /// <summary>Decodes the signature blob a row's column points at.</summary>
+        private ClrMethodSignature DecodeSignature(MetadataTable table, uint rowId, int column)
+        {
+            if (rowId == 0 || rowId > (uint)this.Image.RowCount(table))
+                return null;
+
+            var blob = this.Image.Blob(this.Image.ReadColumn(table, rowId, column));
+
+            // A MemberRef can name a field as well as a method, and a field signature starts
+            // with its own calling convention - 0x06 - which is not a method's.
+            if (blob.PeekByte() == FieldSignatureConvention)
+                return null;
+
+            return ClrMethodSignature.Decode(ref blob, this.Image);
         }
 
         /// <summary>The user string a <c>ldstr</c> token names.</summary>

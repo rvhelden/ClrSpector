@@ -22,6 +22,7 @@ namespace ClrSpectorConsole
             Section("interfaces", Interfaces);
             Section("names and IL straight from memory", FromMemory);
             Section("IL disassembly", Disassembly);
+            Section("the same IL as low-level C#", CSharpProjection);
             Section("dispatch: precode and vtable", Dispatch);
             Section("an address back to its method", CodeMap);
             Section("tiering", Tiering);
@@ -31,6 +32,7 @@ namespace ClrSpectorConsole
             Section("threads", Threads);
             Section("an exception's captured frames", ExceptionFrames);
             Section("modules, assemblies, loader heaps", Modules);
+            Section("assembly metadata: tables, heaps, entries", MetadataTables);
             Section("one object on the heap", HeapObject);
             Section("the GC heap", Heap);
         }
@@ -140,6 +142,34 @@ namespace ClrSpectorConsole
             // Auto colours only when the output looks like a terminal that wants it.
             foreach (var line in il.Dump(IlDumpStyle.Auto).Split('\n').Take(8))
                 Console.WriteLine($"  {line.TrimEnd()}");
+        }
+
+        private static void CSharpProjection()
+        {
+            var restock = typeof(Order).GetMethod(nameof(Order.Restock));
+            var projection = ClrMethodIl.Of(restock).ToCSharp();
+
+            Line("projection", projection.ToString());
+
+            // The handler table comes out of the body's own data sections, so the try and catch
+            // blocks below are there for IL read from memory too - and the caught type is named
+            // from the module's metadata, with no reflection anywhere in it.
+            var fromMemory = ClrMethodIl.Of(
+                ClrObject.From<Order>().MethodTable.FindMethod(nameof(Order.Restock)));
+
+            Line("body in memory", fromMemory.Description.ReadIl().ToString());
+
+            foreach (var region in fromMemory.ExceptionRegions)
+                Line("  region", region.ToString());
+
+            // The same IlDumpStyle as the IL listing, so Auto colours in a terminal and not in
+            // a pipe, and the two dumps share one palette between them.
+            var lines = projection.Dump(IlDumpStyle.Auto).Split(Environment.NewLine);
+
+            foreach (var line in lines.Take(18))
+                Console.WriteLine($"  {line.TrimEnd()}");
+
+            Line("...", $"{Math.Max(0, lines.Length - 18)} more lines");
         }
 
         private static void Dispatch()
@@ -341,6 +371,53 @@ namespace ClrSpectorConsole
                     Line("  module", $"{eachModule.SimpleName}  " +
                                      $"{ClrModuleMetadata.Of(eachModule).Image}");
                 }
+            }
+        }
+
+        private static void MetadataTables()
+        {
+            // Two images of very different size, because the size is what makes this interesting:
+            // ECMA-335 column widths are not fixed. A heap index is two bytes until the heap
+            // passes 64 KB, a table index until the table passes 65535 rows - so the same schema
+            // measures to different row sizes in these two, and every row offset shifts with it.
+            foreach (var subject in new[] { typeof(Order), typeof(object) })
+            {
+                var module = ClrModule.Of(subject);
+                var image = ClrModuleMetadata.Of(module).Image;
+
+                Console.WriteLine();
+                Line("module", $"{module.SimpleName}  metadata {image.MetadataSizeOf()} bytes, " +
+                               $"version {image.Version}");
+
+                Line("heaps", $"strings {image.StringHeapSize} bytes / " +
+                              $"{image.StringIndexSize}-byte indexes, " +
+                              $"blobs {image.BlobHeapSize} / {image.BlobIndexSize}-byte, " +
+                              $"user strings {image.UserStringHeapSize}");
+
+                // Only the tables this module actually uses; most of the 45 are empty.
+                var populated = Enum.GetValues<MetadataTable>()
+                    .Where(t => image.RowCount(t) > 0)
+                    .OrderByDescending(t => image.RowCount(t))
+                    .ToList();
+
+                Line("tables", $"{populated.Count} of 45 populated");
+
+                foreach (var table in populated.Take(10))
+                {
+                    Line($"  {table}", $"{image.RowCount(table),7} rows" +
+                                       $"{(image.IsSorted(table) ? "  sorted" : string.Empty)}");
+                }
+
+                // And an actual entry out of two of them, to show the rows really are readable.
+                var firstType = ClrModuleMetadata.Of(module)
+                    .FullTypeName(((uint)MetadataTable.TypeDef << 24) | 2);
+
+                var lastMethodRow = (uint)image.RowCount(MetadataTable.MethodDef);
+                var lastMethod = ClrModuleMetadata.Of(module)
+                    .MethodName(((uint)MetadataTable.MethodDef << 24) | lastMethodRow);
+
+                Line("  TypeDef row 2", firstType);
+                Line($"  MethodDef row {lastMethodRow}", lastMethod);
             }
         }
 

@@ -13,6 +13,20 @@ namespace ClrSpector
         /// <summary>mdMethodDef - the metadata table that method tokens live in.</summary>
         private const uint MethodDefTokenType = 0x06000000;
 
+        /// <summary>
+        /// A ceiling on a stored signature's length, since it is read out of memory rather than
+        /// bounded by anything. Well past any real signature.
+        /// </summary>
+        private const uint MaximumStoredSignature = 64 * 1024;
+
+        /// <summary>
+        /// The token-range bits of MethodDescChunk.FlagsAndTokenRange; the rest are flags.
+        /// </summary>
+        private const ushort TokenRangeMask = 0x0FFF;
+
+        /// <summary>The kind bits of InstantiatedMethodDesc.Flags2.</summary>
+        private const ushort GenericKindMask = 0x0007;
+
         /// <summary>The slot number of this method in the type's vtable.</summary>
         public ushort SlotNumber { get; private set; }
 
@@ -275,7 +289,273 @@ namespace ClrSpector
         /// <see cref="System.Reflection.MethodBase"/> to exist. Null when the declaring module
         /// has no mapped image, as a runtime-generated one does not.
         /// </remarks>
-        public string Name => this.Metadata?.MethodName(this.MetadataToken);
+        public string Name => this.Metadata?.MethodName(this.MetadataToken) ?? this.StoredName;
+
+        /// <summary>
+        /// True when this MethodDesc carries its own signature instead of pointing at a metadata
+        /// row - a dynamic method, an array accessor, or a delegate's runtime-implemented method.
+        /// </summary>
+        /// <remarks>
+        /// These are the MethodDescs whose token names nothing useful. A dynamic method was never
+        /// in any module's tables, and an array's Get, Set and Address are synthesised by the
+        /// runtime for each array type rather than declared anywhere - so the runtime stores the
+        /// signature blob on the MethodDesc itself, in the StoredSigMethodDesc that these three
+        /// classifications extend.
+        /// </remarks>
+        public bool HasStoredSignature =>
+            this.Classification == MethodClassification.EEImpl
+            || this.Classification == MethodClassification.Array
+            || this.Classification == MethodClassification.Dynamic;
+
+        /// <summary>
+        /// The raw ExtendedFlags of a MethodDesc that stores its own signature.
+        /// </summary>
+        /// <remarks>
+        /// These distinguish the varieties of runtime-made method - an LCG method from an IL
+        /// stub, and one kind of stub from another. The descriptor publishes the field but not
+        /// the meaning of its bits, so the value is surfaced as it stands rather than decoded
+        /// into names this build cannot verify.
+        /// </remarks>
+        public uint StoredSignatureFlags
+        {
+            get
+            {
+                if (!this.HasStoredSignature)
+                    return 0;
+
+                var descriptor = ContractDescriptor.Current;
+
+                return descriptor.TryGetDataType("StoredSigMethodDesc", out var layout)
+                       && layout.HasField("ExtendedFlags")
+                    ? new MemoryReader(this.ClrPointer).ReadUInt(layout["ExtendedFlags"])
+                    : 0;
+            }
+        }
+
+        /// <summary>
+        /// What kind of generic method this is, for an instantiated MethodDesc.
+        /// </summary>
+        /// <remarks>
+        /// Read from InstantiatedMethodDesc.Flags2. Only
+        /// <see cref="GenericMethodKind.GenericMethodDefinition"/> is confirmed by measurement
+        /// here, because it is the only kind reachable through a MethodTable's chunks - the
+        /// instantiations themselves live in the module's InstMethodHashTable, which nothing
+        /// walks yet. The other names come from the runtime's own enum, so treat a value other
+        /// than the definition as indicative rather than verified.
+        /// </remarks>
+        public GenericMethodKind GenericKind
+        {
+            get
+            {
+                if (this.Classification != MethodClassification.Instantiated)
+                    return GenericMethodKind.NotGeneric;
+
+                var descriptor = ContractDescriptor.Current;
+                if (!descriptor.TryGetDataType("InstantiatedMethodDesc", out var layout)
+                    || !layout.HasField("Flags2"))
+                {
+                    return GenericMethodKind.NotGeneric;
+                }
+
+                var flags = new MemoryReader(this.ClrPointer).ReadUShort(layout["Flags2"]);
+
+                return (GenericMethodKind)(flags & GenericKindMask);
+            }
+        }
+
+        /// <summary>The raw Flags2 of an instantiated MethodDesc; zero for anything else.</summary>
+        public ushort InstantiationFlags
+        {
+            get
+            {
+                if (this.Classification != MethodClassification.Instantiated)
+                    return 0;
+
+                var descriptor = ContractDescriptor.Current;
+
+                return descriptor.TryGetDataType("InstantiatedMethodDesc", out var layout)
+                       && layout.HasField("Flags2")
+                    ? new MemoryReader(this.ClrPointer).ReadUShort(layout["Flags2"])
+                    : (ushort)0;
+            }
+        }
+
+        /// <summary>
+        /// True for the open definition of a generic method - Echo&lt;T&gt; rather than
+        /// Echo&lt;int&gt;.
+        /// </summary>
+        /// <remarks>
+        /// These are the generic methods a MethodTable's chunks actually hold, which is why this
+        /// is the one kind measurement can confirm.
+        /// </remarks>
+        public bool IsGenericMethodDefinition =>
+            this.GenericKind == GenericMethodKind.GenericMethodDefinition;
+
+        /// <summary>
+        /// This method's signature with the declaring type's and the method's own type arguments
+        /// substituted in, or the open signature when there is nothing to substitute.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// This is what <see cref="Signature"/> cannot be on its own: metadata records the open
+        /// definition, so closing it needs the instantiation, which lives on the MethodTable
+        /// (its PerInstInfo) and on the MethodDesc (its own PerInstInfo). A type variable with no
+        /// real type behind it is left alone rather than guessed at, so the open definition of a
+        /// generic type closes to itself.
+        /// </para>
+        /// <para>
+        /// It closes against the <b>declaring</b> MethodTable, which for a shared instantiation
+        /// is the canonical one - so <c>List&lt;string&gt;.Add</c> comes back as taking
+        /// <c>System.__Canon</c> rather than <c>System.String</c>. That is not a shortfall: one
+        /// body of code serves every reference instantiation, and <c>__Canon</c> is the type it
+        /// was compiled against. Measured: <c>List&lt;int&gt;.Add</c> closes to
+        /// <c>System.Int32</c>, because a value type argument gets its own code.
+        /// </para>
+        /// <para>
+        /// To close against one exact instantiation instead, substitute that MethodTable's own
+        /// <see cref="ClrMethodTable.TypeArguments"/>:
+        /// <c>method.Signature.WithArguments(..., null)</c> - see
+        /// <see cref="ClosedSignatureFor(ClrMethodTable)"/>, which does it for you.
+        /// </para>
+        /// </remarks>
+        public ClrMethodSignature ClosedSignature
+        {
+            get
+            {
+                var signature = this.Signature;
+                if (signature == null)
+                    return null;
+
+                return signature.WithArguments(
+                    Resolve(this.DeclaringMethodTable?.TypeArguments),
+                    Resolve(this.GenericArgumentMethodTables));
+            }
+        }
+
+        /// <summary>
+        /// This method's signature closed against one exact instantiation, rather than against
+        /// the canonical MethodTable its code is shared through.
+        /// </summary>
+        /// <remarks>
+        /// The difference matters for reference instantiations. <see cref="ClosedSignature"/>
+        /// reports what the code was compiled against, which is <c>System.__Canon</c>; passing
+        /// <c>List&lt;string&gt;</c>'s MethodTable here reports <c>System.String</c>, which is
+        /// what a caller of that instantiation actually passes.
+        /// </remarks>
+        public ClrMethodSignature ClosedSignatureFor(ClrMethodTable instantiation)
+        {
+            var signature = this.Signature;
+
+            if (signature == null)
+                return null;
+
+            return signature.WithArguments(
+                Resolve(instantiation?.TypeArguments),
+                Resolve(this.GenericArgumentMethodTables));
+        }
+
+        /// <summary>
+        /// Turns type handles into signature nodes, dropping the ones that are not MethodTables.
+        /// </summary>
+        /// <remarks>
+        /// A type variable or a TypeDesc has no MethodTable to name, so its slot is left null and
+        /// substitution leaves that parameter as it was.
+        /// </remarks>
+        private static ClrSignatureType[] Resolve(IntPtr[] handles)
+        {
+            if (handles == null || handles.Length == 0)
+                return null;
+
+            var resolved = new ClrSignatureType[handles.Length];
+
+            for (var i = 0; i < handles.Length; i++)
+            {
+                if (!ClrMethodTable.IsMethodTableHandle(handles[i]))
+                    continue;
+
+                try
+                {
+                    resolved[i] = ClrSignatureType.ForMethodTable(
+                        ClrMethodTable.Create(new MemoryReader(handles[i])));
+                }
+                catch (Exception)
+                {
+                    // A handle that will not decode is left unsubstituted rather than fatal.
+                }
+            }
+
+            return resolved;
+        }
+
+        /// <summary>The address of the signature blob stored on this MethodDesc, or zero.</summary>
+        public IntPtr StoredSignatureAddress => this.StoredSignature().Address;
+
+        /// <summary>The length of the stored signature blob, or zero.</summary>
+        public uint StoredSignatureLength => this.StoredSignature().Length;
+
+        /// <summary>
+        /// The name a dynamic method carries on its own MethodDesc, or null for anything else.
+        /// </summary>
+        /// <remarks>
+        /// A dynamic method has no MethodDef row, so there is no string heap to look its name up
+        /// in - the DynamicMethodDesc holds a plain UTF-8 pointer instead. This is what lets an
+        /// emitted method be named at all.
+        /// </remarks>
+        public string StoredName
+        {
+            get
+            {
+                if (this.Classification != MethodClassification.Dynamic)
+                    return null;
+
+                var descriptor = ContractDescriptor.Current;
+                if (!descriptor.TryGetDataType("DynamicMethodDesc", out var layout)
+                    || !layout.HasField("MethodName"))
+                {
+                    return null;
+                }
+
+                var name = new MemoryReader(this.ClrPointer).ReadIntPtr(layout["MethodName"]);
+
+                return name == IntPtr.Zero || !ProcessMemoryRegions.IsReadable(name, 1)
+                    ? null
+                    : new MemoryReader(name).ReadNullTerminatedString(0);
+            }
+        }
+
+        /// <summary>
+        /// The signature blob this MethodDesc stores, when it stores one.
+        /// </summary>
+        /// <remarks>
+        /// Guarded rather than trusted. The fields are only meaningful for the classifications
+        /// that extend StoredSigMethodDesc, and reading a pointer out of a MethodDesc that does
+        /// not have one would be an access violation rather than a wrong answer - so both the
+        /// classification and the pointer itself are checked.
+        /// </remarks>
+        private (IntPtr Address, uint Length) StoredSignature()
+        {
+            if (!this.HasStoredSignature)
+                return (IntPtr.Zero, 0);
+
+            var descriptor = ContractDescriptor.Current;
+            if (!descriptor.TryGetDataType("StoredSigMethodDesc", out var layout)
+                || !layout.HasField("Sig")
+                || !layout.HasField("cSig"))
+            {
+                return (IntPtr.Zero, 0);
+            }
+
+            var reader = new MemoryReader(this.ClrPointer);
+            var signature = reader.ReadIntPtr(layout["Sig"]);
+            var length = reader.ReadUInt(layout["cSig"]);
+
+            if (signature == IntPtr.Zero || length == 0 || length > MaximumStoredSignature)
+                return (IntPtr.Zero, 0);
+
+            return ProcessMemoryRegions.IsReadable(signature, length)
+                ? (signature, length)
+                : (IntPtr.Zero, 0);
+        }
 
         /// <summary>
         /// The declaring type's full name, from metadata. Null when the module has no image.
@@ -363,6 +643,58 @@ namespace ClrSpector
             return rva == 0 ? null : ClrMethodBodyImage.Read(imageBase, rva);
         }
 
+        /// <summary>
+        /// Decodes the MethodDesc at <paramref name="address"/>, recovering the chunk it belongs
+        /// to so its token can be reassembled.
+        /// </summary>
+        /// <remarks>
+        /// A MethodDesc holds only the low bits of its own token; the high bits are on the
+        /// MethodDescChunk that owns it. Normally the chunk is already in hand because the walk
+        /// came through it - but an address arriving from somewhere else (a
+        /// <see cref="RuntimeMethodHandle"/>, or a code address resolved through
+        /// <see cref="Code.ClrCodeMap"/>) has no chunk with it.
+        ///
+        /// It can be recovered, because a MethodDesc records its own offset within its chunk:
+        /// <see cref="ChunkIndex"/> in units of MethodDescAlignment, past the chunk header. So
+        /// the chunk is found by stepping back exactly that far, and the step is then checked -
+        /// the chunk must claim a count that actually covers this MethodDesc, or the address was
+        /// not a MethodDesc and the token would be fiction.
+        /// </remarks>
+        public static ClrMethodDescription At(IntPtr address)
+        {
+            if (address == IntPtr.Zero)
+                return null;
+
+            var descriptor = ContractDescriptor.Current;
+            var layout = descriptor.GetDataType("MethodDesc");
+            var chunkLayout = descriptor.GetDataType("MethodDescChunk");
+
+            var alignment = (int)descriptor.Globals.Number("MethodDescAlignment");
+            var remainderBits = (int)descriptor.Globals.Number("MethodDescTokenRemainderBitCount");
+
+            var chunkIndex = new MemoryReader(address).ReadByte(layout["ChunkIndex"]);
+            var chunk = address - (int)chunkLayout.RequiredSize - (chunkIndex * alignment);
+
+            var chunkReader = new MemoryReader(chunk);
+            var count = chunkReader.ReadByte(chunkLayout["Count"]) + 1;
+
+            // Count is a bias; a chunk holding fewer MethodDescs than this one's index means the
+            // step back landed on something that is not a MethodDescChunk.
+            if (chunkIndex / (uint)alignment >= (uint)count && chunkIndex != 0)
+                throw new ClrSpectorUnsupportedRuntimeException(
+                    $"The MethodDesc at 0x{address.ToInt64():x} reports chunk index {chunkIndex}, " +
+                    $"but the chunk it points back to at 0x{chunk.ToInt64():x} holds only {count} " +
+                    $"methods. The address is not a MethodDesc.");
+
+            var tokenRange = (ushort)(chunkReader.ReadUShort(chunkLayout["FlagsAndTokenRange"])
+                                      & TokenRangeMask);
+
+            var method = Create(new MemoryReader(address), tokenRange, remainderBits);
+            method.MethodTablePointer = chunkReader.ReadIntPtr(chunkLayout["MethodTable"]);
+
+            return method;
+        }
+
         public static ClrMethodDescription Create(MemoryReader reader, ushort tokenRange, int tokenRemainderBitCount)
         {
             var layout = ContractDescriptor.Current.GetDataType("MethodDesc");
@@ -395,6 +727,35 @@ namespace ClrSpector
             return $"MethodDesc @0x{this.ClrPointer.ToInt64():x}{described} " +
                    $"slot={this.SlotNumber} token=0x{this.MetadataToken:x8}";
         }
+    }
+
+    /// <summary>
+    /// What kind of generic method an instantiated MethodDesc is.
+    /// </summary>
+    /// <remarks>
+    /// The values are the runtime's own, from the kind bits of InstantiatedMethodDesc.Flags2.
+    /// Only <see cref="GenericMethodDefinition"/> is confirmed against a live runtime here - see
+    /// <see cref="ClrMethodDescription.GenericKind"/>.
+    /// </remarks>
+    public enum GenericMethodKind
+    {
+        /// <summary>Not an instantiated MethodDesc at all.</summary>
+        NotGeneric = 0,
+
+        /// <summary>The open definition, Echo&lt;T&gt;.</summary>
+        GenericMethodDefinition = 1,
+
+        /// <summary>An instantiation with its own code, as a value type argument gets.</summary>
+        UnsharedMethodInstantiation = 2,
+
+        /// <summary>
+        /// An instantiation sharing code with others, which is what reference type arguments get
+        /// - and why its type arguments read as System.__Canon.
+        /// </summary>
+        SharedMethodInstantiation = 3,
+
+        /// <summary>A wrapper stub that carries an instantiation of its own.</summary>
+        WrapperStubWithInstantiations = 4
     }
 
     /// <summary>

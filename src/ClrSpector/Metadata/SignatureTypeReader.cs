@@ -150,6 +150,11 @@ namespace ClrSpector
         /// </summary>
         private static string NameOf(MetadataImage image, MetadataTable table, uint rowId)
         {
+            // A signature stored on a MethodDesc rather than in metadata has no image behind it,
+            // so its tokens cannot be named. The shape of the type is still fully decodable.
+            if (image == null)
+                return null;
+
             if (rowId == 0 || rowId > (uint)image.RowCount(table))
                 return null;
 

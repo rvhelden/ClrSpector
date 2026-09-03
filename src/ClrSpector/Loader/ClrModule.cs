@@ -40,6 +40,28 @@ namespace ClrSpector
             this.Path = this.layout.HasField("Path")
                 ? ReadWide(reader.ReadIntPtr(this.layout["Path"]))
                 : null;
+
+            this.FileName = this.layout.HasField("FileName")
+                ? ReadWide(reader.ReadIntPtr(this.layout["FileName"]))
+                : null;
+
+            this.PEAssembly = this.Pointer(reader, "PEAssembly");
+            this.ReadyToRunInfo = this.Pointer(reader, "ReadyToRunInfo");
+            this.DynamicMetadata = this.Pointer(reader, "DynamicMetadata");
+            this.GrowableSymbolStream = this.Pointer(reader, "GrowableSymbolStream");
+            this.AvailableTypeParams = this.Pointer(reader, "AvailableTypeParams");
+            this.InstMethodHashTable = this.Pointer(reader, "InstMethodHashTable");
+            this.DynamicILBlobTable = this.Pointer(reader, "DynamicILBlobTable");
+            this.EnCClassList = this.Pointer(reader, "EnCClassList");
+
+            if (this.layout.HasField("MetadataGeneration"))
+                this.MetadataGeneration = reader.ReadUInt(this.layout["MetadataGeneration"]);
+        }
+
+        /// <summary>A pointer field, or zero when this runtime does not publish it.</summary>
+        private IntPtr Pointer(MemoryReader reader, string field)
+        {
+            return this.layout.HasField(field) ? reader.ReadIntPtr(this.layout[field]) : IntPtr.Zero;
         }
 
         /// <summary>The runtime's Module.</summary>
@@ -61,6 +83,73 @@ namespace ClrSpector
 
         /// <summary>The module's file path, when it has one.</summary>
         public string Path { get; }
+
+        /// <summary>
+        /// The module's file name. Distinct from <see cref="Path"/>, which is the full path, and
+        /// from <see cref="SimpleName"/>, which drops the extension.
+        /// </summary>
+        public string FileName { get; }
+
+        /// <summary>
+        /// The PEAssembly - the loaded file behind this module, and the route to its
+        /// <c>PEImage</c> and metadata importer.
+        /// </summary>
+        public IntPtr PEAssembly { get; }
+
+        /// <summary>
+        /// The module's ReadyToRun information, or zero when it was not compiled ahead of time.
+        /// </summary>
+        /// <remarks>
+        /// Non-zero means the module ships precompiled native code, which is why some of its
+        /// methods have an entry point before anything has jitted them. The structure behind this
+        /// is described by the descriptor's <c>ReadyToRunInfo</c> type and read by the
+        /// ExecutionManager contract; this is the address, not a decode of it.
+        /// </remarks>
+        public IntPtr ReadyToRunInfo { get; }
+
+        /// <summary>True when the module carries ahead-of-time compiled code.</summary>
+        public bool IsReadyToRun => this.ReadyToRunInfo != IntPtr.Zero;
+
+        /// <summary>
+        /// Metadata the module grew at runtime, for a module built by <c>AssemblyBuilder</c>.
+        /// </summary>
+        /// <remarks>
+        /// A dynamic module has no mapped image, so <see cref="ClrModuleMetadata"/> finds nothing
+        /// for it - its metadata is here instead, in a growable buffer rather than a PE section.
+        /// </remarks>
+        public IntPtr DynamicMetadata { get; }
+
+        /// <summary>The in-memory symbol stream, when debug symbols were supplied at runtime.</summary>
+        public IntPtr GrowableSymbolStream { get; }
+
+        /// <summary>
+        /// The hash table of type parameters instantiated from this module - the arrays, pointers
+        /// and byrefs built over its types, which have no metadata row of their own.
+        /// </summary>
+        public IntPtr AvailableTypeParams { get; }
+
+        /// <summary>
+        /// The hash table of instantiated generic methods, which likewise have no metadata row -
+        /// <c>List&lt;int&gt;.Add</c> is not in any module's MethodDef table.
+        /// </summary>
+        public IntPtr InstMethodHashTable { get; }
+
+        /// <summary>IL supplied at runtime for a method, keyed by token; used by profilers and ENC.</summary>
+        public IntPtr DynamicILBlobTable { get; }
+
+        /// <summary>The types edit-and-continue has changed in this module.</summary>
+        public IntPtr EnCClassList { get; }
+
+        /// <summary>
+        /// How many times this module's metadata has been updated in place, by edit-and-continue
+        /// or a hot reload. Zero for a module nothing has edited.
+        /// </summary>
+        /// <remarks>
+        /// Worth checking before trusting anything read from the mapped image: an updated module's
+        /// current metadata lives in the runtime's own tables, not in the file it was loaded from,
+        /// so a non-zero generation means <see cref="ClrModuleMetadata"/> is reading a stale view.
+        /// </remarks>
+        public uint MetadataGeneration { get; }
 
         /// <summary>Reads the runtime's Module for a reflection module.</summary>
         /// <remarks>
@@ -108,6 +197,47 @@ namespace ClrSpector
         }
 
         /// <summary>The FieldDesc for a FieldDef token, or zero when not yet created.</summary>
+        /// <summary>
+        /// The Assembly an AssemblyRef token resolves to, or zero when this module has not
+        /// needed that reference yet.
+        /// </summary>
+        /// <remarks>
+        /// This is the module's own view of its dependencies: metadata lists what it references
+        /// by name, and this map records which loaded Assembly each of those names turned out to
+        /// be. Zero means the reference has not been resolved yet, since the runtime binds them
+        /// lazily - not that the dependency is missing.
+        /// </remarks>
+        public IntPtr AssemblyRefToAssembly(uint assemblyRefToken)
+        {
+            return this.Lookup("ManifestModuleReferencesMap", assemblyRefToken);
+        }
+
+        /// <summary>
+        /// The runtime structure a MemberRef token resolves to - a MethodDesc or a FieldDesc,
+        /// depending on what the reference names.
+        /// </summary>
+        /// <remarks>
+        /// A MemberRef is how a module names a member of a type it does not declare, so this is
+        /// the map that turns a cross-assembly call site into the callee's own MethodDesc.
+        /// </remarks>
+        public IntPtr MemberRefToDesc(uint memberRefToken)
+        {
+            return this.Lookup("MemberRefToDescMap", memberRefToken);
+        }
+
+        /// <summary>
+        /// The IL code versioning state for a MethodDef token, or zero when the method has never
+        /// been re-jitted.
+        /// </summary>
+        /// <remarks>
+        /// Non-zero means something has given the method an alternative body - a profiler ReJIT,
+        /// or a hot reload - so the IL in the mapped image is no longer what runs.
+        /// </remarks>
+        public IntPtr MethodDefToILCodeVersioningState(uint methodDefToken)
+        {
+            return this.Lookup("MethodDefToILCodeVersioningStateMap", methodDefToken);
+        }
+
         public IntPtr FieldDefToFieldDesc(uint fieldDefToken)
         {
             return this.Lookup("FieldDefToDescMap", fieldDefToken);

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Runtime.CompilerServices;
 
 namespace ClrSpectorConsole;
@@ -20,6 +20,25 @@ public class Order : IPriced, IComparable<Order>
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     public virtual string Ship() => "shipped";
+
+    /// <summary>Enough shape to be worth projecting back to C#: a loop, a branch, a catch.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public string Restock(int wanted)
+    {
+        var missing = 0;
+
+        for (var i = 0; i < wanted; i++)
+            missing += i < this.Quantity ? 0 : 1;
+
+        try
+        {
+            return missing == 0 ? "ok" : "short " + missing;
+        }
+        catch (InvalidOperationException)
+        {
+            return "failed";
+        }
+    }
 
     public int CompareTo(Order other) => 0;
 }

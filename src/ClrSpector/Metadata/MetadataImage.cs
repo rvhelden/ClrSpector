@@ -201,6 +201,33 @@ namespace ClrSpector
             return new MetadataImage(metadataAddress, size);
         }
 
+        /// <summary>The size of the whole metadata region, in bytes.</summary>
+        public int MetadataSizeOf() => this.metadataSize;
+
+        /// <summary>The size of the string heap, which holds names.</summary>
+        public int StringHeapSize => this.stringHeapSize;
+
+        /// <summary>The size of the blob heap, which holds signatures.</summary>
+        public int BlobHeapSize => this.blobHeapSize;
+
+        /// <summary>The size of the user string heap, which holds <c>ldstr</c> literals.</summary>
+        public int UserStringHeapSize => this.userStringHeapSize;
+
+        /// <summary>
+        /// How many bytes a string heap index takes in a row: two, or four once the heap passes
+        /// 64 KB. This is the widening that makes a row's offset depend on the image's size.
+        /// </summary>
+        public int StringIndexSize => this.stringIndexSize;
+
+        /// <summary>How many bytes a blob heap index takes in a row.</summary>
+        public int BlobIndexSize => this.blobIndexSize;
+
+        /// <summary>How many bytes a GUID heap index takes in a row.</summary>
+        public int GuidIndexSize => this.guidIndexSize;
+
+        /// <summary>The measured byte size of one row of a table.</summary>
+        public int RowSize(MetadataTable table) => this.rowSizes[(int)table];
+
         /// <summary>
         /// Whether the metadata declares a table sorted by its key column.
         /// </summary>
